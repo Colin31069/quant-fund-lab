@@ -33,3 +33,5 @@ MVP + M1 + M2 完成：除交易日曆、停牌/漲跌停、交易成本、point
 M5-1 Factor Laboratory 已完成：價量資料可產生 momentum 252-21 / 63-5、short reversal、low volatility、low beta、base-currency liquidity、volume surprise 等 point-in-time cross-sectional factors；研究層可計算 Pearson IC、Spearman Rank IC、IC IR、positive-IC rate、1/5/20 日 decay、平均 factor correlation 與 rank turnover。另保留 external point-in-time factor panel 介面供後續 Value / Quality / Profitability 等財務因子接入；在正式財務資料 provider 完成前，不虛構歷史基本面。
 
 M5-2 Learned Factor Alpha 已完成：每個 timestamp 的候選因子依固定順序做 cross-sectional residualization，降低共線性；因子權重只使用 signal date 前已完整實現的 Rank IC，並以 horizon 間隔抽取非重疊樣本、可靠度 shrinkage、t-like score 與 L1 normalization 形成 signed weights。Factor composite 可作為原 Kalman/OU/residual-momentum Alpha 的可調 overlay，預設關閉；回測結果會保存每次 rebalance 的 learned factor weights，研究報告也一併輸出。
+
+M5-3 Portfolio Risk Controls 已完成：optimizer 產生相對權重後，可選擇套用 annualized-volatility target、historical Expected Shortfall/CVaR cap 與策略自身 drawdown de-risking。三者都只把 risky sleeve 等比例縮小到現金，不增加槓桿；risk-control diagnostics 會保存縮放前後的預估波動、CVaR、gross exposure、drawdown 與各縮放因子，verified report 同步輸出。

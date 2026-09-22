@@ -24,6 +24,7 @@ from .market_calendar import SessionValidation, require_valid_daily_sessions
 from .models import ensemble_alpha
 from .portfolio import optimize_weights
 from .research import detect_market_regime, neutralize_alpha, regime_adjusted_alpha
+from .risk_controls import apply_portfolio_risk_controls
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class BacktestResult:
     max_fx_age_days: float
     regimes: pd.DataFrame
     factor_weights: pd.DataFrame
+    risk_controls: pd.DataFrame
 
 
 def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> BacktestResult:
@@ -86,6 +88,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     terminal_rows: list[dict[str, object]] = []
     regime_rows: list[dict[str, object]] = []
     factor_weight_rows: list[pd.Series] = []
+    risk_control_rows: list[dict[str, object]] = []
     target = pd.Series(0.0, index=data.symbols)
     factor_panel = pd.DataFrame()
     factor_ic = pd.DataFrame()
@@ -102,6 +105,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
 
     start_i = strategy.warmup_days - 1
     initial_date = dates[start_i]
+    running_peak = float(config.initial_cash)
     equity_rows.append({"timestamp": initial_date, "equity": config.initial_cash, "cash": state.cash})
 
     for i in range(start_i, len(dates) - 1):
@@ -115,6 +119,9 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         fx_signal = fx_to_base.loc[signal_date]
         fx_next = fx_to_base.loc[execution_date]
         terminal_next = data.terminal_returns.loc[execution_date]
+        signal_equity = state.equity(close_now, fx_signal)
+        running_peak = max(running_peak, signal_equity)
+        current_drawdown = max(0.0, 1.0 - signal_equity / max(running_peak, 1e-12))
         terminal_events = apply_terminal_returns(
             state=state,
             terminal_returns=terminal_next,
@@ -181,6 +188,54 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
             )
             terminal_symbols = terminal_next[terminal_next.notna()].index
             target.loc[target.index.intersection(terminal_symbols)] = 0.0
+            risk_result = apply_portfolio_risk_controls(
+                target,
+                returns,
+                strategy.covariance_shrinkage,
+                current_drawdown,
+                target_annual_volatility=(
+                    strategy.target_annual_volatility
+                    if strategy.volatility_target_enabled
+                    else None
+                ),
+                max_daily_cvar=(
+                    strategy.max_daily_cvar if strategy.cvar_control_enabled else None
+                ),
+                cvar_confidence=strategy.cvar_confidence,
+                drawdown_soft_limit=(
+                    strategy.drawdown_soft_limit
+                    if strategy.drawdown_control_enabled
+                    else None
+                ),
+                drawdown_hard_limit=(
+                    strategy.drawdown_hard_limit
+                    if strategy.drawdown_control_enabled
+                    else None
+                ),
+                drawdown_min_exposure=strategy.drawdown_min_exposure,
+            )
+            gross_before = float(target.sum())
+            target = risk_result.weights
+            risk_control_rows.append(
+                {
+                    "timestamp": signal_date,
+                    "drawdown": current_drawdown,
+                    "gross_before": gross_before,
+                    "gross_after": float(target.sum()),
+                    "forecast_annual_volatility_before": (
+                        risk_result.forecast_annual_volatility_before
+                    ),
+                    "forecast_annual_volatility_after": (
+                        risk_result.forecast_annual_volatility_after
+                    ),
+                    "historical_cvar_before": risk_result.historical_cvar_before,
+                    "historical_cvar_after": risk_result.historical_cvar_after,
+                    "volatility_scale": risk_result.volatility_scale,
+                    "cvar_scale": risk_result.cvar_scale,
+                    "drawdown_scale": risk_result.drawdown_scale,
+                    "final_scale": risk_result.final_scale,
+                }
+            )
 
             alpha_row = alpha.copy()
             alpha_row.name = signal_date
@@ -224,6 +279,11 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         if factor_weight_rows
         else pd.DataFrame()
     )
+    risk_controls_df = (
+        pd.DataFrame(risk_control_rows).set_index("timestamp")
+        if risk_control_rows
+        else pd.DataFrame()
+    )
     if fills_df.empty:
         costs_df = pd.DataFrame(columns=["gross_turnover", "fees", "slippage_cost", "total_cost", "turnover_rate"])
     else:
@@ -244,4 +304,5 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         max_fx_age_days=float(fx_age_days.max().max()),
         regimes=regimes_df,
         factor_weights=factor_weights_df,
+        risk_controls=risk_controls_df,
     )

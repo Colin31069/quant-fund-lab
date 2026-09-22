@@ -44,6 +44,15 @@ class StrategyConfig:
     factor_ic_lookback: int = 60
     factor_ic_min_observations: int = 12
     factor_orthogonalization: bool = True
+    volatility_target_enabled: bool = False
+    target_annual_volatility: float = 0.12
+    cvar_control_enabled: bool = False
+    max_daily_cvar: float = 0.025
+    cvar_confidence: float = 0.95
+    drawdown_control_enabled: bool = False
+    drawdown_soft_limit: float = 0.10
+    drawdown_hard_limit: float = 0.20
+    drawdown_min_exposure: float = 0.25
 
 
 @dataclass(frozen=True)

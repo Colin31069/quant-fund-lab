@@ -65,6 +65,17 @@ with st.sidebar:
     run_factor_research = st.checkbox("執行因子 IC / Decay 研究", value=False)
     enable_factor_alpha = st.checkbox("啟用 trailing-IC Factor Alpha overlay", value=False)
     factor_alpha_weight = st.slider("Factor Alpha overlay 權重", 0.0, 0.60, 0.30, 0.05)
+    enable_vol_target = st.checkbox("Volatility targeting", value=False)
+    target_annual_volatility = st.slider("目標年化波動", 0.05, 0.30, 0.12, 0.01)
+    enable_cvar_control = st.checkbox("CVaR / Expected Shortfall cap", value=False)
+    max_daily_cvar = st.slider("最大日 CVaR", 0.005, 0.050, 0.025, 0.005, format="%.3f")
+    enable_drawdown_control = st.checkbox("Drawdown de-risking", value=False)
+    drawdown_soft_limit = st.slider("Drawdown soft limit", 0.05, 0.20, 0.10, 0.01)
+    drawdown_hard_min = min(drawdown_soft_limit + 0.05, 0.40)
+    drawdown_hard_limit = st.slider(
+        "Drawdown hard limit", drawdown_hard_min, 0.50, max(0.20, drawdown_hard_min), 0.01
+    )
+    drawdown_min_exposure = st.slider("Hard-limit 最低風險曝險", 0.0, 0.75, 0.25, 0.05)
     run = st.button("執行模型", type="primary", use_container_width=True)
 
 
@@ -145,6 +156,14 @@ if run:
                 risk_budget_penalty=risk_budget_penalty,
                 factor_alpha_enabled=enable_factor_alpha,
                 factor_alpha_weight=factor_alpha_weight,
+                volatility_target_enabled=enable_vol_target,
+                target_annual_volatility=target_annual_volatility,
+                cvar_control_enabled=enable_cvar_control,
+                max_daily_cvar=max_daily_cvar,
+                drawdown_control_enabled=enable_drawdown_control,
+                drawdown_soft_limit=drawdown_soft_limit,
+                drawdown_hard_limit=drawdown_hard_limit,
+                drawdown_min_exposure=drawdown_min_exposure,
             )
             config = BacktestConfig(
                 initial_cash=initial_cash,
@@ -342,6 +361,30 @@ if run:
                 st.dataframe(learned.tail(40), use_container_width=True, height=320)
             if len(trade_symbols) < 6:
                 st.warning("目前股票數少於 6 檔，cross-sectional IC 估計會非常不穩定；較適合研究較大 universe。")
+
+        if enable_vol_target or enable_cvar_control or enable_drawdown_control:
+            st.subheader("M5-3 Portfolio Risk Controls")
+            controls = comparison.paper_replay.risk_controls
+            if controls.empty:
+                st.info("目前沒有 risk-control observation。")
+            else:
+                latest_control = controls.iloc[-1]
+                q1, q2, q3, q4 = st.columns(4)
+                q1.metric("Final risk scale", f"{float(latest_control['final_scale']):.1%}")
+                q2.metric(
+                    "Forecast vol after",
+                    f"{float(latest_control['forecast_annual_volatility_after']):.1%}",
+                )
+                q3.metric(
+                    "Daily CVaR after",
+                    f"{float(latest_control['historical_cvar_after']):.2%}",
+                )
+                q4.metric("Strategy drawdown", f"{float(latest_control['drawdown']):.1%}")
+                st.caption(
+                    "Risk-control scale = min(volatility scale, CVaR scale, drawdown scale)，"
+                    "只縮小 risky sleeve，剩餘配置為現金，不做槓桿放大。"
+                )
+                st.dataframe(controls.tail(40), use_container_width=True, height=320)
 
         st.subheader("M2-3 Regime / Risk Budget")
         regimes = comparison.paper_replay.regimes
