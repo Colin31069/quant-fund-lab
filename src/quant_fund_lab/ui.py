@@ -10,6 +10,7 @@ from quant_fund_lab.analytics import buy_and_hold_equity, metric_frame
 from quant_fund_lab.config import BacktestConfig, StrategyConfig
 from quant_fund_lab.data import MarketData, download_yahoo, synthetic_market_data
 from quant_fund_lab.data_quality import validate_corporate_actions
+from quant_fund_lab.diagnostics import diagnose_walk_forward
 from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
 from quant_fund_lab.paper import historical_vs_paper_replay
 from quant_fund_lab.walkforward import (
@@ -176,9 +177,32 @@ if run:
                             max_validation_drawdown=0.35,
                         ),
                     )
+                    diagnostics = diagnose_walk_forward(
+                        wf,
+                        bootstrap_iterations=500,
+                        mean_block_length=10.0,
+                        seed=11,
+                    )
                 wf_metrics = pd.DataFrame([wf.oos_metrics], index=["walk_forward_oos"])
                 st.dataframe(wf_metrics, use_container_width=True)
                 st.dataframe(wf.folds, use_container_width=True, height=300)
+                st.markdown("**Multiple-testing / Overfitting diagnostics**")
+                d1, d2, d3, d4 = st.columns(4)
+                dsr = diagnostics.deflated_sharpe
+                reality = diagnostics.reality_check
+                d1.metric("Deflated Sharpe 機率", f"{dsr.probability:.1%}")
+                d2.metric("OOS Sharpe", f"{dsr.observed_sharpe_annualized:.2f}")
+                d3.metric(
+                    "Selection-adjusted Sharpe 門檻",
+                    f"{dsr.expected_max_sharpe_annualized:.2f}",
+                )
+                d4.metric("Reality Check p-value", f"{reality.p_value:.3f}")
+                st.caption(
+                    f"DSR 使用 {dsr.num_trials} 個候選策略的 Validation Sharpe 分布修正 selection bias；"
+                    f"Reality Check 對 {reality.candidate_count} 個候選、{reality.sample_size} 個 Validation 報酬"
+                    f"做 {reality.bootstrap_iterations} 次 stationary bootstrap。"
+                    "這些是研究診斷，不代表未來報酬保證。"
+                )
                 wf_fig = go.Figure()
                 wf_fig.add_trace(
                     go.Scatter(x=wf.oos_equity.index, y=wf.oos_equity, name="OOS equity")

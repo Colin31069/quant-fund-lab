@@ -43,6 +43,7 @@ class WalkForwardSpec:
 class WalkForwardResult:
     folds: pd.DataFrame
     candidate_scores: pd.DataFrame
+    candidate_validation_returns: pd.DataFrame
     oos_equity: pd.Series
     oos_metrics: dict[str, float]
 
@@ -130,6 +131,7 @@ def run_walk_forward(
     validation_start = spec.train_bars
     fold_rows: list[dict[str, object]] = []
     score_rows: list[dict[str, object]] = []
+    validation_return_frames: list[pd.DataFrame] = []
     oos_values: list[float] = []
     oos_dates: list[pd.Timestamp] = []
     chained_level = float(base_config.initial_cash)
@@ -144,6 +146,7 @@ def run_walk_forward(
         train_end = validation_start
 
         ranked: list[tuple[float, str, StrategyConfig, dict[str, float], float]] = []
+        fold_validation_returns: dict[str, pd.Series] = {}
         for candidate_id in sorted(candidate_map):
             candidate = candidate_map[candidate_id]
             candidate_config = replace(base_config, strategy=candidate)
@@ -153,6 +156,12 @@ def run_walk_forward(
             validation_equity = calibration.equity_curve["equity"].loc[
                 validation_baseline : index[validation_end - 1]
             ]
+            validation_returns = validation_equity.pct_change().dropna().loc[
+                index[validation_start] : index[validation_end - 1]
+            ]
+            if len(validation_returns) != spec.validation_bars:
+                raise ValueError("validation return count does not match validation_bars")
+            fold_validation_returns[candidate_id] = validation_returns
             validation_turnover = float(
                 calibration.cost_attribution["turnover_rate"]
                 .loc[index[validation_start] : index[validation_end - 1]]
@@ -173,6 +182,18 @@ def run_walk_forward(
                     **{f"validation_{key}": value for key, value in metrics.items()},
                 }
             )
+
+        fold_matrix = pd.DataFrame(fold_validation_returns)
+        if list(fold_matrix.columns) != sorted(candidate_map):
+            fold_matrix = fold_matrix.reindex(columns=sorted(candidate_map))
+        fold_matrix.index = pd.MultiIndex.from_arrays(
+            [
+                np.full(len(fold_matrix), fold_number, dtype=int),
+                fold_matrix.index,
+            ],
+            names=["fold", "timestamp"],
+        )
+        validation_return_frames.append(fold_matrix)
 
         ranked.sort(key=lambda item: (-item[0], item[1]))
         best_score, best_id, best_strategy, best_metrics, _ = ranked[0]
@@ -245,9 +266,13 @@ def run_walk_forward(
     oos_equity = pd.Series(oos_values, index=pd.DatetimeIndex(oos_dates), name="oos_equity")
     if oos_equity.index.has_duplicates:
         raise ValueError("walk-forward OOS windows overlap")
+    candidate_validation_returns = pd.concat(validation_return_frames).sort_index()
+    if candidate_validation_returns.isna().any().any():
+        raise ValueError("candidate validation-return matrix contains missing values")
     return WalkForwardResult(
         folds=pd.DataFrame(fold_rows).set_index("fold"),
         candidate_scores=pd.DataFrame(score_rows),
+        candidate_validation_returns=candidate_validation_returns,
         oos_equity=oos_equity,
         oos_metrics=performance_metrics(oos_equity),
     )

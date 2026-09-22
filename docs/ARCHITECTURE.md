@@ -110,7 +110,9 @@ Streamlit local dashboard：
 
 **M2-1 已完成：Walk-forward calibration / OOS harness。** 每個 fold 明確切為 Train → Validation → Test；Train 僅提供歷史狀態與 warm-up，候選參數只能用 Validation 指標選擇，Test 完全未見。Test 以重置本金執行，並把每個 fold 的純 test returns 串接成單一 OOS equity。支援 expanding/rolling train window、deterministic candidate ID、Calmar/Sharpe/annual-return objective、validation drawdown constraint，UI 可查看 fold 邊界、入選參數與 OOS 指標。
 
-**M2-2 待做：** multiple-testing control、Deflated Sharpe、bootstrap / Reality Check 類統計診斷，避免「試太多候選後挑到幸運冠軍」。
+**M2-2 已完成：Multiple-testing / data-snooping diagnostics。** Walk-forward 現在保留同步的 candidate Validation return matrix；Deflated Sharpe Ratio 以純 OOS winner returns 做觀測 Sharpe，並用所有候選 Validation Sharpe 的橫斷面分散度建立 selection-adjusted expected-max Sharpe 門檻，同時修正樣本長度、偏態與峰度。另實作 White Reality Check-style stationary bootstrap：先將每個候選 Validation return differential 去均值，再以相同 bootstrap index 同步重抽所有候選以保留橫斷面相依性，估計 best-model family-wise p-value。方法論依 Bailey / López de Prado 等人的 Deflated Sharpe Ratio 與 Halbert White (2000) Reality Check；目前 Reality Check 實作採 max-mean stationary-bootstrap diagnostic，明確標示為 White-style，而非聲稱重現所有原論文擴充版本。
+
+重要邊界：Test returns 只用於最終 OOS DSR 的 winner performance，不參與 candidate selection；Reality Check 使用的是 Validation 搜尋集合，避免拿 Test 區間回頭挑策略。
 
 **M2-3 待做：** regime detection、factor neutralization 與更完整的 risk budgeting。
 

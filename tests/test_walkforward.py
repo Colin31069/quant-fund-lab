@@ -44,6 +44,12 @@ def test_walk_forward_fold_chronology_and_no_overlap():
         assert fold["test_start"] <= fold["test_end"]
     assert not result.oos_equity.index.has_duplicates
     assert result.oos_equity.index.is_monotonic_increasing
+    assert result.candidate_validation_returns.shape == (
+        len(result.folds) * spec.validation_bars,
+        len(candidates),
+    )
+    assert not result.candidate_validation_returns.isna().any().any()
+    assert result.candidate_validation_returns.index.names == ["fold", "timestamp"]
 
 
 def test_walk_forward_selection_is_deterministic():
