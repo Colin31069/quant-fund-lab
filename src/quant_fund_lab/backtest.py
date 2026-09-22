@@ -12,6 +12,7 @@ from .execution import (
     market_for_symbol,
     rebalance_at_open,
 )
+from .fx import currency_for_symbol, validate_fx
 from .market_calendar import SessionValidation, require_valid_daily_sessions
 from .models import ensemble_alpha
 from .portfolio import optimize_weights
@@ -26,19 +27,42 @@ class BacktestResult:
     cost_attribution: pd.DataFrame
     session_validation: SessionValidation | None
     terminal_events: pd.DataFrame
+    base_currency: str
+    max_fx_age_days: float
 
 
 def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> BacktestResult:
     config = config or BacktestConfig()
     markets = {market_for_symbol(symbol) for symbol in data.symbols}
-    if len(markets) != 1:
-        raise ValueError("mixed US/TW portfolios require FX conversion; run one market per portfolio in MVP")
-    market = next(iter(markets))
+    currencies = {currency_for_symbol(symbol) for symbol in data.symbols}
     session_validation: SessionValidation | None = None
-    if data.exchange is not None:
+    if len(markets) == 1 and data.exchange is not None:
+        market = next(iter(markets))
         if data.exchange != market:
             raise ValueError("market-data exchange metadata does not match symbols")
         session_validation = require_valid_daily_sessions(data.close.index, market)
+
+    requested_base = config.base_currency.upper() if config.base_currency else None
+    if data.fx_to_base is None:
+        if len(currencies) != 1:
+            raise ValueError("mixed-currency portfolio requires attached FX conversion factors")
+        local_currency = next(iter(currencies))
+        base_currency = requested_base or data.base_currency or local_currency
+        if base_currency != local_currency:
+            raise ValueError(f"FX conversion is required for {local_currency}->{base_currency}")
+        fx_to_base = pd.DataFrame(1.0, index=data.close.index, columns=data.symbols)
+        fx_age_days = pd.DataFrame(0.0, index=data.close.index, columns=data.symbols)
+    else:
+        if data.base_currency is None:
+            raise ValueError("base_currency metadata is required with attached FX factors")
+        base_currency = data.base_currency.upper()
+        if requested_base is not None and requested_base != base_currency:
+            raise ValueError("BacktestConfig base_currency does not match attached FX data")
+        fx_report = validate_fx(data, config.max_fx_staleness_days)
+        if not fx_report.is_valid:
+            raise ValueError("attached FX conversion factors failed validation")
+        fx_to_base = data.fx_to_base
+        fx_age_days = data.fx_age_days
     strategy = config.strategy
     dates = data.close.index
     if len(dates) < strategy.warmup_days + 2:
@@ -64,21 +88,24 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         close_next = data.close.loc[execution_date]
         volume_next = data.volume.loc[execution_date]
         reference_next = data.reference.loc[execution_date]
+        fx_signal = fx_to_base.loc[signal_date]
+        fx_next = fx_to_base.loc[execution_date]
         terminal_next = data.terminal_returns.loc[execution_date]
         terminal_events = apply_terminal_returns(
             state=state,
             terminal_returns=terminal_next,
             reference_prices=reference_next,
             timestamp=pd.Timestamp(execution_date),
+            fx_to_base=fx_next,
         )
         terminal_rows.extend(asdict(event) for event in terminal_events)
 
         if (i - start_i) % strategy.rebalance_every == 0:
-            history = data.close.iloc[: i + 1]
+            history = data.close.iloc[: i + 1] * fx_to_base.iloc[: i + 1]
             alpha_frame = ensemble_alpha(history, strategy)
             alpha = alpha_frame["ensemble"].reindex(data.symbols).fillna(0.0)
             returns = history.pct_change(fill_method=None).tail(strategy.covariance_lookback)
-            previous = state.weights(close_now).reindex(data.symbols).fillna(0.0)
+            previous = state.weights(close_now, fx_signal).reindex(data.symbols).fillna(0.0)
             eligible = data.membership.loc[signal_date].reindex(data.symbols).fillna(False)
             target = optimize_weights(alpha, returns, previous, strategy, eligible=eligible)
             terminal_symbols = terminal_next[terminal_next.notna()].index
@@ -99,13 +126,14 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                 reference_prices=reference_next,
                 timestamp=pd.Timestamp(execution_date),
                 config=config,
+                fx_to_base=fx_next,
             )
             fill_rows.extend(asdict(fill) for fill in fills)
 
         equity_rows.append(
             {
                 "timestamp": execution_date,
-                "equity": state.equity(close_next),
+                "equity": state.equity(close_next, fx_next),
                 "cash": state.cash,
             }
         )
@@ -131,4 +159,6 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         cost_attribution=costs_df,
         session_validation=session_validation,
         terminal_events=terminal_df,
+        base_currency=base_currency,
+        max_fx_age_days=float(fx_age_days.max().max()),
     )

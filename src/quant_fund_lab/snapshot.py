@@ -14,6 +14,7 @@ from .data import MarketData
 class SnapshotManifest:
     dataset_id: str
     exchange: str | None
+    base_currency: str | None
     symbols: tuple[str, ...]
     start: str
     end: str
@@ -28,9 +29,15 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _dataset_id(files: dict[str, str], exchange: str | None) -> str:
+def _dataset_id(
+    files: dict[str, str], exchange: str | None, base_currency: str | None
+) -> str:
     payload = json.dumps(
-        {"exchange": exchange, "files": dict(sorted(files.items()))},
+        {
+            "exchange": exchange,
+            "base_currency": base_currency,
+            "files": dict(sorted(files.items())),
+        },
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
@@ -54,6 +61,8 @@ def save_market_data_snapshot(
         "terminal_returns": data.terminal_returns,
         "dividends": data.dividends,
         "stock_splits": data.stock_splits,
+        "fx_to_base": data.fx_to_base,
+        "fx_age_days": data.fx_age_days,
     }
     file_hashes: dict[str, str] = {}
     for name, frame in frames.items():
@@ -64,19 +73,23 @@ def save_market_data_snapshot(
         file_hashes[path.name] = _sha256(path)
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "exchange": data.exchange,
+        "base_currency": data.base_currency,
         "symbols": data.symbols,
         "start": str(pd.Timestamp(data.close.index.min()).date()),
         "end": str(pd.Timestamp(data.close.index.max()).date()),
         "files": dict(sorted(file_hashes.items())),
     }
-    manifest["dataset_id"] = _dataset_id(file_hashes, data.exchange)
+    manifest["dataset_id"] = _dataset_id(
+        file_hashes, data.exchange, data.base_currency
+    )
     manifest_path = root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     return SnapshotManifest(
         dataset_id=manifest["dataset_id"],
         exchange=data.exchange,
+        base_currency=data.base_currency,
         symbols=tuple(data.symbols),
         start=manifest["start"],
         end=manifest["end"],
@@ -87,7 +100,7 @@ def save_market_data_snapshot(
 def load_market_data_snapshot(directory: str | Path) -> MarketData:
     root = Path(directory)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != 1:
+    if manifest.get("schema_version") != 2:
         raise ValueError("unsupported snapshot schema version")
     files: dict[str, str] = manifest["files"]
     required = {"open.parquet", "close.parquet", "volume.parquet"}
@@ -97,7 +110,9 @@ def load_market_data_snapshot(directory: str | Path) -> MarketData:
         path = root / filename
         if not path.exists() or _sha256(path) != expected_hash:
             raise ValueError(f"snapshot integrity check failed: {filename}")
-    if _dataset_id(files, manifest.get("exchange")) != manifest.get("dataset_id"):
+    if _dataset_id(
+        files, manifest.get("exchange"), manifest.get("base_currency")
+    ) != manifest.get("dataset_id"):
         raise ValueError("snapshot manifest dataset_id mismatch")
 
     def read(name: str) -> pd.DataFrame | None:
@@ -113,5 +128,8 @@ def load_market_data_snapshot(directory: str | Path) -> MarketData:
         terminal_returns=read("terminal_returns"),
         dividends=read("dividends"),
         stock_splits=read("stock_splits"),
+        fx_to_base=read("fx_to_base"),
+        fx_age_days=read("fx_age_days"),
+        base_currency=manifest.get("base_currency"),
         exchange=manifest.get("exchange"),
     )

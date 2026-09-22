@@ -37,6 +37,8 @@ class StrategyConfig:
 @dataclass(frozen=True)
 class BacktestConfig:
     initial_cash: float = 1_000_000.0
+    base_currency: str | None = None
+    max_fx_staleness_days: int = 5
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     us_costs: MarketCostConfig = field(
         default_factory=lambda: MarketCostConfig(

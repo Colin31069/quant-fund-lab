@@ -17,6 +17,9 @@ class MarketData:
     terminal_returns: pd.DataFrame | None = None
     dividends: pd.DataFrame | None = None
     stock_splits: pd.DataFrame | None = None
+    fx_to_base: pd.DataFrame | None = None
+    fx_age_days: pd.DataFrame | None = None
+    base_currency: str | None = None
     exchange: str | None = None
 
     def __post_init__(self) -> None:
@@ -37,6 +40,8 @@ class MarketData:
             "terminal_returns": self.terminal_returns,
             "dividends": self.dividends,
             "stock_splits": self.stock_splits,
+            "fx_to_base": self.fx_to_base,
+            "fx_age_days": self.fx_age_days,
         }
         for name, frame in optional.items():
             if frame is not None and (
@@ -69,6 +74,18 @@ class MarketData:
                 "stock_splits",
                 pd.DataFrame(0.0, index=self.close.index, columns=self.close.columns, dtype=float),
             )
+        if self.fx_to_base is not None:
+            invalid_fx = self.fx_to_base.notna() & (
+                (self.fx_to_base <= 0.0) | ~np.isfinite(self.fx_to_base)
+            )
+            if bool(invalid_fx.any().any()):
+                raise ValueError("fx_to_base must contain positive finite conversion factors")
+            if self.base_currency not in {"USD", "TWD"}:
+                raise ValueError("base_currency must be USD or TWD when fx_to_base is provided")
+        if self.fx_age_days is not None:
+            invalid_age = self.fx_age_days.notna() & (self.fx_age_days < 0.0)
+            if bool(invalid_age.any().any()):
+                raise ValueError("fx_age_days cannot be negative")
 
     @property
     def symbols(self) -> list[str]:
@@ -86,6 +103,9 @@ class MarketData:
             ),
             dividends=self.dividends.loc[start:end] if self.dividends is not None else None,
             stock_splits=self.stock_splits.loc[start:end] if self.stock_splits is not None else None,
+            fx_to_base=self.fx_to_base.loc[start:end] if self.fx_to_base is not None else None,
+            fx_age_days=self.fx_age_days.loc[start:end] if self.fx_age_days is not None else None,
+            base_currency=self.base_currency,
             exchange=self.exchange,
         )
 

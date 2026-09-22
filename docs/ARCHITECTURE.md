@@ -52,6 +52,8 @@
 - fixed slippage + sqrt(participation) market impact
 - volume participation cap
 - integer share/lot handling
+- local-currency execution + base-currency cash/NAV accounting
+- FX conversion factor 定義固定為 `local value × fx_to_base = base value`
 
 這一層由 historical backtest 與 paper replay 共用。
 
@@ -102,7 +104,7 @@ Streamlit local dashboard：
 
 限制：Yahoo 的歷史可交易 universe 仍不是完整的交易所 constituent/delisting database；membership 目前由每個 ticker 的首末可觀測資料建立，真正 institutional-grade survivorship control 仍需要 point-in-time security master / delisted-security provider。terminal return 因此採 explicit input，不猜測未知下市報酬。
 
-**M1-3 待做：** USD/TWD FX conversion、base-currency accounting、跨市場組合。
+**M1-3 已完成：** USD/TWD FX conversion、base-currency accounting 與跨市場組合。Yahoo `USDTWD=X` 作為 canonical「1 USD = 幾 TWD」來源；系統只 forward-fill 已知匯率，不 backfill 未來匯率，並驗證最大 stale age。股票成交價、手續費、證交稅與滑價保留 local currency；現金、NAV、權重、turnover 與績效統一換成 base currency。Alpha 與 covariance 也改用 base-currency price history，因此跨市場研究會納入 FX 變動。混合市場使用各市場觀測日期的 union；休市標的因 Open 缺值/Volume=0 不成交。FX factors 與 age metadata 也納入 snapshot hash。
 
 ### M2 — Model research
 

@@ -43,6 +43,9 @@ def historical_vs_paper_replay(
         ),
         dividends=data.dividends.iloc[:split] if data.dividends is not None else None,
         stock_splits=data.stock_splits.iloc[:split] if data.stock_splits is not None else None,
+        fx_to_base=data.fx_to_base.iloc[:split] if data.fx_to_base is not None else None,
+        fx_age_days=data.fx_age_days.iloc[:split] if data.fx_age_days is not None else None,
+        base_currency=data.base_currency,
         exchange=data.exchange,
     )
     paper_start = max(0, split - warmup)
@@ -59,6 +62,9 @@ def historical_vs_paper_replay(
         stock_splits=(
             data.stock_splits.iloc[paper_start:] if data.stock_splits is not None else None
         ),
+        fx_to_base=data.fx_to_base.iloc[paper_start:] if data.fx_to_base is not None else None,
+        fx_age_days=data.fx_age_days.iloc[paper_start:] if data.fx_age_days is not None else None,
+        base_currency=data.base_currency,
         exchange=data.exchange,
     )
     backtest = run_backtest(backtest_data, config)

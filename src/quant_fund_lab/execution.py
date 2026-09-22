@@ -6,6 +6,7 @@ from math import floor, sqrt
 import pandas as pd
 
 from .config import BacktestConfig, MarketCostConfig
+from .fx import currency_for_symbol
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,11 @@ class Fill:
     gross_value: float
     fees: float
     slippage_cost: float
+    local_currency: str
+    fx_to_base: float
+    gross_value_local: float
+    fees_local: float
+    slippage_cost_local: float
 
 
 @dataclass(frozen=True)
@@ -29,6 +35,9 @@ class TerminalEvent:
     reference_price: float
     terminal_return: float
     proceeds: float
+    local_currency: str
+    fx_to_base: float
+    proceeds_local: float
 
 
 @dataclass
@@ -36,17 +45,39 @@ class PortfolioState:
     cash: float
     shares: dict[str, int] = field(default_factory=dict)
 
-    def equity(self, prices: pd.Series) -> float:
-        holdings = sum(self.shares.get(s, 0) * float(prices.get(s, 0.0)) for s in self.shares)
+    def equity(self, prices: pd.Series, fx_to_base: pd.Series | None = None) -> float:
+        factors = (
+            fx_to_base.reindex(prices.index).fillna(1.0)
+            if fx_to_base is not None
+            else pd.Series(1.0, index=prices.index)
+        )
+        holdings = sum(
+            self.shares.get(symbol, 0)
+            * float(prices.get(symbol, 0.0))
+            * float(factors.get(symbol, 1.0))
+            for symbol in self.shares
+        )
         return float(self.cash + holdings)
 
-    def weights(self, prices: pd.Series) -> pd.Series:
-        equity = self.equity(prices)
+    def weights(self, prices: pd.Series, fx_to_base: pd.Series | None = None) -> pd.Series:
+        factors = (
+            fx_to_base.reindex(prices.index).fillna(1.0)
+            if fx_to_base is not None
+            else pd.Series(1.0, index=prices.index)
+        )
+        equity = self.equity(prices, factors)
         symbols = list(prices.index)
         if equity <= 0:
             return pd.Series(0.0, index=symbols)
         return pd.Series(
-            {s: self.shares.get(s, 0) * float(prices[s]) / equity for s in symbols}, dtype=float
+            {
+                symbol: self.shares.get(symbol, 0)
+                * float(prices[symbol])
+                * float(factors[symbol])
+                / equity
+                for symbol in symbols
+            },
+            dtype=float,
         )
 
 
@@ -102,11 +133,19 @@ def _blocked_by_price_limit(
     )
 
 
+def _fx_factor(symbol: str, fx_to_base: pd.Series | None) -> float:
+    factor = 1.0 if fx_to_base is None else float(fx_to_base.get(symbol, float("nan")))
+    if not pd.notna(factor) or factor <= 0.0:
+        raise ValueError(f"missing or invalid FX conversion factor for {symbol}")
+    return factor
+
+
 def apply_terminal_returns(
     state: PortfolioState,
     terminal_returns: pd.Series,
     reference_prices: pd.Series,
     timestamp: pd.Timestamp,
+    fx_to_base: pd.Series | None = None,
 ) -> list[TerminalEvent]:
     events: list[TerminalEvent] = []
     for symbol, terminal_return in terminal_returns.items():
@@ -121,7 +160,9 @@ def apply_terminal_returns(
         reference = float(reference_prices.get(symbol, float("nan")))
         if not pd.notna(reference) or reference < 0.0:
             raise ValueError(f"missing terminal reference price for {symbol}")
-        proceeds = quantity * reference * (1.0 + terminal_return)
+        factor = _fx_factor(symbol, fx_to_base)
+        proceeds_local = quantity * reference * (1.0 + terminal_return)
+        proceeds = proceeds_local * factor
         state.cash += proceeds
         state.shares[symbol] = 0
         events.append(
@@ -132,6 +173,9 @@ def apply_terminal_returns(
                 reference_price=reference,
                 terminal_return=terminal_return,
                 proceeds=float(proceeds),
+                local_currency=currency_for_symbol(symbol),
+                fx_to_base=float(factor),
+                proceeds_local=float(proceeds_local),
             )
         )
     return events
@@ -145,13 +189,17 @@ def rebalance_at_open(
     reference_prices: pd.Series,
     timestamp: pd.Timestamp,
     config: BacktestConfig,
+    fx_to_base: pd.Series | None = None,
 ) -> list[Fill]:
     """Execute sells first, then buys, using a configurable liquidity/slippage model."""
 
     fills: list[Fill] = []
     symbols = list(target_weights.index)
     valuation_prices = open_prices.where(open_prices.notna() & (open_prices > 0), reference_prices)
-    equity = state.equity(valuation_prices)
+    factors = pd.Series(
+        {symbol: _fx_factor(symbol, fx_to_base) for symbol in symbols}, dtype=float
+    )
+    equity = state.equity(valuation_prices, factors)
 
     desired_qty: dict[str, int] = {}
     for symbol in symbols:
@@ -161,7 +209,10 @@ def rebalance_at_open(
             continue
         costs = _cost_config(symbol, config)
         desired_value = max(float(target_weights[symbol]), 0.0) * equity
-        desired_qty[symbol] = int(floor(desired_value / px / costs.lot_size) * costs.lot_size)
+        base_price = px * float(factors[symbol])
+        desired_qty[symbol] = int(
+            floor(desired_value / base_price / costs.lot_size) * costs.lot_size
+        )
 
     for side in ("SELL", "BUY"):
         for symbol in symbols:
@@ -190,23 +241,32 @@ def rebalance_at_open(
             participation = qty / max(volume, 1.0)
             slip_rate = costs.slippage_bps / 10_000.0 + costs.impact_coefficient * sqrt(participation) / 100.0
             fill_px = ref * (1.0 + slip_rate if side == "BUY" else 1.0 - slip_rate)
-            gross = qty * fill_px
-            fees = _trade_costs(side, gross, costs)
+            factor = float(factors[symbol])
+            gross_local = qty * fill_px
+            fees_local = _trade_costs(side, gross_local, costs)
 
             if side == "BUY":
-                per_share_cash = fill_px * (1.0 + costs.commission_bps / 10_000.0)
-                affordable = int(floor(state.cash / max(per_share_cash, 1e-12) / costs.lot_size) * costs.lot_size)
+                per_share_cash = (
+                    fill_px * (1.0 + costs.commission_bps / 10_000.0) * factor
+                )
+                affordable = int(
+                    floor(state.cash / max(per_share_cash, 1e-12) / costs.lot_size)
+                    * costs.lot_size
+                )
                 qty = min(qty, affordable)
                 if qty <= 0:
                     continue
-                gross = qty * fill_px
-                fees = _trade_costs(side, gross, costs)
-                state.cash -= gross + fees
+                gross_local = qty * fill_px
+                fees_local = _trade_costs(side, gross_local, costs)
+                state.cash -= (gross_local + fees_local) * factor
                 state.shares[symbol] = current + qty
             else:
-                state.cash += gross - fees
+                state.cash += (gross_local - fees_local) * factor
                 state.shares[symbol] = current - qty
 
+            gross = gross_local * factor
+            fees = fees_local * factor
+            slippage_local = abs(fill_px - ref) * qty
             fills.append(
                 Fill(
                     timestamp=timestamp,
@@ -217,7 +277,12 @@ def rebalance_at_open(
                     fill_price=float(fill_px),
                     gross_value=float(gross),
                     fees=float(fees),
-                    slippage_cost=float(abs(fill_px - ref) * qty),
+                    slippage_cost=float(slippage_local * factor),
+                    local_currency=currency_for_symbol(symbol),
+                    fx_to_base=factor,
+                    gross_value_local=float(gross_local),
+                    fees_local=float(fees_local),
+                    slippage_cost_local=float(slippage_local),
                 )
             )
     return fills

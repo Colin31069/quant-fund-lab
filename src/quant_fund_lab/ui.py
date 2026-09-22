@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -9,7 +10,7 @@ from quant_fund_lab.analytics import buy_and_hold_equity, metric_frame
 from quant_fund_lab.config import BacktestConfig, StrategyConfig
 from quant_fund_lab.data import MarketData, download_yahoo, synthetic_market_data
 from quant_fund_lab.data_quality import validate_corporate_actions
-from quant_fund_lab.execution import market_for_symbol
+from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
 from quant_fund_lab.paper import historical_vs_paper_replay
 
 st.set_page_config(page_title="Quant Fund Lab", layout="wide")
@@ -21,9 +22,15 @@ with st.sidebar:
     data_mode = st.selectbox("資料來源", ["Yahoo 公開市場資料", "離線合成資料"])
     symbols_text = st.text_input("交易標的", "AAPL,MSFT,NVDA,GOOGL")
     benchmark = st.text_input("比較基準", "SPY")
+    base_currency = st.selectbox("投資組合基準幣別", ["TWD", "USD"])
     end_date = st.date_input("結束日", value=datetime.now(timezone.utc).date())
     start_date = st.date_input("開始日", value=end_date - timedelta(days=365 * 4))
-    initial_cash = st.number_input("虛擬初始資金", min_value=10_000.0, value=1_000_000.0, step=100_000.0)
+    initial_cash = st.number_input(
+        f"虛擬初始資金（{base_currency}）",
+        min_value=10_000.0,
+        value=1_000_000.0,
+        step=100_000.0,
+    )
     max_weight = st.slider("單一標的最大權重", 0.05, 0.50, 0.25, 0.05)
     rebalance_every = st.slider("再平衡頻率（交易日）", 1, 20, 5)
     train_fraction = st.slider("回測 / paper replay 切分", 0.55, 0.90, 0.70, 0.05)
@@ -43,15 +50,15 @@ if run:
     if len(trade_symbols) < 2:
         st.error("至少提供兩個交易標的，橫斷面模型才有意義。")
         st.stop()
-    trade_markets = {market_for_symbol(symbol) for symbol in trade_symbols}
-    benchmark_market = market_for_symbol(benchmark.strip().upper())
-    if len(trade_markets) != 1 or benchmark_market not in trade_markets:
-        st.error("MVP 尚未做 USD/TWD 匯率換算；請一次只跑美股或只跑台股，且 benchmark 要同市場。")
-        st.stop()
 
     try:
         with st.spinner("載入資料並執行 walk-forward paper replay..."):
             raw = load_data(data_mode, tuple(all_symbols), str(start_date), str(end_date + timedelta(days=1)))
+            if data_mode == "Yahoo 公開市場資料":
+                raw = attach_yahoo_fx(raw, base_currency=base_currency)
+            else:
+                synthetic_usd_twd = pd.Series(32.0, index=raw.close.index, dtype=float)
+                raw = attach_fx_rates(raw, base_currency, usd_twd=synthetic_usd_twd)
             trade_data = MarketData(
                 open=raw.open[trade_symbols],
                 close=raw.close[trade_symbols],
@@ -63,14 +70,29 @@ if run:
                 ),
                 dividends=raw.dividends[trade_symbols] if raw.dividends is not None else None,
                 stock_splits=raw.stock_splits[trade_symbols] if raw.stock_splits is not None else None,
+                fx_to_base=raw.fx_to_base[trade_symbols] if raw.fx_to_base is not None else None,
+                fx_age_days=raw.fx_age_days[trade_symbols] if raw.fx_age_days is not None else None,
+                base_currency=raw.base_currency,
                 exchange=raw.exchange,
             )
             strategy = StrategyConfig(max_weight=max_weight, rebalance_every=rebalance_every)
-            config = BacktestConfig(initial_cash=initial_cash, strategy=strategy)
+            config = BacktestConfig(
+                initial_cash=initial_cash,
+                base_currency=base_currency,
+                strategy=strategy,
+            )
             comparison = historical_vs_paper_replay(trade_data, config, train_fraction=train_fraction)
             action_report = validate_corporate_actions(trade_data)
+            fx_report = validate_fx(trade_data, config.max_fx_staleness_days)
 
-        st.success(f"切分日：{comparison.split_date.date()}；其後區段以重置虛擬資金做 paper replay。")
+        st.success(
+            f"切分日：{comparison.split_date.date()}；其後區段以重置虛擬資金做 paper replay。"
+            f" NAV 基準幣別：{comparison.paper_replay.base_currency}。"
+        )
+        st.caption(
+            f"FX 最大沿用天數：{fx_report.max_age_days:.0f} 日；"
+            "換匯只允許使用當日或更早的匯率，不使用未來資料。"
+        )
         session_report = comparison.paper_replay.session_validation
         if not action_report.is_valid:
             st.warning(
@@ -105,7 +127,10 @@ if run:
         with col2:
             st.subheader("Paper Replay 與市場基準")
             paper_equity = comparison.paper_replay.equity_curve["equity"]
-            benchmark_close = raw.close[benchmark.strip().upper()].reindex(paper_equity.index).ffill().dropna()
+            benchmark_symbol = benchmark.strip().upper()
+            benchmark_close = (
+                raw.close[benchmark_symbol] * raw.fx_to_base[benchmark_symbol]
+            ).reindex(paper_equity.index).ffill().dropna()
             benchmark_equity = buy_and_hold_equity(benchmark_close, initial_cash)
             comparison_frame = metric_frame({"paper_replay": paper_equity, "benchmark": benchmark_equity})
             st.dataframe(comparison_frame, use_container_width=True)
@@ -127,8 +152,9 @@ if run:
                 st.info("此區段沒有成交，因此沒有交易成本。")
             else:
                 c1, c2, c3 = st.columns(3)
-                c1.metric("總手續費/稅費", f"{costs['fees'].sum():,.2f}")
-                c2.metric("估計滑價成本", f"{costs['slippage_cost'].sum():,.2f}")
+                currency = comparison.paper_replay.base_currency
+                c1.metric(f"總手續費/稅費（{currency}）", f"{costs['fees'].sum():,.2f}")
+                c2.metric(f"估計滑價成本（{currency}）", f"{costs['slippage_cost'].sum():,.2f}")
                 c3.metric("累積單向換手", f"{costs['turnover_rate'].sum():.2f}x")
                 st.dataframe(costs.tail(50), use_container_width=True, height=360)
         with tab3:

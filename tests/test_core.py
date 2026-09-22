@@ -7,6 +7,7 @@ from quant_fund_lab.config import BacktestConfig, StrategyConfig
 from quant_fund_lab.data import MarketData, synthetic_market_data
 from quant_fund_lab.data_quality import validate_corporate_actions
 from quant_fund_lab.execution import PortfolioState, apply_terminal_returns, rebalance_at_open
+from quant_fund_lab.fx import attach_fx_rates, validate_fx
 from quant_fund_lab.market_calendar import require_valid_daily_sessions, validate_daily_sessions
 from quant_fund_lab.models import ensemble_alpha
 from quant_fund_lab.portfolio import optimize_weights
@@ -31,10 +32,43 @@ def test_optimizer_respects_long_only_caps():
     assert float(weights.sum()) <= 1.000001
 
 
-def test_backtest_rejects_mixed_currency_markets():
+def test_fx_direction_and_mixed_currency_backtest():
     data = synthetic_market_data(symbols=("AAPL", "2330.TW"), periods=220)
-    cfg = BacktestConfig(strategy=StrategyConfig(warmup_days=80))
-    with pytest.raises(ValueError, match="FX conversion"):
+    usd_twd = pd.Series(32.0, index=data.close.index, dtype=float)
+    usd_data = attach_fx_rates(data, "USD", usd_twd=usd_twd)
+    assert (usd_data.fx_to_base["AAPL"] == 1.0).all()
+    assert np.allclose(usd_data.fx_to_base["2330.TW"], 1.0 / 32.0)
+
+    twd_data = attach_fx_rates(data, "TWD", usd_twd=usd_twd)
+    assert (twd_data.fx_to_base["AAPL"] == 32.0).all()
+    assert (twd_data.fx_to_base["2330.TW"] == 1.0).all()
+
+    cfg = BacktestConfig(
+        initial_cash=1_000_000,
+        base_currency="USD",
+        strategy=StrategyConfig(warmup_days=80, rebalance_every=5, max_weight=0.5),
+    )
+    result = run_backtest(usd_data, cfg)
+    assert result.base_currency == "USD"
+    assert not result.fills.empty
+    assert result.equity_curve["equity"].gt(0).all()
+
+
+def test_fx_alignment_never_backfills_and_rejects_stale_rates():
+    data = synthetic_market_data(symbols=("AAPL", "2330.TW"), periods=30)
+    late = pd.Series(32.0, index=data.close.index[2:], dtype=float)
+    with pytest.raises(ValueError, match="no prior observation"):
+        attach_fx_rates(data, "USD", usd_twd=late)
+
+    stale = pd.Series([32.0], index=[data.close.index[0]], dtype=float)
+    with pytest.raises(ValueError, match="stale"):
+        attach_fx_rates(data, "USD", usd_twd=stale, max_staleness_days=5)
+
+
+def test_backtest_rejects_mixed_currency_without_fx():
+    data = synthetic_market_data(symbols=("AAPL", "2330.TW"), periods=220)
+    cfg = BacktestConfig(base_currency="USD", strategy=StrategyConfig(warmup_days=80))
+    with pytest.raises(ValueError, match="mixed-currency"):
         run_backtest(data, cfg)
 
 
@@ -73,6 +107,27 @@ def test_zero_volume_bar_cannot_fill():
     )
     assert fills == []
     assert state.cash == 1_000_000
+
+
+def test_execution_converts_local_trade_cashflow_to_base_currency():
+    cfg = BacktestConfig(base_currency="USD", strategy=StrategyConfig(warmup_days=20))
+    state = PortfolioState(cash=10_000.0)
+    fills = rebalance_at_open(
+        state=state,
+        target_weights=pd.Series({"2330.TW": 0.5}),
+        open_prices=pd.Series({"2330.TW": 100.0}),
+        volumes=pd.Series({"2330.TW": 1_000_000.0}),
+        reference_prices=pd.Series({"2330.TW": 99.0}),
+        timestamp=pd.Timestamp("2026-01-05"),
+        config=cfg,
+        fx_to_base=pd.Series({"2330.TW": 1.0 / 32.0}),
+    )
+    assert fills
+    fill = fills[0]
+    assert fill.local_currency == "TWD"
+    assert fill.fx_to_base == pytest.approx(1.0 / 32.0)
+    assert fill.gross_value == pytest.approx(fill.gross_value_local / 32.0)
+    assert state.cash < 10_000.0
 
 
 def test_tw_round_lot_and_locked_limit_guard():
@@ -185,12 +240,26 @@ def test_corporate_action_validation_flags_bad_metadata():
     assert report.negative_dividend_events
 
 
+def test_snapshot_preserves_fx_metadata(tmp_path):
+    data = synthetic_market_data(symbols=("AAPL", "2330.TW"), periods=80)
+    usd_twd = pd.Series(32.0, index=data.close.index, dtype=float)
+    converted = attach_fx_rates(data, "USD", usd_twd=usd_twd)
+    root = tmp_path / "fx-snapshot"
+    manifest = save_market_data_snapshot(converted, root)
+    loaded = load_market_data_snapshot(root)
+    assert manifest.base_currency == "USD"
+    assert loaded.base_currency == "USD"
+    pd.testing.assert_frame_equal(loaded.fx_to_base, converted.fx_to_base, check_freq=False)
+    assert validate_fx(loaded).is_valid
+
+
 def test_snapshot_round_trip_and_integrity(tmp_path):
     data = synthetic_market_data(symbols=("AAA", "BBB"), periods=80)
     root = tmp_path / "snapshot"
     manifest = save_market_data_snapshot(data, root)
     loaded = load_market_data_snapshot(root)
     assert manifest.dataset_id
+    assert manifest.base_currency is None
     pd.testing.assert_frame_equal(loaded.close, data.close, check_freq=False)
     pd.testing.assert_frame_equal(loaded.membership, data.membership, check_freq=False)
 
