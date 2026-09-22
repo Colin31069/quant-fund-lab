@@ -13,6 +13,7 @@ from quant_fund_lab.data_quality import validate_corporate_actions
 from quant_fund_lab.diagnostics import diagnose_walk_forward
 from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
 from quant_fund_lab.paper import historical_vs_paper_replay
+from quant_fund_lab.paper_live import replay_targets_persistently
 from quant_fund_lab.walkforward import (
     WalkForwardSpec,
     generate_candidate_grid,
@@ -51,6 +52,8 @@ with st.sidebar:
     risk_budget_penalty = st.slider(
         "Risk-budget penalty", 0.0, 0.010, 0.001, 0.001, format="%.3f"
     )
+    st.markdown("**M3 Persistent Paper Trading**")
+    persist_paper_ledger = st.checkbox("建立本機 persistent paper ledger", value=False)
     run = st.button("執行模型", type="primary", use_container_width=True)
 
 
@@ -108,6 +111,33 @@ if run:
             comparison = historical_vs_paper_replay(trade_data, config, train_fraction=train_fraction)
             action_report = validate_corporate_actions(trade_data)
             fx_report = validate_fx(trade_data, config.max_fx_staleness_days)
+            benchmark_symbol = benchmark.strip().upper()
+            benchmark_close_base = (
+                raw.close[benchmark_symbol] * raw.fx_to_base[benchmark_symbol]
+            ).ffill().dropna()
+            persistent_nav = None
+            persistent_orders = None
+            persistent_fills = None
+            persistent_positions = None
+            persistent_snapshots = None
+            if persist_paper_ledger:
+                ledger = replay_targets_persistently(
+                    trade_data,
+                    comparison.paper_replay.weights,
+                    config,
+                    "artifacts/paper_trading.sqlite",
+                    snapshot_root="artifacts/paper_snapshots",
+                    benchmark_close_base=benchmark_close_base,
+                    reset=True,
+                )
+                try:
+                    persistent_nav = ledger.nav_history()
+                    persistent_orders = ledger.orders()
+                    persistent_fills = ledger.fills()
+                    persistent_positions = ledger.positions()
+                    persistent_snapshots = ledger.snapshots()
+                finally:
+                    ledger.close()
 
         st.success(
             f"切分日：{comparison.split_date.date()}；其後區段以重置虛擬資金做 paper replay。"
@@ -151,10 +181,7 @@ if run:
         with col2:
             st.subheader("Paper Replay 與市場基準")
             paper_equity = comparison.paper_replay.equity_curve["equity"]
-            benchmark_symbol = benchmark.strip().upper()
-            benchmark_close = (
-                raw.close[benchmark_symbol] * raw.fx_to_base[benchmark_symbol]
-            ).reindex(paper_equity.index).ffill().dropna()
+            benchmark_close = benchmark_close_base.reindex(paper_equity.index).ffill().dropna()
             benchmark_equity = buy_and_hold_equity(benchmark_close, initial_cash)
             comparison_frame = metric_frame({"paper_replay": paper_equity, "benchmark": benchmark_equity})
             st.dataframe(comparison_frame, use_container_width=True)
@@ -185,6 +212,56 @@ if run:
                 "Regime 與 factor exposure 每次只使用 signal date 當下以前的資料。"
             )
             st.dataframe(regimes.tail(30), use_container_width=True, height=260)
+
+        if persistent_nav is not None and not persistent_nav.empty:
+            st.subheader("M3 Persistent Paper Ledger")
+            latest_nav = persistent_nav.iloc[-1]
+            open_order_count = int(
+                persistent_orders["status"].isin(["NEW", "PARTIAL"]).sum()
+                if persistent_orders is not None and not persistent_orders.empty
+                else 0
+            )
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric(
+                f"Ledger NAV ({base_currency})",
+                f"{float(latest_nav['equity']):,.2f}",
+            )
+            p2.metric("Realized PnL", f"{float(latest_nav['realized_pnl']):,.2f}")
+            p3.metric("Unrealized PnL", f"{float(latest_nav['unrealized_pnl']):,.2f}")
+            p4.metric("Open / Partial Orders", str(open_order_count))
+            ledger_fig = go.Figure()
+            ledger_fig.add_trace(
+                go.Scatter(x=persistent_nav.index, y=persistent_nav["equity"], name="Paper ledger NAV")
+            )
+            if persistent_nav["benchmark_equity"].notna().any():
+                ledger_fig.add_trace(
+                    go.Scatter(
+                        x=persistent_nav.index,
+                        y=persistent_nav["benchmark_equity"],
+                        name="Benchmark",
+                    )
+                )
+            ledger_fig.update_layout(
+                title="Persistent paper NAV vs benchmark",
+                yaxis_title=base_currency,
+                height=380,
+            )
+            st.plotly_chart(ledger_fig, use_container_width=True)
+            st.caption(
+                "SQLite: artifacts/paper_trading.sqlite；每日可重現 market snapshots: "
+                "artifacts/paper_snapshots/。未成交數量會保持 NEW/PARTIAL 並在後續交易日重試。"
+            )
+            pt1, pt2, pt3, pt4 = st.tabs(
+                ["Persistent Orders", "Persistent Fills", "Positions", "Daily Snapshots"]
+            )
+            with pt1:
+                st.dataframe(persistent_orders, use_container_width=True, height=300)
+            with pt2:
+                st.dataframe(persistent_fills, use_container_width=True, height=300)
+            with pt3:
+                st.dataframe(persistent_positions, use_container_width=True, height=300)
+            with pt4:
+                st.dataframe(persistent_snapshots, use_container_width=True, height=300)
 
         if run_walkforward:
             st.subheader("Walk-forward Out-of-Sample")

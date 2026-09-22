@@ -181,6 +181,120 @@ def apply_terminal_returns(
     return events
 
 
+def desired_quantities(
+    state: PortfolioState,
+    target_weights: pd.Series,
+    prices: pd.Series,
+    config: BacktestConfig,
+    fx_to_base: pd.Series | None = None,
+) -> dict[str, int]:
+    """Translate target weights into lot-rounded desired share quantities."""
+
+    symbols = list(target_weights.index)
+    factors = pd.Series(
+        {symbol: _fx_factor(symbol, fx_to_base) for symbol in symbols}, dtype=float
+    )
+    equity = state.equity(prices, factors)
+    desired: dict[str, int] = {}
+    for symbol in symbols:
+        price = float(prices.get(symbol, float("nan")))
+        if not pd.notna(price) or price <= 0.0:
+            desired[symbol] = state.shares.get(symbol, 0)
+            continue
+        costs = _cost_config(symbol, config)
+        desired_value = max(float(target_weights[symbol]), 0.0) * equity
+        base_price = price * float(factors[symbol])
+        desired[symbol] = int(
+            floor(desired_value / base_price / costs.lot_size) * costs.lot_size
+        )
+    return desired
+
+
+def execute_market_order(
+    state: PortfolioState,
+    symbol: str,
+    side: str,
+    quantity: int,
+    open_price: float,
+    volume: float,
+    reference_price: float,
+    timestamp: pd.Timestamp,
+    config: BacktestConfig,
+    fx_to_base: float = 1.0,
+) -> Fill | None:
+    """Execute one virtual market order with the same rules used by backtests."""
+
+    side = side.upper()
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("side must be BUY or SELL")
+    costs = _cost_config(symbol, config)
+    ref = float(open_price)
+    available_volume = max(float(volume), 0.0)
+    if quantity <= 0 or available_volume <= 0.0 or not pd.notna(ref) or ref <= 0.0:
+        return None
+    if _blocked_by_price_limit(symbol, side, ref, float(reference_price), costs):
+        return None
+    if not pd.notna(fx_to_base) or fx_to_base <= 0.0:
+        raise ValueError(f"missing or invalid FX conversion factor for {symbol}")
+
+    max_liquidity_qty = int(
+        floor(available_volume * costs.max_participation / costs.lot_size) * costs.lot_size
+    )
+    qty = min(int(quantity), max_liquidity_qty)
+    qty = int(floor(qty / costs.lot_size) * costs.lot_size)
+    current = state.shares.get(symbol, 0)
+    if side == "SELL":
+        qty = min(qty, current)
+    if qty <= 0:
+        return None
+
+    participation = qty / max(available_volume, 1.0)
+    slip_rate = (
+        costs.slippage_bps / 10_000.0
+        + costs.impact_coefficient * sqrt(participation) / 100.0
+    )
+    fill_px = ref * (1.0 + slip_rate if side == "BUY" else 1.0 - slip_rate)
+    factor = float(fx_to_base)
+    gross_local = qty * fill_px
+    fees_local = _trade_costs(side, gross_local, costs)
+
+    if side == "BUY":
+        per_share_cash = fill_px * (1.0 + costs.commission_bps / 10_000.0) * factor
+        affordable = int(
+            floor(state.cash / max(per_share_cash, 1e-12) / costs.lot_size) * costs.lot_size
+        )
+        qty = min(qty, affordable)
+        if qty <= 0:
+            return None
+        gross_local = qty * fill_px
+        fees_local = _trade_costs(side, gross_local, costs)
+        state.cash -= (gross_local + fees_local) * factor
+        state.shares[symbol] = current + qty
+    else:
+        state.cash += (gross_local - fees_local) * factor
+        state.shares[symbol] = current - qty
+
+    gross = gross_local * factor
+    fees = fees_local * factor
+    slippage_local = abs(fill_px - ref) * qty
+    return Fill(
+        timestamp=timestamp,
+        symbol=symbol,
+        side=side,
+        quantity=qty,
+        reference_price=ref,
+        fill_price=float(fill_px),
+        gross_value=float(gross),
+        fees=float(fees),
+        slippage_cost=float(slippage_local * factor),
+        local_currency=currency_for_symbol(symbol),
+        fx_to_base=factor,
+        gross_value_local=float(gross_local),
+        fees_local=float(fees_local),
+        slippage_cost_local=float(slippage_local),
+    )
+
+
 def rebalance_at_open(
     state: PortfolioState,
     target_weights: pd.Series,
@@ -199,20 +313,9 @@ def rebalance_at_open(
     factors = pd.Series(
         {symbol: _fx_factor(symbol, fx_to_base) for symbol in symbols}, dtype=float
     )
-    equity = state.equity(valuation_prices, factors)
-
-    desired_qty: dict[str, int] = {}
-    for symbol in symbols:
-        px = float(open_prices[symbol])
-        if not pd.notna(px) or px <= 0:
-            desired_qty[symbol] = state.shares.get(symbol, 0)
-            continue
-        costs = _cost_config(symbol, config)
-        desired_value = max(float(target_weights[symbol]), 0.0) * equity
-        base_price = px * float(factors[symbol])
-        desired_qty[symbol] = int(
-            floor(desired_value / base_price / costs.lot_size) * costs.lot_size
-        )
+    desired_qty = desired_quantities(
+        state, target_weights, valuation_prices, config, factors
+    )
 
     for side in ("SELL", "BUY"):
         for symbol in symbols:
@@ -220,69 +323,18 @@ def rebalance_at_open(
             delta = desired_qty[symbol] - current
             if (side == "SELL" and delta >= 0) or (side == "BUY" and delta <= 0):
                 continue
-
-            costs = _cost_config(symbol, config)
-            ref = float(open_prices[symbol])
-            volume = max(float(volumes.get(symbol, 0.0)), 0.0)
-            reference_price = float(reference_prices.get(symbol, float("nan")))
-            if volume <= 0.0 or not pd.notna(ref) or ref <= 0.0:
-                continue
-            if _blocked_by_price_limit(symbol, side, ref, reference_price, costs):
-                continue
-            max_liquidity_qty = int(floor(volume * costs.max_participation / costs.lot_size) * costs.lot_size)
-            requested = abs(delta)
-            qty = min(requested, max_liquidity_qty)
-            qty = int(floor(qty / costs.lot_size) * costs.lot_size)
-            if side == "SELL":
-                qty = min(qty, current)
-            if qty <= 0:
-                continue
-
-            participation = qty / max(volume, 1.0)
-            slip_rate = costs.slippage_bps / 10_000.0 + costs.impact_coefficient * sqrt(participation) / 100.0
-            fill_px = ref * (1.0 + slip_rate if side == "BUY" else 1.0 - slip_rate)
-            factor = float(factors[symbol])
-            gross_local = qty * fill_px
-            fees_local = _trade_costs(side, gross_local, costs)
-
-            if side == "BUY":
-                per_share_cash = (
-                    fill_px * (1.0 + costs.commission_bps / 10_000.0) * factor
-                )
-                affordable = int(
-                    floor(state.cash / max(per_share_cash, 1e-12) / costs.lot_size)
-                    * costs.lot_size
-                )
-                qty = min(qty, affordable)
-                if qty <= 0:
-                    continue
-                gross_local = qty * fill_px
-                fees_local = _trade_costs(side, gross_local, costs)
-                state.cash -= (gross_local + fees_local) * factor
-                state.shares[symbol] = current + qty
-            else:
-                state.cash += (gross_local - fees_local) * factor
-                state.shares[symbol] = current - qty
-
-            gross = gross_local * factor
-            fees = fees_local * factor
-            slippage_local = abs(fill_px - ref) * qty
-            fills.append(
-                Fill(
-                    timestamp=timestamp,
-                    symbol=symbol,
-                    side=side,
-                    quantity=qty,
-                    reference_price=ref,
-                    fill_price=float(fill_px),
-                    gross_value=float(gross),
-                    fees=float(fees),
-                    slippage_cost=float(slippage_local * factor),
-                    local_currency=currency_for_symbol(symbol),
-                    fx_to_base=factor,
-                    gross_value_local=float(gross_local),
-                    fees_local=float(fees_local),
-                    slippage_cost_local=float(slippage_local),
-                )
+            fill = execute_market_order(
+                state=state,
+                symbol=symbol,
+                side=side,
+                quantity=abs(delta),
+                open_price=float(open_prices.get(symbol, float("nan"))),
+                volume=float(volumes.get(symbol, 0.0)),
+                reference_price=float(reference_prices.get(symbol, float("nan"))),
+                timestamp=timestamp,
+                config=config,
+                fx_to_base=float(factors[symbol]),
             )
+            if fill is not None:
+                fills.append(fill)
     return fills

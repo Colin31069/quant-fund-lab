@@ -118,7 +118,7 @@ Streamlit local dashboard：
 
 ### M3 — Persistent paper trading
 
-每日資料快照、SQLite/DuckDB ledger、虛擬訂單狀態、pending/partial fills、PnL attribution、基準與實際 observed close 對帳。
+**M3 已完成。** `PaperLedger` 使用 SQLite 持久化 cash、positions、orders、fills、terminal events、daily position marks、NAV 與 snapshots。Target-weight 訂單在 signal close 後建立，最早下一根 open 執行；NEW/PARTIAL 未成交數量會跨交易日保留重試，新 rebalance 會以 `CANCELLED_REPLACED` 明確取代舊 target。Historical backtest 與 persistent paper trader 共用 `execute_market_order`，因此 commission / tax / SEC fee / slippage / participation cap / TW lot / locked-limit 規則一致。每日 close 以 observed close + FX 標記持倉，分離 realized / unrealized PnL、累積 fees/slippage，並保存 benchmark equity 與 ledger-vs-position reconciliation error。每個交易日可輸出 SHA-256 market-data snapshot 並把 dataset ID/path 寫入 ledger；SQLite 關閉後可重新開啟，延續 pending orders。UI 可選擇建立 `artifacts/paper_trading.sqlite` 與 `artifacts/paper_snapshots/` 的可視化 replay。
 
 ### M4 — Production hardening
 
