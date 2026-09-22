@@ -45,6 +45,7 @@ def export_research_report(
         "alphas.csv": root / "alphas.csv",
         "regimes.csv": root / "regimes.csv",
         "cost_attribution.csv": root / "cost_attribution.csv",
+        "factor_weights.csv": root / "factor_weights.csv",
     }
     _write_frame(result.equity_curve, files["equity_curve.csv"])
     _write_frame(result.fills, files["fills.csv"])
@@ -52,6 +53,7 @@ def export_research_report(
     _write_frame(result.alphas, files["alphas.csv"])
     _write_frame(result.regimes, files["regimes.csv"])
     _write_frame(result.cost_attribution, files["cost_attribution.csv"])
+    _write_frame(result.factor_weights, files["factor_weights.csv"])
 
     metrics_path = root / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")

@@ -93,6 +93,29 @@ def test_backtest_produces_equity_and_trades():
     }
 
 
+def test_backtest_factor_overlay_records_learned_weights():
+    data = synthetic_market_data(
+        symbols=("A", "B", "C", "D", "E", "F", "G", "H"), periods=340, seed=62
+    )
+    cfg = BacktestConfig(
+        initial_cash=500_000,
+        strategy=StrategyConfig(
+            warmup_days=160,
+            rebalance_every=20,
+            max_weight=0.25,
+            factor_alpha_enabled=True,
+            factor_alpha_weight=0.30,
+            factor_ic_lookback=20,
+            factor_ic_min_observations=4,
+        ),
+    )
+    result = run_backtest(data, cfg)
+    assert not result.factor_weights.empty
+    assert np.isfinite(result.factor_weights.fillna(0.0).to_numpy()).all()
+    assert (result.factor_weights.fillna(0.0).abs().sum(axis=1) <= 1.000001).all()
+    assert result.equity_curve["equity"].gt(0.0).all()
+
+
 def test_zero_volume_bar_cannot_fill():
     cfg = BacktestConfig(strategy=StrategyConfig(warmup_days=20))
     state = PortfolioState(cash=1_000_000)

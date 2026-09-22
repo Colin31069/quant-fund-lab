@@ -13,6 +13,12 @@ from .execution import (
     market_for_symbol,
     rebalance_at_open,
 )
+from .factors import (
+    build_market_factor_panel,
+    factor_alpha_from_precomputed,
+    information_coefficient_series,
+    orthogonalize_factor_panel,
+)
 from .fx import currency_for_symbol, validate_fx
 from .market_calendar import SessionValidation, require_valid_daily_sessions
 from .models import ensemble_alpha
@@ -32,6 +38,7 @@ class BacktestResult:
     base_currency: str
     max_fx_age_days: float
     regimes: pd.DataFrame
+    factor_weights: pd.DataFrame
 
 
 def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> BacktestResult:
@@ -78,7 +85,20 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     fill_rows: list[dict[str, object]] = []
     terminal_rows: list[dict[str, object]] = []
     regime_rows: list[dict[str, object]] = []
+    factor_weight_rows: list[pd.Series] = []
     target = pd.Series(0.0, index=data.symbols)
+    factor_panel = pd.DataFrame()
+    factor_ic = pd.DataFrame()
+    if strategy.factor_alpha_enabled:
+        factor_panel = build_market_factor_panel(data, sampling_every=1)
+        if strategy.factor_orthogonalization:
+            factor_panel = orthogonalize_factor_panel(factor_panel)
+        factor_prices = data.close * fx_to_base
+        factor_ic = information_coefficient_series(
+            factor_panel,
+            factor_prices,
+            horizons=(strategy.factor_ic_horizon,),
+        )
 
     start_i = strategy.warmup_days - 1
     initial_date = dates[start_i]
@@ -114,6 +134,22 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
             else:
                 regime = detect_market_regime(history, strategy.regime_lookback)
                 raw_alpha = alpha_frame["ensemble"]
+            if strategy.factor_alpha_enabled:
+                factor_signal = factor_alpha_from_precomputed(
+                    factor_panel,
+                    factor_ic,
+                    pd.Timestamp(signal_date),
+                    data.symbols,
+                    horizon=strategy.factor_ic_horizon,
+                    lookback=strategy.factor_ic_lookback,
+                    min_observations=strategy.factor_ic_min_observations,
+                )
+                overlay = float(np.clip(strategy.factor_alpha_weight, 0.0, 1.0))
+                if not factor_signal.weights.empty:
+                    raw_alpha = (1.0 - overlay) * raw_alpha + overlay * factor_signal.score
+                factor_weight_row = factor_signal.weights.copy()
+                factor_weight_row.name = signal_date
+                factor_weight_rows.append(factor_weight_row)
             factor_returns = history.pct_change(fill_method=None).tail(strategy.factor_lookback)
             if strategy.factor_neutralization:
                 neutral_alpha, _ = neutralize_alpha(raw_alpha, factor_returns, eligible=eligible)
@@ -183,6 +219,11 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         if regime_rows
         else pd.DataFrame(columns=["label", "trend_z", "annual_volatility", "gross_exposure_limit"])
     )
+    factor_weights_df = (
+        pd.DataFrame(factor_weight_rows).sort_index()
+        if factor_weight_rows
+        else pd.DataFrame()
+    )
     if fills_df.empty:
         costs_df = pd.DataFrame(columns=["gross_turnover", "fees", "slippage_cost", "total_cost", "turnover_rate"])
     else:
@@ -202,4 +243,5 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         base_currency=base_currency,
         max_fx_age_days=float(fx_age_days.max().max()),
         regimes=regimes_df,
+        factor_weights=factor_weights_df,
     )

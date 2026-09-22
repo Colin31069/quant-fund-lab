@@ -38,6 +38,12 @@ class StrategyConfig:
     factor_neutralization_strength: float = 0.50
     factor_lookback: int = 60
     risk_budget_penalty: float = 0.001
+    factor_alpha_enabled: bool = False
+    factor_alpha_weight: float = 0.30
+    factor_ic_horizon: int = 5
+    factor_ic_lookback: int = 60
+    factor_ic_min_observations: int = 12
+    factor_orthogonalization: bool = True
 
 
 @dataclass(frozen=True)

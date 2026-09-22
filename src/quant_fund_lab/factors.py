@@ -21,6 +21,12 @@ class FactorResearchResult:
     turnover: pd.Series
 
 
+@dataclass(frozen=True)
+class FactorAlphaSignal:
+    score: pd.Series
+    weights: pd.Series
+
+
 def _cross_sectional_zscore(frame: pd.DataFrame, eligible: pd.DataFrame) -> pd.DataFrame:
     result = pd.DataFrame(np.nan, index=frame.index, columns=frame.columns, dtype=float)
     for timestamp in frame.index:
@@ -127,7 +133,9 @@ def information_coefficient_series(
     if min_cross_section < 3:
         raise ValueError("min_cross_section must be >= 3")
     if factor_panel.empty:
-        return pd.DataFrame(columns=["factor", "horizon", "ic", "rank_ic", "n"])
+        return pd.DataFrame(
+            columns=["realized_at", "factor", "horizon", "ic", "rank_ic", "n"]
+        )
     rows: list[dict[str, object]] = []
     for horizon in horizons:
         forward = _forward_returns(close, horizon)
@@ -148,6 +156,9 @@ def information_coefficient_series(
                 rows.append(
                     {
                         "timestamp": pd.Timestamp(timestamp),
+                        "realized_at": pd.Timestamp(
+                            close.index[close.index.get_loc(timestamp) + horizon]
+                        ),
                         "factor": factor,
                         "horizon": int(horizon),
                         "ic": float(aligned["score"].corr(aligned["forward"], method="pearson")),
@@ -156,7 +167,9 @@ def information_coefficient_series(
                     }
                 )
     if not rows:
-        return pd.DataFrame(columns=["factor", "horizon", "ic", "rank_ic", "n"])
+        return pd.DataFrame(
+            columns=["realized_at", "factor", "horizon", "ic", "rank_ic", "n"]
+        )
     return pd.DataFrame(rows).set_index("timestamp").sort_index()
 
 
@@ -228,6 +241,131 @@ def factor_rank_turnover(factor_panel: pd.DataFrame) -> pd.Series:
                 changes.append(float((pair.iloc[:, 1] - pair.iloc[:, 0]).abs().mean()))
         result[str(factor)] = float(np.mean(changes)) if changes else float("nan")
     return pd.Series(result, name="rank_turnover").sort_index()
+
+
+def orthogonalize_factor_panel(factor_panel: pd.DataFrame) -> pd.DataFrame:
+    """Sequentially residualize factor scores cross-sectionally in deterministic order."""
+
+    if factor_panel.empty:
+        return factor_panel.copy()
+    preferred_order = [
+        "momentum_252_21",
+        "momentum_63_5",
+        "short_reversal_5",
+        "low_volatility_60",
+        "low_beta_126",
+        "liquidity_20",
+        "volume_surprise_5_20",
+    ]
+    present = list(factor_panel.index.get_level_values("factor").unique())
+    order = [factor for factor in preferred_order if factor in present]
+    order.extend(sorted(factor for factor in present if factor not in order))
+    rows: list[pd.DataFrame] = []
+    for timestamp in factor_panel.index.get_level_values("timestamp").unique():
+        snapshot = factor_panel.xs(timestamp, level="timestamp")["score"].unstack("factor")
+        timestamp_order = [factor for factor in order if factor in snapshot.columns]
+        orthogonal = pd.DataFrame(index=snapshot.index, columns=timestamp_order, dtype=float)
+        orthogonal.index.name = "symbol"
+        orthogonal.columns.name = "factor"
+        completed: list[str] = []
+        for factor in timestamp_order:
+            residual = snapshot[factor].astype(float).copy()
+            for previous in completed:
+                pair = pd.concat(
+                    [residual.rename("y"), orthogonal[previous].rename("x")], axis=1
+                ).dropna()
+                if len(pair) < 3 or float(pair["x"].std(ddof=0)) <= _EPS:
+                    continue
+                x = pair["x"] - pair["x"].mean()
+                y = pair["y"] - pair["y"].mean()
+                beta = float((x * y).sum() / max(float((x * x).sum()), _EPS))
+                residual.loc[pair.index] = pair["y"] - beta * pair["x"]
+            active = residual.dropna()
+            if len(active) >= 2:
+                std = float(active.std(ddof=0))
+                orthogonal.loc[active.index, factor] = (
+                    (active - active.mean()) / std if std > _EPS else 0.0
+                )
+            completed.append(factor)
+        stacked = orthogonal.stack(future_stack=True).dropna().rename("score").to_frame()
+        stacked["timestamp"] = pd.Timestamp(timestamp)
+        rows.append(stacked.reset_index())
+    result = pd.concat(rows, ignore_index=True)
+    return result.set_index(["timestamp", "symbol", "factor"]).sort_index()
+
+
+def learn_factor_ic_weights(
+    ic_series: pd.DataFrame,
+    signal_date: pd.Timestamp,
+    horizon: int = 5,
+    lookback: int = 60,
+    min_observations: int = 12,
+) -> pd.Series:
+    """Learn signed factor weights using only labels fully realized by signal_date."""
+
+    if lookback < 1 or min_observations < 3:
+        raise ValueError("invalid factor IC learning window")
+    if ic_series.empty:
+        return pd.Series(dtype=float)
+    available = ic_series[
+        (ic_series["horizon"] == horizon)
+        & (pd.to_datetime(ic_series["realized_at"]) <= pd.Timestamp(signal_date))
+    ]
+    if available.empty:
+        return pd.Series(dtype=float)
+    matrix = available.pivot_table(
+        index=available.index, columns="factor", values="rank_ic", aggfunc="last"
+    ).sort_index()
+    matrix = matrix.iloc[::-max(horizon, 1)].iloc[::-1].tail(lookback)
+    scores: dict[str, float] = {}
+    for factor in matrix.columns:
+        observations = matrix[factor].dropna()
+        if len(observations) < min_observations:
+            continue
+        mean = float(observations.mean())
+        std = float(observations.std(ddof=1))
+        if std <= _EPS:
+            continue
+        reliability = len(observations) / (len(observations) + 20.0)
+        t_like = mean / std * sqrt(len(observations)) * reliability
+        scores[str(factor)] = float(np.clip(t_like, -3.0, 3.0))
+    weights = pd.Series(scores, dtype=float)
+    scale = float(weights.abs().sum())
+    if scale <= _EPS:
+        return pd.Series(dtype=float)
+    return weights / scale
+
+
+def factor_alpha_from_precomputed(
+    factor_panel: pd.DataFrame,
+    ic_series: pd.DataFrame,
+    signal_date: pd.Timestamp,
+    symbols: list[str],
+    horizon: int = 5,
+    lookback: int = 60,
+    min_observations: int = 12,
+) -> FactorAlphaSignal:
+    weights = learn_factor_ic_weights(
+        ic_series,
+        signal_date,
+        horizon=horizon,
+        lookback=lookback,
+        min_observations=min_observations,
+    )
+    zero = pd.Series(0.0, index=symbols, dtype=float)
+    timestamps = factor_panel.index.get_level_values("timestamp") if not factor_panel.empty else []
+    if weights.empty or signal_date not in timestamps:
+        return FactorAlphaSignal(score=zero, weights=weights)
+    snapshot = factor_panel.xs(signal_date, level="timestamp")["score"].unstack("factor")
+    common = [factor for factor in weights.index if factor in snapshot.columns]
+    if not common:
+        return FactorAlphaSignal(score=zero, weights=pd.Series(dtype=float))
+    score = snapshot[common].fillna(0.0).mul(weights[common], axis=1).sum(axis=1)
+    score = score.reindex(symbols).fillna(0.0)
+    active = score[score != 0.0]
+    if len(active) >= 2 and float(active.std(ddof=0)) > _EPS:
+        score.loc[active.index] = (active - active.mean()) / active.std(ddof=0)
+    return FactorAlphaSignal(score=score.clip(-4.0, 4.0), weights=weights[common])
 
 
 def research_factors(

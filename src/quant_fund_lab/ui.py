@@ -63,6 +63,8 @@ with st.sidebar:
     export_verifiable_report = st.checkbox("匯出可驗證研究報告", value=False)
     st.markdown("**M5 Factor Laboratory**")
     run_factor_research = st.checkbox("執行因子 IC / Decay 研究", value=False)
+    enable_factor_alpha = st.checkbox("啟用 trailing-IC Factor Alpha overlay", value=False)
+    factor_alpha_weight = st.slider("Factor Alpha overlay 權重", 0.0, 0.60, 0.30, 0.05)
     run = st.button("執行模型", type="primary", use_container_width=True)
 
 
@@ -141,6 +143,8 @@ if run:
                 factor_neutralization=factor_neutralization,
                 factor_neutralization_strength=factor_neutralization_strength,
                 risk_budget_penalty=risk_budget_penalty,
+                factor_alpha_enabled=enable_factor_alpha,
+                factor_alpha_weight=factor_alpha_weight,
             )
             config = BacktestConfig(
                 initial_cash=initial_cash,
@@ -324,6 +328,20 @@ if run:
                     use_container_width=True,
                     height=320,
                 )
+
+        if enable_factor_alpha:
+            st.subheader("M5-2 Learned Factor Alpha")
+            learned = comparison.paper_replay.factor_weights
+            if learned.empty:
+                st.info("尚未累積足夠已實現 IC 樣本；Factor overlay 暫時不改變原始 Alpha。")
+            else:
+                st.caption(
+                    "權重由 signal date 前已完整實現的 Rank IC 學習；5 日 horizon 使用非重疊樣本，"
+                    "並以 L1 正規化。正權重代表順向使用，負權重代表反向使用。"
+                )
+                st.dataframe(learned.tail(40), use_container_width=True, height=320)
+            if len(trade_symbols) < 6:
+                st.warning("目前股票數少於 6 檔，cross-sectional IC 估計會非常不穩定；較適合研究較大 universe。")
 
         st.subheader("M2-3 Regime / Risk Budget")
         regimes = comparison.paper_replay.regimes
