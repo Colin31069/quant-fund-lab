@@ -114,7 +114,7 @@ Streamlit local dashboard：
 
 重要邊界：Test returns 只用於最終 OOS DSR 的 winner performance，不參與 candidate selection；Reality Check 使用的是 Validation 搜尋集合，避免拿 Test 區間回頭挑策略。
 
-**M2-3 待做：** regime detection、factor neutralization 與更完整的 risk budgeting。
+**M2-3 已完成：Regime detection / factor neutralization / risk budgeting。** 每個 signal date 只用 trailing equal-weight market returns 計算 trend z-score 與 annualized volatility，分類為 trend / neutral / high-volatility / risk-off / stress，據此調整 Kalman、OU、residual-momentum 的 ensemble 權重與 portfolio gross-exposure cap。接著以 trailing returns 估計每檔 market beta 與 idiosyncratic volatility，對 alpha 做 eligible-universe 內的橫斷面 OLS residualization，再以 configurable strength 將 raw alpha 與 residual alpha 混合（預設 50%）；這可降低非預期 factor exposure，又避免 hard neutralization 把策略本身的有效 alpha 一併刪除。樣本不足時 fail-safe 保留原 alpha，不用未來資訊。最後 optimizer 在原 mean-variance/turnover objective 上加入 normalized variance risk-contribution 對 equal-risk target 的 penalty，並確保正常解與 fallback 都遵守 regime gross-exposure cap。UI 顯示當前 regime、trend z、market vol 與 gross cap。
 
 ### M3 — Persistent paper trading
 

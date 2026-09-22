@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+import numpy as np
 import pandas as pd
 
 from .config import BacktestConfig
@@ -16,6 +17,7 @@ from .fx import currency_for_symbol, validate_fx
 from .market_calendar import SessionValidation, require_valid_daily_sessions
 from .models import ensemble_alpha
 from .portfolio import optimize_weights
+from .research import detect_market_regime, neutralize_alpha, regime_adjusted_alpha
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,7 @@ class BacktestResult:
     terminal_events: pd.DataFrame
     base_currency: str
     max_fx_age_days: float
+    regimes: pd.DataFrame
 
 
 def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> BacktestResult:
@@ -74,6 +77,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     alpha_rows: list[pd.Series] = []
     fill_rows: list[dict[str, object]] = []
     terminal_rows: list[dict[str, object]] = []
+    regime_rows: list[dict[str, object]] = []
     target = pd.Series(0.0, index=data.symbols)
 
     start_i = strategy.warmup_days - 1
@@ -103,11 +107,42 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         if (i - start_i) % strategy.rebalance_every == 0:
             history = data.close.iloc[: i + 1] * fx_to_base.iloc[: i + 1]
             alpha_frame = ensemble_alpha(history, strategy)
-            alpha = alpha_frame["ensemble"].reindex(data.symbols).fillna(0.0)
+            eligible = data.membership.loc[signal_date].reindex(data.symbols).fillna(False)
+            if strategy.regime_enabled:
+                regime = detect_market_regime(history, strategy.regime_lookback)
+                raw_alpha = regime_adjusted_alpha(alpha_frame, strategy, regime)
+            else:
+                regime = detect_market_regime(history, strategy.regime_lookback)
+                raw_alpha = alpha_frame["ensemble"]
+            factor_returns = history.pct_change(fill_method=None).tail(strategy.factor_lookback)
+            if strategy.factor_neutralization:
+                neutral_alpha, _ = neutralize_alpha(raw_alpha, factor_returns, eligible=eligible)
+                strength = float(np.clip(strategy.factor_neutralization_strength, 0.0, 1.0))
+                alpha = (1.0 - strength) * raw_alpha + strength * neutral_alpha
+                alpha = alpha.where(eligible, 0.0)
+            else:
+                alpha = raw_alpha.where(eligible, 0.0)
+            alpha = alpha.reindex(data.symbols).fillna(0.0)
             returns = history.pct_change(fill_method=None).tail(strategy.covariance_lookback)
             previous = state.weights(close_now, fx_signal).reindex(data.symbols).fillna(0.0)
-            eligible = data.membership.loc[signal_date].reindex(data.symbols).fillna(False)
-            target = optimize_weights(alpha, returns, previous, strategy, eligible=eligible)
+            gross_limit = regime.gross_exposure_limit if strategy.regime_enabled else 1.0
+            target = optimize_weights(
+                alpha,
+                returns,
+                previous,
+                strategy,
+                eligible=eligible,
+                gross_exposure_limit=gross_limit,
+            )
+            regime_rows.append(
+                {
+                    "timestamp": signal_date,
+                    "label": regime.label,
+                    "trend_z": regime.trend_z,
+                    "annual_volatility": regime.annual_volatility,
+                    "gross_exposure_limit": gross_limit,
+                }
+            )
             terminal_symbols = terminal_next[terminal_next.notna()].index
             target.loc[target.index.intersection(terminal_symbols)] = 0.0
 
@@ -143,6 +178,11 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     weights_df = pd.DataFrame(weight_rows).sort_index() if weight_rows else pd.DataFrame(columns=data.symbols)
     alphas_df = pd.DataFrame(alpha_rows).sort_index() if alpha_rows else pd.DataFrame(columns=data.symbols)
     terminal_df = pd.DataFrame(terminal_rows)
+    regimes_df = (
+        pd.DataFrame(regime_rows).set_index("timestamp")
+        if regime_rows
+        else pd.DataFrame(columns=["label", "trend_z", "annual_volatility", "gross_exposure_limit"])
+    )
     if fills_df.empty:
         costs_df = pd.DataFrame(columns=["gross_turnover", "fees", "slippage_cost", "total_cost", "turnover_rate"])
     else:
@@ -161,4 +201,5 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         terminal_events=terminal_df,
         base_currency=base_currency,
         max_fx_age_days=float(fx_age_days.max().max()),
+        regimes=regimes_df,
     )

@@ -32,6 +32,12 @@ class StrategyConfig:
     alpha_daily_scale: float = 0.002
     max_weight: float = 0.25
     rebalance_every: int = 5
+    regime_enabled: bool = True
+    regime_lookback: int = 60
+    factor_neutralization: bool = True
+    factor_neutralization_strength: float = 0.50
+    factor_lookback: int = 60
+    risk_budget_penalty: float = 0.001
 
 
 @dataclass(frozen=True)

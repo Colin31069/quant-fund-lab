@@ -42,6 +42,15 @@ with st.sidebar:
     train_fraction = st.slider("回測 / paper replay 切分", 0.55, 0.90, 0.70, 0.05)
     run_walkforward = st.checkbox("執行 M2 Walk-forward OOS", value=False)
     walkforward_objective = st.selectbox("Walk-forward 選參指標", ["calmar", "sharpe", "annual_return"])
+    st.markdown("**M2-3 風險研究**")
+    regime_enabled = st.checkbox("Regime detection", value=True)
+    factor_neutralization = st.checkbox("Factor neutralization", value=True)
+    factor_neutralization_strength = st.slider(
+        "Factor neutralization strength", 0.0, 1.0, 0.50, 0.10
+    )
+    risk_budget_penalty = st.slider(
+        "Risk-budget penalty", 0.0, 0.010, 0.001, 0.001, format="%.3f"
+    )
     run = st.button("執行模型", type="primary", use_container_width=True)
 
 
@@ -83,7 +92,14 @@ if run:
                 base_currency=raw.base_currency,
                 exchange=raw.exchange,
             )
-            strategy = StrategyConfig(max_weight=max_weight, rebalance_every=rebalance_every)
+            strategy = StrategyConfig(
+                max_weight=max_weight,
+                rebalance_every=rebalance_every,
+                regime_enabled=regime_enabled,
+                factor_neutralization=factor_neutralization,
+                factor_neutralization_strength=factor_neutralization_strength,
+                risk_budget_penalty=risk_budget_penalty,
+            )
             config = BacktestConfig(
                 initial_cash=initial_cash,
                 base_currency=base_currency,
@@ -150,6 +166,25 @@ if run:
         fig.add_trace(go.Scatter(x=pp.index, y=pp / pp.iloc[0], name="Paper replay"))
         fig.update_layout(title="標準化淨值曲線", yaxis_title="Growth of 1", height=450)
         st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("M2-3 Regime / Risk Budget")
+        regimes = comparison.paper_replay.regimes
+        if regimes.empty:
+            st.info("目前沒有 regime observation。")
+        else:
+            latest_regime = regimes.iloc[-1]
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Current regime", str(latest_regime["label"]))
+            r2.metric("Trend z", f"{float(latest_regime['trend_z']):.2f}")
+            r3.metric("Annualized market vol", f"{float(latest_regime['annual_volatility']):.1%}")
+            r4.metric("Gross exposure cap", f"{float(latest_regime['gross_exposure_limit']):.0%}")
+            st.caption(
+                f"Factor neutralization={'ON' if factor_neutralization else 'OFF'} "
+                f"(strength={factor_neutralization_strength:.0%})；"
+                f"risk-budget penalty={risk_budget_penalty:.3f}。"
+                "Regime 與 factor exposure 每次只使用 signal date 當下以前的資料。"
+            )
+            st.dataframe(regimes.tail(30), use_container_width=True, height=260)
 
         if run_walkforward:
             st.subheader("Walk-forward Out-of-Sample")

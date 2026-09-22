@@ -28,4 +28,4 @@ streamlit run src/quant_fund_lab/ui.py
 
 ## 目前階段
 
-MVP + M1 + M2-1 + M2-2 完成：除交易日曆、停牌/漲跌停、交易成本、point-in-time universe、terminal return、企業行動、可重現資料快照與 USD/TWD base-currency accounting 外，現已加入 leak-resistant walk-forward calibration、Deflated Sharpe Ratio 與 White Reality Check-style stationary bootstrap。參數只能由 Validation 區間選擇，Test 完全不參與選參；統計診斷再針對多重測試與 data snooping 修正「幸運冠軍」問題。下一階段 M2-3 加入 regime detection、factor neutralization 與 risk budgeting。
+MVP + M1 + M2 完成：除交易日曆、停牌/漲跌停、交易成本、point-in-time universe、terminal return、企業行動、可重現資料快照與 USD/TWD base-currency accounting 外，研究層已加入 leak-resistant walk-forward calibration、Deflated Sharpe Ratio、White Reality Check-style stationary bootstrap，以及 M2-3 regime detection、statistical factor neutralization 與 risk-contribution budgeting。Regime 只使用 trailing market returns 調整模型混合與 gross exposure；alpha 再對 market beta / idiosyncratic volatility 做可調強度的橫斷面部分殘差化，避免一次把有效 alpha 全部投影掉；optimizer 以 normalized risk contribution penalty 抑制風險集中。下一階段進入 M3 persistent paper trading。
