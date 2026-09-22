@@ -108,7 +108,11 @@ Streamlit local dashboard：
 
 ### M2 — Model research
 
-Walk-forward parameter calibration、nested validation、White Reality Check / SPA 類多重測試控制、Deflated Sharpe、regime detection、factor neutralization。
+**M2-1 已完成：Walk-forward calibration / OOS harness。** 每個 fold 明確切為 Train → Validation → Test；Train 僅提供歷史狀態與 warm-up，候選參數只能用 Validation 指標選擇，Test 完全未見。Test 以重置本金執行，並把每個 fold 的純 test returns 串接成單一 OOS equity。支援 expanding/rolling train window、deterministic candidate ID、Calmar/Sharpe/annual-return objective、validation drawdown constraint，UI 可查看 fold 邊界、入選參數與 OOS 指標。
+
+**M2-2 待做：** multiple-testing control、Deflated Sharpe、bootstrap / Reality Check 類統計診斷，避免「試太多候選後挑到幸運冠軍」。
+
+**M2-3 待做：** regime detection、factor neutralization 與更完整的 risk budgeting。
 
 ### M3 — Persistent paper trading
 

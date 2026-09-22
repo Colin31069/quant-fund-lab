@@ -12,6 +12,11 @@ from quant_fund_lab.data import MarketData, download_yahoo, synthetic_market_dat
 from quant_fund_lab.data_quality import validate_corporate_actions
 from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
 from quant_fund_lab.paper import historical_vs_paper_replay
+from quant_fund_lab.walkforward import (
+    WalkForwardSpec,
+    generate_candidate_grid,
+    run_walk_forward,
+)
 
 st.set_page_config(page_title="Quant Fund Lab", layout="wide")
 st.title("Quant Fund Lab")
@@ -34,6 +39,8 @@ with st.sidebar:
     max_weight = st.slider("單一標的最大權重", 0.05, 0.50, 0.25, 0.05)
     rebalance_every = st.slider("再平衡頻率（交易日）", 1, 20, 5)
     train_fraction = st.slider("回測 / paper replay 切分", 0.55, 0.90, 0.70, 0.05)
+    run_walkforward = st.checkbox("執行 M2 Walk-forward OOS", value=False)
+    walkforward_objective = st.selectbox("Walk-forward 選參指標", ["calmar", "sharpe", "annual_return"])
     run = st.button("執行模型", type="primary", use_container_width=True)
 
 
@@ -142,6 +149,46 @@ if run:
         fig.add_trace(go.Scatter(x=pp.index, y=pp / pp.iloc[0], name="Paper replay"))
         fig.update_layout(title="標準化淨值曲線", yaxis_title="Growth of 1", height=450)
         st.plotly_chart(fig, use_container_width=True)
+
+        if run_walkforward:
+            st.subheader("Walk-forward Out-of-Sample")
+            if len(trade_data.close) < 420:
+                st.warning("Walk-forward 至少需要約 420 個交易日；目前資料不足。")
+            else:
+                with st.spinner("執行 walk-forward calibration / OOS test..."):
+                    candidates = generate_candidate_grid(
+                        strategy,
+                        risk_aversion=(2.0, 4.0, 8.0),
+                        covariance_shrinkage=(strategy.covariance_shrinkage,),
+                        rebalance_every=(5, 10),
+                    )
+                    wf = run_walk_forward(
+                        trade_data,
+                        config,
+                        candidates,
+                        WalkForwardSpec(
+                            train_bars=252,
+                            validation_bars=84,
+                            test_bars=84,
+                            step_bars=84,
+                            expanding=True,
+                            objective=walkforward_objective,
+                            max_validation_drawdown=0.35,
+                        ),
+                    )
+                wf_metrics = pd.DataFrame([wf.oos_metrics], index=["walk_forward_oos"])
+                st.dataframe(wf_metrics, use_container_width=True)
+                st.dataframe(wf.folds, use_container_width=True, height=300)
+                wf_fig = go.Figure()
+                wf_fig.add_trace(
+                    go.Scatter(x=wf.oos_equity.index, y=wf.oos_equity, name="OOS equity")
+                )
+                wf_fig.update_layout(
+                    title="Walk-forward 純 OOS 淨值",
+                    yaxis_title=f"NAV ({comparison.paper_replay.base_currency})",
+                    height=380,
+                )
+                st.plotly_chart(wf_fig, use_container_width=True)
 
         tab1, tab2, tab3, tab4 = st.tabs(["成交紀錄", "成本與換手", "目標權重", "Alpha 訊號"])
         with tab1:

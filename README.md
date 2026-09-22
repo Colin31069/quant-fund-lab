@@ -28,4 +28,4 @@ streamlit run src/quant_fund_lab/ui.py
 
 ## 目前階段
 
-MVP + M1 完成：日線、long-only、現金帳戶、可設定交易成本與滑價；已加入交易日曆品質檢查、停牌/零成交量不成交、台股普通交易 1,000 股單位與漲跌停鎖單代理、交易成本歸因、point-in-time universe、terminal/delisting return、企業行動 metadata、SHA-256 可重現資料快照，以及 USD/TWD FX/base-currency accounting。美股與台股現在可放在同一個虛擬投資組合，NAV、權重、Alpha/風險矩陣與成本歸因皆以指定基準幣別計算。下一階段進入 M2 model research / walk-forward robustness。
+MVP + M1 + M2-1 完成：除交易日曆、停牌/漲跌停、交易成本、point-in-time universe、terminal return、企業行動、可重現資料快照與 USD/TWD base-currency accounting 外，現已加入 leak-resistant walk-forward calibration。參數只能由 Validation 區間選擇，Test 區間完全不參與選參；每個 Test fold 重置虛擬本金、只帶入過去 warm-up，最後只串接純 OOS returns。下一階段 M2-2 加入 multiple-testing / Deflated Sharpe 等過度擬合診斷。
