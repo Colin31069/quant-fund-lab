@@ -8,12 +8,16 @@ import streamlit as st
 
 from quant_fund_lab.analytics import buy_and_hold_equity, metric_frame
 from quant_fund_lab.config import BacktestConfig, StrategyConfig
-from quant_fund_lab.data import MarketData, download_yahoo, synthetic_market_data
+from quant_fund_lab.data import MarketData, synthetic_market_data
 from quant_fund_lab.data_quality import validate_corporate_actions
 from quant_fund_lab.diagnostics import diagnose_walk_forward
 from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
 from quant_fund_lab.paper import historical_vs_paper_replay
 from quant_fund_lab.paper_live import replay_targets_persistently
+from quant_fund_lab.provenance import AuditLog, build_run_manifest
+from quant_fund_lab.providers import SnapshotProvider, YahooProvider, load_with_failover
+from quant_fund_lab.reporting import export_research_report, verify_research_report
+from quant_fund_lab.snapshot import save_market_data_snapshot
 from quant_fund_lab.walkforward import (
     WalkForwardSpec,
     generate_candidate_grid,
@@ -54,14 +58,25 @@ with st.sidebar:
     )
     st.markdown("**M3 Persistent Paper Trading**")
     persist_paper_ledger = st.checkbox("建立本機 persistent paper ledger", value=False)
+    st.markdown("**M4 Production Hardening**")
+    export_verifiable_report = st.checkbox("匯出可驗證研究報告", value=False)
     run = st.button("執行模型", type="primary", use_container_width=True)
 
 
 @st.cache_data(show_spinner=False)
-def load_data(mode: str, symbols: tuple[str, ...], start: str, end: str) -> MarketData:
+def load_data(
+    mode: str, symbols: tuple[str, ...], start: str, end: str
+) -> tuple[MarketData, str, tuple[tuple[str, bool, str | None], ...]]:
     if mode == "離線合成資料":
-        return synthetic_market_data(symbols=symbols, periods=800)
-    return download_yahoo(symbols=symbols, start=start, end=end)
+        return synthetic_market_data(symbols=symbols, periods=800), "synthetic", (("synthetic", True, None),)
+    result = load_with_failover(
+        [YahooProvider(), SnapshotProvider(("artifacts/provider_cache",))],
+        list(symbols),
+        start,
+        end,
+    )
+    attempts = tuple((item.provider, item.success, item.error) for item in result.attempts)
+    return result.data, result.provider, attempts
 
 
 if run:
@@ -73,9 +88,30 @@ if run:
 
     try:
         with st.spinner("載入資料並執行 walk-forward paper replay..."):
-            raw = load_data(data_mode, tuple(all_symbols), str(start_date), str(end_date + timedelta(days=1)))
+            raw, data_provider, provider_attempts = load_data(
+                data_mode,
+                tuple(all_symbols),
+                str(start_date),
+                str(end_date + timedelta(days=1)),
+            )
             if data_mode == "Yahoo 公開市場資料":
-                raw = attach_yahoo_fx(raw, base_currency=base_currency)
+                if raw.fx_to_base is None:
+                    try:
+                        raw = attach_yahoo_fx(raw, base_currency=base_currency)
+                    except Exception:  # noqa: BLE001 - retry through verified local fallback.
+                        fallback = load_with_failover(
+                            [SnapshotProvider(("artifacts/provider_cache",))],
+                            all_symbols,
+                            str(start_date),
+                            str(end_date + timedelta(days=1)),
+                        )
+                        raw = fallback.data
+                        data_provider = fallback.provider
+                        provider_attempts = provider_attempts + tuple(
+                            (item.provider, item.success, item.error) for item in fallback.attempts
+                        )
+                if data_provider == "yahoo":
+                    save_market_data_snapshot(raw, "artifacts/provider_cache/latest", overwrite=True)
             else:
                 synthetic_usd_twd = pd.Series(32.0, index=raw.close.index, dtype=float)
                 raw = attach_fx_rates(raw, base_currency, usd_twd=synthetic_usd_twd)
@@ -111,6 +147,50 @@ if run:
             comparison = historical_vs_paper_replay(trade_data, config, train_fraction=train_fraction)
             action_report = validate_corporate_actions(trade_data)
             fx_report = validate_fx(trade_data, config.max_fx_staleness_days)
+            audit = AuditLog("artifacts/audit.jsonl")
+            audit.append(
+                "DATA_PROVIDER_SELECTED",
+                {
+                    "provider": data_provider,
+                    "attempts": [
+                        {"provider": p, "success": ok, "error": error}
+                        for p, ok, error in provider_attempts
+                    ],
+                    "symbols": all_symbols,
+                },
+            )
+            report_export = None
+            if export_verifiable_report:
+                input_snapshot = save_market_data_snapshot(
+                    trade_data, "artifacts/report_input/latest", overwrite=True
+                )
+                run_context = {
+                    "mode": "paper_replay",
+                    "train_fraction": float(train_fraction),
+                    "split_date": str(comparison.split_date.date()),
+                }
+                run_manifest = build_run_manifest(
+                    config, input_snapshot.dataset_id, run_context=run_context
+                )
+                report_directory = f"artifacts/reports/{run_manifest.run_id}"
+                exported_run, _ = export_research_report(
+                    comparison.paper_replay,
+                    config,
+                    input_snapshot.dataset_id,
+                    report_directory,
+                    run_context=run_context,
+                )
+                report_verified = verify_research_report(report_directory)
+                audit.append(
+                    "REPORT_EXPORTED",
+                    {
+                        "run_id": exported_run.run_id,
+                        "dataset_id": input_snapshot.dataset_id,
+                        "path": report_directory,
+                        "verified": report_verified,
+                    },
+                )
+                report_export = (exported_run.run_id, report_directory, report_verified)
             benchmark_symbol = benchmark.strip().upper()
             benchmark_close_base = (
                 raw.close[benchmark_symbol] * raw.fx_to_base[benchmark_symbol]
@@ -147,6 +227,17 @@ if run:
             f"FX 最大沿用天數：{fx_report.max_age_days:.0f} 日；"
             "換匯只允許使用當日或更早的匯率，不使用未來資料。"
         )
+        provider_failed = [name for name, ok, _ in provider_attempts if not ok]
+        st.caption(
+            f"資料 Provider：{data_provider}。"
+            + (f" Failover 前失敗：{', '.join(provider_failed)}。" if provider_failed else "")
+        )
+        if report_export is not None:
+            report_run_id, report_path, report_verified = report_export
+            st.success(
+                f"M4 report 已匯出：{report_path}；run_id={report_run_id}；"
+                f"integrity={'PASS' if report_verified else 'FAIL'}。"
+            )
         session_report = comparison.paper_replay.session_validation
         if not action_report.is_valid:
             st.warning(

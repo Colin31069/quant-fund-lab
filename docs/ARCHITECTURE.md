@@ -122,4 +122,4 @@ Streamlit local dashboard：
 
 ### M4 — Production hardening
 
-資料 provider failover、reproducible dataset snapshots、audit log、config version、deterministic run id、報告匯出。
+**M4 已完成。** `MarketDataProvider` chain 將外部 provider failure 隔離，預設可由 Yahoo 回退到完整性驗證通過的本機 snapshot；Snapshot fallback 明確回報 provider attempts，不把失敗靜默吞掉。`CONFIG_SCHEMA_VERSION` 與完整 dataclass config 以 canonical JSON 序列化，deterministic run ID 同時 hash dataset ID、package version 與 run context（例如 paper split），避免不同研究條件碰撞。`AuditLog` 為 append-only JSONL，每筆事件鏈接前一筆 SHA-256，任何內容、順序或前鏈竄改都會驗證失敗。`export_research_report` 匯出 equity/fills/weights/alpha/regime/cost CSV、metrics/run manifest JSON 與 HTML，`report_manifest.json` 再 hash 所有輸出並產生 report ID，可離線驗證研究產物完整性。UI 可選擇建立 verified report，並顯示實際 data provider / failover 狀態。
