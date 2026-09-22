@@ -8,6 +8,7 @@ import streamlit as st
 from quant_fund_lab.analytics import buy_and_hold_equity, metric_frame
 from quant_fund_lab.config import BacktestConfig, StrategyConfig
 from quant_fund_lab.data import MarketData, download_yahoo, synthetic_market_data
+from quant_fund_lab.data_quality import validate_corporate_actions
 from quant_fund_lab.execution import market_for_symbol
 from quant_fund_lab.paper import historical_vs_paper_replay
 
@@ -56,14 +57,28 @@ if run:
                 close=raw.close[trade_symbols],
                 volume=raw.volume[trade_symbols],
                 reference=raw.reference[trade_symbols] if raw.reference is not None else None,
+                membership=raw.membership[trade_symbols] if raw.membership is not None else None,
+                terminal_returns=(
+                    raw.terminal_returns[trade_symbols] if raw.terminal_returns is not None else None
+                ),
+                dividends=raw.dividends[trade_symbols] if raw.dividends is not None else None,
+                stock_splits=raw.stock_splits[trade_symbols] if raw.stock_splits is not None else None,
                 exchange=raw.exchange,
             )
             strategy = StrategyConfig(max_weight=max_weight, rebalance_every=rebalance_every)
             config = BacktestConfig(initial_cash=initial_cash, strategy=strategy)
             comparison = historical_vs_paper_replay(trade_data, config, train_fraction=train_fraction)
+            action_report = validate_corporate_actions(trade_data)
 
         st.success(f"切分日：{comparison.split_date.date()}；其後區段以重置虛擬資金做 paper replay。")
         session_report = comparison.paper_replay.session_validation
+        if not action_report.is_valid:
+            st.warning(
+                "企業行動資料有可疑項目："
+                f"負股利 {len(action_report.negative_dividend_events)}、"
+                f"無效拆股 {len(action_report.invalid_split_events)}、"
+                f"拆股後調整報酬異常 {len(action_report.suspicious_split_adjustments)}。"
+            )
         if session_report is not None and (
             session_report.missing_sessions or session_report.off_calendar_sessions
         ):

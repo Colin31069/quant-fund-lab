@@ -37,6 +37,12 @@ def historical_vs_paper_replay(
         close=data.close.iloc[:split],
         volume=data.volume.iloc[:split],
         reference=data.reference.iloc[:split] if data.reference is not None else None,
+        membership=data.membership.iloc[:split] if data.membership is not None else None,
+        terminal_returns=(
+            data.terminal_returns.iloc[:split] if data.terminal_returns is not None else None
+        ),
+        dividends=data.dividends.iloc[:split] if data.dividends is not None else None,
+        stock_splits=data.stock_splits.iloc[:split] if data.stock_splits is not None else None,
         exchange=data.exchange,
     )
     paper_start = max(0, split - warmup)
@@ -45,6 +51,14 @@ def historical_vs_paper_replay(
         close=data.close.iloc[paper_start:],
         volume=data.volume.iloc[paper_start:],
         reference=data.reference.iloc[paper_start:] if data.reference is not None else None,
+        membership=data.membership.iloc[paper_start:] if data.membership is not None else None,
+        terminal_returns=(
+            data.terminal_returns.iloc[paper_start:] if data.terminal_returns is not None else None
+        ),
+        dividends=data.dividends.iloc[paper_start:] if data.dividends is not None else None,
+        stock_splits=(
+            data.stock_splits.iloc[paper_start:] if data.stock_splits is not None else None
+        ),
         exchange=data.exchange,
     )
     backtest = run_backtest(backtest_data, config)

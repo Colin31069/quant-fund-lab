@@ -28,4 +28,4 @@ streamlit run src/quant_fund_lab/ui.py
 
 ## 目前階段
 
-MVP + M1-1：日線、long-only、現金帳戶、可設定交易成本與滑價；已加入交易日曆品質檢查、停牌/零成交量不成交、台股普通交易 1,000 股單位與漲跌停鎖單代理模型，以及手續費/滑價/換手歸因。後續再加入 survivorship/delisting、FX、企業行動資料品質層與 walk-forward calibration。
+MVP + M1-1 + M1-2：日線、long-only、現金帳戶、可設定交易成本與滑價；已加入交易日曆品質檢查、停牌/零成交量不成交、台股普通交易 1,000 股單位與漲跌停鎖單代理、交易成本歸因，以及 point-in-time universe、明確 terminal/delisting return、企業行動 metadata 驗證與 SHA-256 可重現資料快照。下一階段加入 USD/TWD FX 與 base-currency accounting。

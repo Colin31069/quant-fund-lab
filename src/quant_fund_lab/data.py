@@ -13,6 +13,10 @@ class MarketData:
     close: pd.DataFrame
     volume: pd.DataFrame
     reference: pd.DataFrame | None = None
+    membership: pd.DataFrame | None = None
+    terminal_returns: pd.DataFrame | None = None
+    dividends: pd.DataFrame | None = None
+    stock_splits: pd.DataFrame | None = None
     exchange: str | None = None
 
     def __post_init__(self) -> None:
@@ -28,6 +32,43 @@ class MarketData:
             object.__setattr__(self, "reference", self.close.shift(1))
         elif not self.reference.index.equals(self.close.index) or list(self.reference.columns) != list(self.close.columns):
             raise ValueError("reference prices must align with close")
+        optional = {
+            "membership": self.membership,
+            "terminal_returns": self.terminal_returns,
+            "dividends": self.dividends,
+            "stock_splits": self.stock_splits,
+        }
+        for name, frame in optional.items():
+            if frame is not None and (
+                not frame.index.equals(self.close.index) or list(frame.columns) != list(self.close.columns)
+            ):
+                raise ValueError(f"{name} must align with close")
+        if self.membership is None:
+            object.__setattr__(
+                self,
+                "membership",
+                pd.DataFrame(True, index=self.close.index, columns=self.close.columns, dtype=bool),
+            )
+        else:
+            object.__setattr__(self, "membership", self.membership.fillna(False).astype(bool))
+        if self.terminal_returns is None:
+            object.__setattr__(
+                self,
+                "terminal_returns",
+                pd.DataFrame(np.nan, index=self.close.index, columns=self.close.columns, dtype=float),
+            )
+        if self.dividends is None:
+            object.__setattr__(
+                self,
+                "dividends",
+                pd.DataFrame(0.0, index=self.close.index, columns=self.close.columns, dtype=float),
+            )
+        if self.stock_splits is None:
+            object.__setattr__(
+                self,
+                "stock_splits",
+                pd.DataFrame(0.0, index=self.close.index, columns=self.close.columns, dtype=float),
+            )
 
     @property
     def symbols(self) -> list[str]:
@@ -39,6 +80,12 @@ class MarketData:
             close=self.close.loc[start:end],
             volume=self.volume.loc[start:end],
             reference=self.reference.loc[start:end] if self.reference is not None else None,
+            membership=self.membership.loc[start:end] if self.membership is not None else None,
+            terminal_returns=(
+                self.terminal_returns.loc[start:end] if self.terminal_returns is not None else None
+            ),
+            dividends=self.dividends.loc[start:end] if self.dividends is not None else None,
+            stock_splits=self.stock_splits.loc[start:end] if self.stock_splits is not None else None,
             exchange=self.exchange,
         )
 
@@ -60,6 +107,24 @@ def _extract_field(raw: pd.DataFrame, symbols: list[str], field: str) -> pd.Data
     return raw[[field]].rename(columns={field: symbols[0]})
 
 
+def _extract_optional_field(
+    raw: pd.DataFrame, symbols: list[str], field: str, default: float = 0.0
+) -> pd.DataFrame:
+    try:
+        return _extract_field(raw, symbols, field).astype(float)
+    except (KeyError, ValueError):
+        return pd.DataFrame(default, index=raw.index, columns=symbols, dtype=float)
+
+
+def _membership_from_observations(observed: pd.DataFrame) -> pd.DataFrame:
+    membership = pd.DataFrame(False, index=observed.index, columns=observed.columns, dtype=bool)
+    for symbol in observed.columns:
+        dates = observed.index[observed[symbol].fillna(False)]
+        if len(dates):
+            membership.loc[dates[0] : dates[-1], symbol] = True
+    return membership
+
+
 def download_yahoo(
     symbols: Iterable[str],
     start: str,
@@ -79,8 +144,8 @@ def download_yahoo(
         start=start,
         end=end,
         interval=interval,
-        auto_adjust=True,
-        actions=False,
+        auto_adjust=False,
+        actions=True,
         group_by="ticker",
         threads=True,
         progress=False,
@@ -88,14 +153,26 @@ def download_yahoo(
     if raw.empty:
         raise ValueError("no market data returned")
 
-    open_px = _extract_field(raw, symbol_list, "Open").astype(float)
-    close_px = _extract_field(raw, symbol_list, "Close").astype(float)
+    raw_open = _extract_field(raw, symbol_list, "Open").astype(float)
+    raw_close = _extract_field(raw, symbol_list, "Close").astype(float)
+    adjusted_close = _extract_field(raw, symbol_list, "Adj Close").astype(float)
     volume = _extract_field(raw, symbol_list, "Volume").astype(float)
+    dividends = _extract_optional_field(raw, symbol_list, "Dividends")
+    stock_splits = _extract_optional_field(raw, symbol_list, "Stock Splits")
 
-    valid = close_px.notna().sum(axis=1) > 0
-    open_px = open_px.loc[valid]
-    close_px = close_px.loc[valid].ffill()
+    factor = adjusted_close / raw_close.replace(0.0, np.nan)
+    invalid_factor = factor.notna() & ((factor <= 0.0) | ~np.isfinite(factor))
+    if bool(invalid_factor.any().any()):
+        raise ValueError("invalid corporate-action adjustment factor in Yahoo data")
+    adjusted_open = raw_open * factor
+    observed = raw_close.notna() | raw_open.notna()
+    valid = adjusted_close.notna().sum(axis=1) > 0
+    open_px = adjusted_open.loc[valid]
+    close_px = adjusted_close.loc[valid].ffill()
     volume = volume.loc[valid].fillna(0.0)
+    membership = _membership_from_observations(observed.loc[valid])
+    dividends = dividends.loc[valid].fillna(0.0)
+    stock_splits = stock_splits.loc[valid].fillna(0.0)
     reference = close_px.shift(1)
     markets = {"TW" if s.upper().endswith((".TW", ".TWO")) else "US" for s in symbol_list}
     exchange = markets.pop() if len(markets) == 1 else None
@@ -104,6 +181,9 @@ def download_yahoo(
         close=close_px,
         volume=volume,
         reference=reference,
+        membership=membership,
+        dividends=dividends,
+        stock_splits=stock_splits,
         exchange=exchange,
     )
 
@@ -139,5 +219,6 @@ def synthetic_market_data(
         close=pd.DataFrame(close, index=dates),
         volume=pd.DataFrame(volume, index=dates),
         reference=pd.DataFrame(close, index=dates).shift(1),
+        membership=pd.DataFrame(True, index=dates, columns=symbols, dtype=bool),
         exchange=None,
     )

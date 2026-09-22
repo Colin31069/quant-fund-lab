@@ -4,11 +4,13 @@ import pytest
 
 from quant_fund_lab.backtest import run_backtest
 from quant_fund_lab.config import BacktestConfig, StrategyConfig
-from quant_fund_lab.data import synthetic_market_data
-from quant_fund_lab.execution import PortfolioState, rebalance_at_open
+from quant_fund_lab.data import MarketData, synthetic_market_data
+from quant_fund_lab.data_quality import validate_corporate_actions
+from quant_fund_lab.execution import PortfolioState, apply_terminal_returns, rebalance_at_open
 from quant_fund_lab.market_calendar import require_valid_daily_sessions, validate_daily_sessions
 from quant_fund_lab.models import ensemble_alpha
 from quant_fund_lab.portfolio import optimize_weights
+from quant_fund_lab.snapshot import load_market_data_snapshot, save_market_data_snapshot
 
 
 def test_ensemble_alpha_is_finite():
@@ -113,3 +115,86 @@ def test_calendar_rejects_off_session_bar():
     assert pd.Timestamp("2026-01-03") in report.off_calendar_sessions
     with pytest.raises(ValueError, match="weekend"):
         require_valid_daily_sessions(observed, "US")
+
+
+def test_point_in_time_membership_forces_ineligible_weight_to_zero():
+    data = synthetic_market_data(symbols=("AAA", "BBB", "CCC"), periods=220)
+    cfg = StrategyConfig(max_weight=0.5)
+    alpha = pd.Series({"AAA": 4.0, "BBB": 3.0, "CCC": 2.0})
+    returns = data.close.pct_change(fill_method=None).tail(cfg.covariance_lookback)
+    eligible = pd.Series({"AAA": False, "BBB": True, "CCC": True})
+    weights = optimize_weights(alpha, returns, None, cfg, eligible=eligible)
+    assert weights["AAA"] == pytest.approx(0.0)
+
+
+def test_terminal_return_event_applies_explicit_delisting_loss():
+    state = PortfolioState(cash=10_000.0, shares={"AAA": 100})
+    events = apply_terminal_returns(
+        state=state,
+        terminal_returns=pd.Series({"AAA": -1.0}),
+        reference_prices=pd.Series({"AAA": 50.0}),
+        timestamp=pd.Timestamp("2026-01-05"),
+    )
+    assert len(events) == 1
+    assert events[0].proceeds == 0.0
+    assert state.shares["AAA"] == 0
+    assert state.cash == 10_000.0
+
+
+def test_terminal_return_cash_outs_holding():
+    data = synthetic_market_data(symbols=("AAA", "BBB"), periods=180)
+    membership = data.membership.copy()
+    terminal = data.terminal_returns.copy()
+    exit_signal = data.close.index[120]
+    exit_date = data.close.index[121]
+    membership.loc[exit_signal:, "AAA"] = False
+    terminal.loc[exit_date, "AAA"] = -1.0
+    custom = MarketData(
+        open=data.open,
+        close=data.close,
+        volume=data.volume,
+        reference=data.reference,
+        membership=membership,
+        terminal_returns=terminal,
+    )
+    cfg = BacktestConfig(
+        initial_cash=1_000_000,
+        strategy=StrategyConfig(warmup_days=80, rebalance_every=1, max_weight=0.8),
+    )
+    result = run_backtest(custom, cfg)
+    assert isinstance(result.terminal_events, pd.DataFrame)
+    later_weights = result.weights.loc[result.weights.index >= exit_signal]
+    assert (later_weights["AAA"].abs() < 1e-12).all()
+
+
+def test_corporate_action_validation_flags_bad_metadata():
+    data = synthetic_market_data(symbols=("AAA", "BBB"), periods=80)
+    dividends = data.dividends.copy()
+    dividends.iloc[20, 0] = -1.0
+    bad = MarketData(
+        open=data.open,
+        close=data.close,
+        volume=data.volume,
+        reference=data.reference,
+        membership=data.membership,
+        dividends=dividends,
+        stock_splits=data.stock_splits,
+    )
+    report = validate_corporate_actions(bad)
+    assert not report.is_valid
+    assert report.negative_dividend_events
+
+
+def test_snapshot_round_trip_and_integrity(tmp_path):
+    data = synthetic_market_data(symbols=("AAA", "BBB"), periods=80)
+    root = tmp_path / "snapshot"
+    manifest = save_market_data_snapshot(data, root)
+    loaded = load_market_data_snapshot(root)
+    assert manifest.dataset_id
+    pd.testing.assert_frame_equal(loaded.close, data.close, check_freq=False)
+    pd.testing.assert_frame_equal(loaded.membership, data.membership, check_freq=False)
+
+    close_path = root / "close.parquet"
+    close_path.write_bytes(close_path.read_bytes() + b"tamper")
+    with pytest.raises(ValueError, match="integrity"):
+        load_market_data_snapshot(root)

@@ -6,7 +6,12 @@ import pandas as pd
 
 from .config import BacktestConfig
 from .data import MarketData
-from .execution import PortfolioState, market_for_symbol, rebalance_at_open
+from .execution import (
+    PortfolioState,
+    apply_terminal_returns,
+    market_for_symbol,
+    rebalance_at_open,
+)
 from .market_calendar import SessionValidation, require_valid_daily_sessions
 from .models import ensemble_alpha
 from .portfolio import optimize_weights
@@ -20,6 +25,7 @@ class BacktestResult:
     alphas: pd.DataFrame
     cost_attribution: pd.DataFrame
     session_validation: SessionValidation | None
+    terminal_events: pd.DataFrame
 
 
 def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> BacktestResult:
@@ -43,6 +49,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     weight_rows: list[pd.Series] = []
     alpha_rows: list[pd.Series] = []
     fill_rows: list[dict[str, object]] = []
+    terminal_rows: list[dict[str, object]] = []
     target = pd.Series(0.0, index=data.symbols)
 
     start_i = strategy.warmup_days - 1
@@ -57,6 +64,14 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         close_next = data.close.loc[execution_date]
         volume_next = data.volume.loc[execution_date]
         reference_next = data.reference.loc[execution_date]
+        terminal_next = data.terminal_returns.loc[execution_date]
+        terminal_events = apply_terminal_returns(
+            state=state,
+            terminal_returns=terminal_next,
+            reference_prices=reference_next,
+            timestamp=pd.Timestamp(execution_date),
+        )
+        terminal_rows.extend(asdict(event) for event in terminal_events)
 
         if (i - start_i) % strategy.rebalance_every == 0:
             history = data.close.iloc[: i + 1]
@@ -64,7 +79,10 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
             alpha = alpha_frame["ensemble"].reindex(data.symbols).fillna(0.0)
             returns = history.pct_change(fill_method=None).tail(strategy.covariance_lookback)
             previous = state.weights(close_now).reindex(data.symbols).fillna(0.0)
-            target = optimize_weights(alpha, returns, previous, strategy)
+            eligible = data.membership.loc[signal_date].reindex(data.symbols).fillna(False)
+            target = optimize_weights(alpha, returns, previous, strategy, eligible=eligible)
+            terminal_symbols = terminal_next[terminal_next.notna()].index
+            target.loc[target.index.intersection(terminal_symbols)] = 0.0
 
             alpha_row = alpha.copy()
             alpha_row.name = signal_date
@@ -96,6 +114,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     fills_df = pd.DataFrame(fill_rows)
     weights_df = pd.DataFrame(weight_rows).sort_index() if weight_rows else pd.DataFrame(columns=data.symbols)
     alphas_df = pd.DataFrame(alpha_rows).sort_index() if alpha_rows else pd.DataFrame(columns=data.symbols)
+    terminal_df = pd.DataFrame(terminal_rows)
     if fills_df.empty:
         costs_df = pd.DataFrame(columns=["gross_turnover", "fees", "slippage_cost", "total_cost", "turnover_rate"])
     else:
@@ -111,4 +130,5 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         alphas=alphas_df,
         cost_attribution=costs_df,
         session_validation=session_validation,
+        terminal_events=terminal_df,
     )

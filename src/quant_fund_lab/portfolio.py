@@ -16,8 +16,16 @@ def shrink_covariance(returns: pd.DataFrame, shrinkage: float) -> pd.DataFrame:
     return covariance
 
 
-def _fallback_weights(alpha: pd.Series, max_weight: float) -> pd.Series:
+def _fallback_weights(
+    alpha: pd.Series, max_weight: float, eligible: pd.Series | None = None
+) -> pd.Series:
     positive = alpha.clip(lower=0.0)
+    allowed = (
+        eligible.reindex(alpha.index).fillna(False).astype(bool)
+        if eligible is not None
+        else pd.Series(True, index=alpha.index, dtype=bool)
+    )
+    positive = positive.where(allowed, 0.0)
     if float(positive.sum()) <= 0.0:
         return pd.Series(0.0, index=alpha.index)
     weights = positive / positive.sum()
@@ -27,7 +35,7 @@ def _fallback_weights(alpha: pd.Series, max_weight: float) -> pd.Series:
             break
         excess = float((weights[over] - max_weight).sum())
         weights[over] = max_weight
-        under = ~over
+        under = (~over) & allowed
         capacity = (max_weight - weights[under]).clip(lower=0.0)
         if float(capacity.sum()) <= 0.0:
             break
@@ -43,11 +51,17 @@ def optimize_weights(
     returns: pd.DataFrame,
     previous_weights: pd.Series | None,
     config: StrategyConfig,
+    eligible: pd.Series | None = None,
 ) -> pd.Series:
     symbols = list(alpha.index)
     if not symbols:
         return pd.Series(dtype=float)
     alpha = alpha.reindex(symbols).fillna(0.0)
+    allowed = (
+        eligible.reindex(symbols).fillna(False).astype(bool)
+        if eligible is not None
+        else pd.Series(True, index=symbols, dtype=bool)
+    )
     prev = (
         previous_weights.reindex(symbols).fillna(0.0)
         if previous_weights is not None
@@ -65,17 +79,17 @@ def optimize_weights(
         utility = expected_return - config.risk_aversion * risk - config.turnover_penalty * turnover
         return -utility
 
-    x0 = _fallback_weights(alpha, config.max_weight).to_numpy(dtype=float)
+    x0 = _fallback_weights(alpha, config.max_weight, allowed).to_numpy(dtype=float)
     result = minimize(
         objective,
         x0=x0,
         method="SLSQP",
-        bounds=[(0.0, config.max_weight)] * len(symbols),
+        bounds=[(0.0, config.max_weight if bool(allowed[s]) else 0.0) for s in symbols],
         constraints=[{"type": "ineq", "fun": lambda w: 1.0 - float(np.sum(w))}],
         options={"maxiter": 300, "ftol": 1e-10},
     )
     if not result.success or not np.all(np.isfinite(result.x)):
-        return _fallback_weights(alpha, config.max_weight)
+        return _fallback_weights(alpha, config.max_weight, allowed)
     weights = pd.Series(result.x, index=symbols).clip(lower=0.0, upper=config.max_weight)
     if float(weights.sum()) > 1.000001:
         weights /= weights.sum()

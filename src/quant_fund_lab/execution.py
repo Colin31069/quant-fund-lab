@@ -21,6 +21,16 @@ class Fill:
     slippage_cost: float
 
 
+@dataclass(frozen=True)
+class TerminalEvent:
+    timestamp: pd.Timestamp
+    symbol: str
+    quantity: int
+    reference_price: float
+    terminal_return: float
+    proceeds: float
+
+
 @dataclass
 class PortfolioState:
     cash: float
@@ -90,6 +100,41 @@ def _blocked_by_price_limit(
     return (side == "BUY" and open_price >= upper - tolerance) or (
         side == "SELL" and open_price <= lower + tolerance
     )
+
+
+def apply_terminal_returns(
+    state: PortfolioState,
+    terminal_returns: pd.Series,
+    reference_prices: pd.Series,
+    timestamp: pd.Timestamp,
+) -> list[TerminalEvent]:
+    events: list[TerminalEvent] = []
+    for symbol, terminal_return in terminal_returns.items():
+        if not pd.notna(terminal_return):
+            continue
+        terminal_return = float(terminal_return)
+        if terminal_return < -1.0:
+            raise ValueError(f"terminal return below -100% for {symbol}")
+        quantity = state.shares.get(symbol, 0)
+        if quantity <= 0:
+            continue
+        reference = float(reference_prices.get(symbol, float("nan")))
+        if not pd.notna(reference) or reference < 0.0:
+            raise ValueError(f"missing terminal reference price for {symbol}")
+        proceeds = quantity * reference * (1.0 + terminal_return)
+        state.cash += proceeds
+        state.shares[symbol] = 0
+        events.append(
+            TerminalEvent(
+                timestamp=timestamp,
+                symbol=symbol,
+                quantity=quantity,
+                reference_price=reference,
+                terminal_return=terminal_return,
+                proceeds=float(proceeds),
+            )
+        )
+    return events
 
 
 def rebalance_at_open(
