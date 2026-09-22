@@ -11,6 +11,7 @@ from quant_fund_lab.config import BacktestConfig, StrategyConfig
 from quant_fund_lab.data import MarketData, synthetic_market_data
 from quant_fund_lab.data_quality import validate_corporate_actions
 from quant_fund_lab.diagnostics import diagnose_walk_forward
+from quant_fund_lab.factors import research_factors
 from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
 from quant_fund_lab.paper import historical_vs_paper_replay
 from quant_fund_lab.paper_live import replay_targets_persistently
@@ -60,6 +61,8 @@ with st.sidebar:
     persist_paper_ledger = st.checkbox("建立本機 persistent paper ledger", value=False)
     st.markdown("**M4 Production Hardening**")
     export_verifiable_report = st.checkbox("匯出可驗證研究報告", value=False)
+    st.markdown("**M5 Factor Laboratory**")
+    run_factor_research = st.checkbox("執行因子 IC / Decay 研究", value=False)
     run = st.button("執行模型", type="primary", use_container_width=True)
 
 
@@ -145,6 +148,15 @@ if run:
                 strategy=strategy,
             )
             comparison = historical_vs_paper_replay(trade_data, config, train_fraction=train_fraction)
+            factor_research = (
+                research_factors(
+                    trade_data,
+                    sampling_every=max(rebalance_every, 1),
+                    horizons=(1, 5, 20),
+                )
+                if run_factor_research
+                else None
+            )
             action_report = validate_corporate_actions(trade_data)
             fx_report = validate_fx(trade_data, config.max_fx_staleness_days)
             audit = AuditLog("artifacts/audit.jsonl")
@@ -284,6 +296,34 @@ if run:
         fig.add_trace(go.Scatter(x=pp.index, y=pp / pp.iloc[0], name="Paper replay"))
         fig.update_layout(title="標準化淨值曲線", yaxis_title="Growth of 1", height=450)
         st.plotly_chart(fig, use_container_width=True)
+
+        if factor_research is not None:
+            st.subheader("M5-1 Factor Research")
+            if factor_research.summary.empty:
+                st.warning("目前資料不足以形成可用的 cross-sectional IC 統計。")
+            else:
+                st.caption(
+                    "IC / Rank IC 使用 factor timestamp 之後的 forward return；"
+                    "factor 本身只由當下與更早資料計算。正值代表因子排序方向與未來報酬同向。"
+                )
+                st.dataframe(factor_research.summary, use_container_width=True, height=360)
+                f1, f2 = st.columns(2)
+                with f1:
+                    st.markdown("**Rank IC Decay**")
+                    st.dataframe(factor_research.decay, use_container_width=True, height=300)
+                with f2:
+                    st.markdown("**Factor Rank Turnover**")
+                    st.dataframe(
+                        factor_research.turnover.rename("rank_turnover").to_frame(),
+                        use_container_width=True,
+                        height=300,
+                    )
+                st.markdown("**Average Cross-sectional Factor Correlation**")
+                st.dataframe(
+                    factor_research.factor_correlation,
+                    use_container_width=True,
+                    height=320,
+                )
 
         st.subheader("M2-3 Regime / Risk Budget")
         regimes = comparison.paper_replay.regimes
