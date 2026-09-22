@@ -18,6 +18,7 @@ from quant_fund_lab.paper_live import replay_targets_persistently
 from quant_fund_lab.provenance import AuditLog, build_run_manifest
 from quant_fund_lab.providers import SnapshotProvider, YahooProvider, load_with_failover
 from quant_fund_lab.reporting import export_research_report, verify_research_report
+from quant_fund_lab.robustness import build_robustness_report
 from quant_fund_lab.snapshot import save_market_data_snapshot
 from quant_fund_lab.walkforward import (
     WalkForwardSpec,
@@ -76,6 +77,7 @@ with st.sidebar:
         "Drawdown hard limit", drawdown_hard_min, 0.50, max(0.20, drawdown_hard_min), 0.01
     )
     drawdown_min_exposure = st.slider("Hard-limit 最低風險曝險", 0.0, 0.75, 0.25, 0.05)
+    run_robustness = st.checkbox("執行 M5-4 Robustness Lab", value=False)
     run = st.button("執行模型", type="primary", use_container_width=True)
 
 
@@ -171,6 +173,20 @@ if run:
                 strategy=strategy,
             )
             comparison = historical_vs_paper_replay(trade_data, config, train_fraction=train_fraction)
+            robustness = (
+                build_robustness_report(
+                    trade_data,
+                    config,
+                    train_fraction,
+                    comparison.paper_replay,
+                    cost_multipliers=(1.0, 1.5, 2.0),
+                    bootstrap_iterations=300,
+                    block_length=10,
+                    seed=19,
+                )
+                if run_robustness
+                else None
+            )
             factor_research = (
                 research_factors(
                     trade_data,
@@ -454,6 +470,22 @@ if run:
                 st.dataframe(persistent_positions, use_container_width=True, height=300)
             with pt4:
                 st.dataframe(persistent_snapshots, use_container_width=True, height=300)
+
+        if robustness is not None:
+            st.subheader("M5-4 Robustness Lab")
+            st.caption(
+                "Robustness 結果只作診斷，不參與參數選擇：成本壓力固定為 1.0x / 1.5x / 2.0x；"
+                "block bootstrap 保留短期報酬相依；regime attribution 只使用當時已知的最新 regime。"
+            )
+            rb1, rb2, rb3 = st.tabs(
+                ["Execution Cost Stress", "Block Bootstrap", "Regime Attribution"]
+            )
+            with rb1:
+                st.dataframe(robustness.cost_stress, use_container_width=True, height=320)
+            with rb2:
+                st.dataframe(robustness.bootstrap_summary, use_container_width=True, height=320)
+            with rb3:
+                st.dataframe(robustness.regime_attribution, use_container_width=True, height=320)
 
         if run_walkforward:
             st.subheader("Walk-forward Out-of-Sample")
