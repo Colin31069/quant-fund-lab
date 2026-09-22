@@ -52,13 +52,29 @@ if run:
         with st.spinner("載入資料並執行 walk-forward paper replay..."):
             raw = load_data(data_mode, tuple(all_symbols), str(start_date), str(end_date + timedelta(days=1)))
             trade_data = MarketData(
-                open=raw.open[trade_symbols], close=raw.close[trade_symbols], volume=raw.volume[trade_symbols]
+                open=raw.open[trade_symbols],
+                close=raw.close[trade_symbols],
+                volume=raw.volume[trade_symbols],
+                reference=raw.reference[trade_symbols] if raw.reference is not None else None,
+                exchange=raw.exchange,
             )
             strategy = StrategyConfig(max_weight=max_weight, rebalance_every=rebalance_every)
             config = BacktestConfig(initial_cash=initial_cash, strategy=strategy)
             comparison = historical_vs_paper_replay(trade_data, config, train_fraction=train_fraction)
 
         st.success(f"切分日：{comparison.split_date.date()}；其後區段以重置虛擬資金做 paper replay。")
+        session_report = comparison.paper_replay.session_validation
+        if session_report is not None and (
+            session_report.missing_sessions or session_report.off_calendar_sessions
+        ):
+            missing_preview = ", ".join(str(x.date()) for x in session_report.missing_sessions[:3])
+            extra_preview = ", ".join(str(x.date()) for x in session_report.off_calendar_sessions[:3])
+            st.warning(
+                "市場資料與第三方交易日曆存在差異。"
+                f" 日曆有、資料無：{len(session_report.missing_sessions)} 日（{missing_preview or '無'}）；"
+                f" 資料有、日曆無：{len(session_report.off_calendar_sessions)} 日（{extra_preview or '無'}）。"
+                "可能是臨時休市、日曆版本落差或資料缺口；不自動補造價格。"
+            )
 
         col1, col2 = st.columns(2)
         with col1:
@@ -87,12 +103,22 @@ if run:
         fig.update_layout(title="標準化淨值曲線", yaxis_title="Growth of 1", height=450)
         st.plotly_chart(fig, use_container_width=True)
 
-        tab1, tab2, tab3 = st.tabs(["成交紀錄", "目標權重", "Alpha 訊號"])
+        tab1, tab2, tab3, tab4 = st.tabs(["成交紀錄", "成本與換手", "目標權重", "Alpha 訊號"])
         with tab1:
             st.dataframe(comparison.paper_replay.fills, use_container_width=True, height=420)
         with tab2:
-            st.dataframe(comparison.paper_replay.weights.tail(50), use_container_width=True, height=420)
+            costs = comparison.paper_replay.cost_attribution
+            if costs.empty:
+                st.info("此區段沒有成交，因此沒有交易成本。")
+            else:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("總手續費/稅費", f"{costs['fees'].sum():,.2f}")
+                c2.metric("估計滑價成本", f"{costs['slippage_cost'].sum():,.2f}")
+                c3.metric("累積單向換手", f"{costs['turnover_rate'].sum():.2f}x")
+                st.dataframe(costs.tail(50), use_container_width=True, height=360)
         with tab3:
+            st.dataframe(comparison.paper_replay.weights.tail(50), use_container_width=True, height=420)
+        with tab4:
             st.dataframe(comparison.paper_replay.alphas.tail(50), use_container_width=True, height=420)
 
     except Exception as exc:  # noqa: BLE001 - UI boundary must surface provider/runtime errors.

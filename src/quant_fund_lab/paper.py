@@ -33,13 +33,19 @@ def historical_vs_paper_replay(
         raise ValueError("not enough data for both backtest and paper replay")
 
     backtest_data = MarketData(
-        open=data.open.iloc[:split], close=data.close.iloc[:split], volume=data.volume.iloc[:split]
+        open=data.open.iloc[:split],
+        close=data.close.iloc[:split],
+        volume=data.volume.iloc[:split],
+        reference=data.reference.iloc[:split] if data.reference is not None else None,
+        exchange=data.exchange,
     )
     paper_start = max(0, split - warmup)
     paper_data = MarketData(
         open=data.open.iloc[paper_start:],
         close=data.close.iloc[paper_start:],
         volume=data.volume.iloc[paper_start:],
+        reference=data.reference.iloc[paper_start:] if data.reference is not None else None,
+        exchange=data.exchange,
     )
     backtest = run_backtest(backtest_data, config)
     paper = run_backtest(paper_data, config)

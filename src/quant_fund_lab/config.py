@@ -14,6 +14,7 @@ class MarketCostConfig:
     impact_coefficient: float = 0.10
     max_participation: float = 0.05
     lot_size: int = 1
+    price_limit_pct: float | None = None
 
 
 @dataclass(frozen=True)
@@ -51,5 +52,7 @@ class BacktestConfig:
             sell_tax_bps=30.0,
             sec_fee_per_million=0.0,
             slippage_bps=5.0,
+            lot_size=1_000,
+            price_limit_pct=0.10,
         )
     )

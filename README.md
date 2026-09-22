@@ -28,4 +28,4 @@ streamlit run src/quant_fund_lab/ui.py
 
 ## 目前階段
 
-MVP：日線、long-only、現金帳戶、可設定交易成本與滑價。後續再加入 walk-forward calibration、更多資料供應商、企業行動/下市資料品質層與更完整的市場微結構模型。
+MVP + M1-1：日線、long-only、現金帳戶、可設定交易成本與滑價；已加入交易日曆品質檢查、停牌/零成交量不成交、台股普通交易 1,000 股單位與漲跌停鎖單代理模型，以及手續費/滑價/換手歸因。後續再加入 survivorship/delisting、FX、企業行動資料品質層與 walk-forward calibration。

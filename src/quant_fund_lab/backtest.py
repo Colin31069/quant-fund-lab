@@ -7,6 +7,7 @@ import pandas as pd
 from .config import BacktestConfig
 from .data import MarketData
 from .execution import PortfolioState, market_for_symbol, rebalance_at_open
+from .market_calendar import SessionValidation, require_valid_daily_sessions
 from .models import ensemble_alpha
 from .portfolio import optimize_weights
 
@@ -17,6 +18,8 @@ class BacktestResult:
     fills: pd.DataFrame
     weights: pd.DataFrame
     alphas: pd.DataFrame
+    cost_attribution: pd.DataFrame
+    session_validation: SessionValidation | None
 
 
 def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> BacktestResult:
@@ -24,6 +27,12 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     markets = {market_for_symbol(symbol) for symbol in data.symbols}
     if len(markets) != 1:
         raise ValueError("mixed US/TW portfolios require FX conversion; run one market per portfolio in MVP")
+    market = next(iter(markets))
+    session_validation: SessionValidation | None = None
+    if data.exchange is not None:
+        if data.exchange != market:
+            raise ValueError("market-data exchange metadata does not match symbols")
+        session_validation = require_valid_daily_sessions(data.close.index, market)
     strategy = config.strategy
     dates = data.close.index
     if len(dates) < strategy.warmup_days + 2:
@@ -47,6 +56,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         open_next = data.open.loc[execution_date]
         close_next = data.close.loc[execution_date]
         volume_next = data.volume.loc[execution_date]
+        reference_next = data.reference.loc[execution_date]
 
         if (i - start_i) % strategy.rebalance_every == 0:
             history = data.close.iloc[: i + 1]
@@ -68,6 +78,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                 target_weights=target,
                 open_prices=open_next,
                 volumes=volume_next,
+                reference_prices=reference_next,
                 timestamp=pd.Timestamp(execution_date),
                 config=config,
             )
@@ -85,4 +96,19 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     fills_df = pd.DataFrame(fill_rows)
     weights_df = pd.DataFrame(weight_rows).sort_index() if weight_rows else pd.DataFrame(columns=data.symbols)
     alphas_df = pd.DataFrame(alpha_rows).sort_index() if alpha_rows else pd.DataFrame(columns=data.symbols)
-    return BacktestResult(equity_curve=equity_curve, fills=fills_df, weights=weights_df, alphas=alphas_df)
+    if fills_df.empty:
+        costs_df = pd.DataFrame(columns=["gross_turnover", "fees", "slippage_cost", "total_cost", "turnover_rate"])
+    else:
+        grouped = fills_df.groupby("timestamp")[["gross_value", "fees", "slippage_cost"]].sum()
+        costs_df = grouped.rename(columns={"gross_value": "gross_turnover"})
+        costs_df["total_cost"] = costs_df["fees"] + costs_df["slippage_cost"]
+        equity_on_trade = equity_curve["equity"].reindex(costs_df.index)
+        costs_df["turnover_rate"] = costs_df["gross_turnover"] / equity_on_trade
+    return BacktestResult(
+        equity_curve=equity_curve,
+        fills=fills_df,
+        weights=weights_df,
+        alphas=alphas_df,
+        cost_attribution=costs_df,
+        session_validation=session_validation,
+    )

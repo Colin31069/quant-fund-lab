@@ -56,11 +56,48 @@ def _trade_costs(side: str, gross: float, costs: MarketCostConfig) -> float:
     return float(commission + sell_tax + sec_fee)
 
 
+def _tw_tick_size(price: float) -> float:
+    if price < 10.0:
+        return 0.01
+    if price < 50.0:
+        return 0.05
+    if price < 100.0:
+        return 0.10
+    if price < 500.0:
+        return 0.50
+    if price < 1_000.0:
+        return 1.0
+    return 5.0
+
+
+def _blocked_by_price_limit(
+    symbol: str,
+    side: str,
+    open_price: float,
+    reference_price: float,
+    costs: MarketCostConfig,
+) -> bool:
+    """Conservative Taiwan locked-limit proxy when official auction reference is unavailable."""
+
+    if market_for_symbol(symbol) != "TW" or costs.price_limit_pct is None:
+        return False
+    if not pd.notna(reference_price) or reference_price <= 0:
+        return False
+    tick = _tw_tick_size(reference_price)
+    upper = reference_price * (1.0 + costs.price_limit_pct)
+    lower = reference_price * (1.0 - costs.price_limit_pct)
+    tolerance = tick / 2.0
+    return (side == "BUY" and open_price >= upper - tolerance) or (
+        side == "SELL" and open_price <= lower + tolerance
+    )
+
+
 def rebalance_at_open(
     state: PortfolioState,
     target_weights: pd.Series,
     open_prices: pd.Series,
     volumes: pd.Series,
+    reference_prices: pd.Series,
     timestamp: pd.Timestamp,
     config: BacktestConfig,
 ) -> list[Fill]:
@@ -68,7 +105,8 @@ def rebalance_at_open(
 
     fills: list[Fill] = []
     symbols = list(target_weights.index)
-    equity = state.equity(open_prices)
+    valuation_prices = open_prices.where(open_prices.notna() & (open_prices > 0), reference_prices)
+    equity = state.equity(valuation_prices)
 
     desired_qty: dict[str, int] = {}
     for symbol in symbols:
@@ -90,9 +128,14 @@ def rebalance_at_open(
             costs = _cost_config(symbol, config)
             ref = float(open_prices[symbol])
             volume = max(float(volumes.get(symbol, 0.0)), 0.0)
+            reference_price = float(reference_prices.get(symbol, float("nan")))
+            if volume <= 0.0 or not pd.notna(ref) or ref <= 0.0:
+                continue
+            if _blocked_by_price_limit(symbol, side, ref, reference_price, costs):
+                continue
             max_liquidity_qty = int(floor(volume * costs.max_participation / costs.lot_size) * costs.lot_size)
             requested = abs(delta)
-            qty = requested if max_liquidity_qty <= 0 else min(requested, max_liquidity_qty)
+            qty = min(requested, max_liquidity_qty)
             qty = int(floor(qty / costs.lot_size) * costs.lot_size)
             if side == "SELL":
                 qty = min(qty, current)

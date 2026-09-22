@@ -94,7 +94,13 @@ Streamlit local dashboard：
 
 ### M1 — 回測可信度
 
-加入 market calendar、交易停牌、price limit、台股零股/整股規則、企業行動驗證、survivorship-bias-aware universe、delisting return、FX conversion、成本版本化。
+**M1-1 已完成：** exchange-calendar mismatch report、週末資料硬拒絕、停牌/零成交量不成交、台股普通交易 1,000 股單位、10% locked-limit 保守代理、fee/slippage/turnover attribution。
+
+注意：Yahoo 不提供 TWSE 正式開盤競價基準價，M1-1 的台股漲跌停判斷以前一調整後收盤價作 proxy；第三方交易日曆也可能落後臨時休市/新年度行事曆，因此 calendar mismatch 只作資料品質警告，不自動補造價格。
+
+**M1-2 待做：** survivorship-bias-aware universe、delisting return、企業行動驗證與資料快照。
+
+**M1-3 待做：** USD/TWD FX conversion、base-currency accounting、跨市場組合。
 
 ### M2 — Model research
 

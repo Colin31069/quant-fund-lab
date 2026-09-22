@@ -12,6 +12,8 @@ class MarketData:
     open: pd.DataFrame
     close: pd.DataFrame
     volume: pd.DataFrame
+    reference: pd.DataFrame | None = None
+    exchange: str | None = None
 
     def __post_init__(self) -> None:
         if self.open.empty or self.close.empty:
@@ -20,6 +22,12 @@ class MarketData:
             raise ValueError("open and close indices must align")
         if list(self.open.columns) != list(self.close.columns):
             raise ValueError("open and close symbols must align")
+        if not self.volume.index.equals(self.close.index) or list(self.volume.columns) != list(self.close.columns):
+            raise ValueError("volume must align with close")
+        if self.reference is None:
+            object.__setattr__(self, "reference", self.close.shift(1))
+        elif not self.reference.index.equals(self.close.index) or list(self.reference.columns) != list(self.close.columns):
+            raise ValueError("reference prices must align with close")
 
     @property
     def symbols(self) -> list[str]:
@@ -30,6 +38,8 @@ class MarketData:
             open=self.open.loc[start:end],
             close=self.close.loc[start:end],
             volume=self.volume.loc[start:end],
+            reference=self.reference.loc[start:end] if self.reference is not None else None,
+            exchange=self.exchange,
         )
 
 
@@ -83,10 +93,19 @@ def download_yahoo(
     volume = _extract_field(raw, symbol_list, "Volume").astype(float)
 
     valid = close_px.notna().sum(axis=1) > 0
-    open_px = open_px.loc[valid].ffill()
+    open_px = open_px.loc[valid]
     close_px = close_px.loc[valid].ffill()
     volume = volume.loc[valid].fillna(0.0)
-    return MarketData(open=open_px, close=close_px, volume=volume)
+    reference = close_px.shift(1)
+    markets = {"TW" if s.upper().endswith((".TW", ".TWO")) else "US" for s in symbol_list}
+    exchange = markets.pop() if len(markets) == 1 else None
+    return MarketData(
+        open=open_px,
+        close=close_px,
+        volume=volume,
+        reference=reference,
+        exchange=exchange,
+    )
 
 
 def synthetic_market_data(
@@ -119,4 +138,6 @@ def synthetic_market_data(
         open=pd.DataFrame(open_px, index=dates),
         close=pd.DataFrame(close, index=dates),
         volume=pd.DataFrame(volume, index=dates),
+        reference=pd.DataFrame(close, index=dates).shift(1),
+        exchange=None,
     )
