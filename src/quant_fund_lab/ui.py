@@ -20,6 +20,7 @@ from quant_fund_lab.providers import SnapshotProvider, YahooProvider, load_with_
 from quant_fund_lab.reporting import export_research_report, verify_research_report
 from quant_fund_lab.robustness import build_robustness_report
 from quant_fund_lab.snapshot import save_market_data_snapshot
+from quant_fund_lab.ui_inputs import load_verified_ui_inputs
 from quant_fund_lab.walkforward import (
     WalkForwardSpec,
     generate_candidate_grid,
@@ -32,9 +33,28 @@ st.caption("數學 Alpha → 風險模型 → 組合最佳化 → 模擬成交�
 
 with st.sidebar:
     st.header("研究設定")
-    data_mode = st.selectbox("資料來源", ["Yahoo 公開市場資料", "離線合成資料"])
-    symbols_text = st.text_input("交易標的", "AAPL,MSFT,NVDA,GOOGL")
-    benchmark = st.text_input("比較基準", "SPY")
+    data_mode = st.selectbox(
+        "資料來源",
+        ["Yahoo 公開市場資料", "離線合成資料", "M8 Verified Lifecycle Snapshot"],
+    )
+    verified_mode = data_mode == "M8 Verified Lifecycle Snapshot"
+    if verified_mode:
+        symbols_text = st.text_input("交易 Security IDs", "")
+        benchmark = st.text_input("比較基準 Security ID", "")
+        market_snapshot_directory = st.text_input(
+            "Market snapshot 目錄", "artifacts/provider_cache/latest"
+        )
+        lifecycle_snapshot_directory = st.text_input(
+            "Lifecycle snapshot 目錄", "artifacts/security_lifecycle/latest"
+        )
+        st.caption(
+            "此模式只接受 stable security_id；兩份 snapshot 都會先做 hash / dataset-ID 驗證。"
+        )
+    else:
+        symbols_text = st.text_input("交易標的", "AAPL,MSFT,NVDA,GOOGL")
+        benchmark = st.text_input("比較基準", "SPY")
+        market_snapshot_directory = ""
+        lifecycle_snapshot_directory = ""
     base_currency = st.selectbox("投資組合基準幣別", ["TWD", "USD"])
     end_date = st.date_input("結束日", value=datetime.now(timezone.utc).date())
     start_date = st.date_input("開始日", value=end_date - timedelta(days=365 * 4))
@@ -104,65 +124,102 @@ def load_data(
 
 
 if run:
-    trade_symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
-    all_symbols = list(dict.fromkeys(trade_symbols + [benchmark.strip().upper()]))
-    if len(trade_symbols) < 2:
+    requested_trade_assets = [
+        s.strip() if verified_mode else s.strip().upper()
+        for s in symbols_text.split(",")
+        if s.strip()
+    ]
+    requested_benchmark = benchmark.strip() if verified_mode else benchmark.strip().upper()
+    all_symbols = list(dict.fromkeys(requested_trade_assets + [requested_benchmark]))
+    if len(requested_trade_assets) < 2:
         st.error("至少提供兩個交易標的，橫斷面模型才有意義。")
         st.stop()
 
     try:
         with st.spinner("載入資料並執行 walk-forward paper replay..."):
-            raw, data_provider, provider_attempts = load_data(
-                data_mode,
-                tuple(all_symbols),
-                str(start_date),
-                str(end_date + timedelta(days=1)),
-            )
-            if data_mode == "Yahoo 公開市場資料":
-                if raw.fx_to_base is None:
-                    try:
-                        raw = attach_yahoo_fx(raw, base_currency=base_currency)
-                    except Exception:  # noqa: BLE001 - retry through verified local fallback.
-                        fallback = load_with_failover(
-                            [SnapshotProvider(("artifacts/provider_cache",))],
-                            all_symbols,
-                            str(start_date),
-                            str(end_date + timedelta(days=1)),
-                        )
-                        raw = fallback.data
-                        data_provider = fallback.provider
-                        provider_attempts = provider_attempts + tuple(
-                            (item.provider, item.success, item.error) for item in fallback.attempts
-                        )
-                if data_provider == "yahoo":
-                    save_market_data_snapshot(raw, "artifacts/provider_cache/latest", overwrite=True)
+            source_data_provenance: dict[str, str] = {}
+            if verified_mode:
+                verified_inputs = load_verified_ui_inputs(
+                    market_snapshot_directory,
+                    lifecycle_snapshot_directory,
+                    requested_trade_assets,
+                    requested_benchmark,
+                    start=start_date,
+                    end=end_date,
+                    base_currency=base_currency,
+                )
+                raw = verified_inputs.raw
+                trade_data = verified_inputs.trade_data
+                trade_symbols = list(verified_inputs.trade_assets)
+                benchmark_symbol = verified_inputs.benchmark_asset
+                source_data_provenance = verified_inputs.data_provenance
+                data_provider = "verified_identity_snapshots"
+                provider_attempts = ((data_provider, True, None),)
             else:
-                synthetic_usd_twd = pd.Series(32.0, index=raw.close.index, dtype=float)
-                raw = attach_fx_rates(raw, base_currency, usd_twd=synthetic_usd_twd)
-            trade_data = MarketData(
-                open=raw.open[trade_symbols],
-                close=raw.close[trade_symbols],
-                volume=raw.volume[trade_symbols],
-                raw_open=raw.raw_open[trade_symbols] if raw.raw_open is not None else None,
-                raw_close=raw.raw_close[trade_symbols] if raw.raw_close is not None else None,
-                reference=raw.reference[trade_symbols] if raw.reference is not None else None,
-                membership=raw.membership[trade_symbols] if raw.membership is not None else None,
-                terminal_returns=(
-                    raw.terminal_returns[trade_symbols] if raw.terminal_returns is not None else None
-                ),
-                dividends=raw.dividends[trade_symbols] if raw.dividends is not None else None,
-                stock_splits=raw.stock_splits[trade_symbols] if raw.stock_splits is not None else None,
-                fx_to_base=raw.fx_to_base[trade_symbols] if raw.fx_to_base is not None else None,
-                fx_age_days=raw.fx_age_days[trade_symbols] if raw.fx_age_days is not None else None,
-                market_codes=(
-                    raw.market_codes[trade_symbols] if raw.market_codes is not None else None
-                ),
-                currency_codes=(
-                    raw.currency_codes[trade_symbols] if raw.currency_codes is not None else None
-                ),
-                base_currency=raw.base_currency,
-                exchange=raw.exchange,
-            )
+                trade_symbols = requested_trade_assets
+                raw, data_provider, provider_attempts = load_data(
+                    data_mode,
+                    tuple(all_symbols),
+                    str(start_date),
+                    str(end_date + timedelta(days=1)),
+                )
+                if data_mode == "Yahoo 公開市場資料":
+                    if raw.fx_to_base is None:
+                        try:
+                            raw = attach_yahoo_fx(raw, base_currency=base_currency)
+                        except Exception:  # noqa: BLE001 - retry through verified local fallback.
+                            fallback = load_with_failover(
+                                [SnapshotProvider(("artifacts/provider_cache",))],
+                                all_symbols,
+                                str(start_date),
+                                str(end_date + timedelta(days=1)),
+                            )
+                            raw = fallback.data
+                            data_provider = fallback.provider
+                            provider_attempts = provider_attempts + tuple(
+                                (item.provider, item.success, item.error)
+                                for item in fallback.attempts
+                            )
+                    if data_provider == "yahoo":
+                        save_market_data_snapshot(
+                            raw, "artifacts/provider_cache/latest", overwrite=True
+                        )
+                else:
+                    synthetic_usd_twd = pd.Series(32.0, index=raw.close.index, dtype=float)
+                    raw = attach_fx_rates(raw, base_currency, usd_twd=synthetic_usd_twd)
+                trade_data = MarketData(
+                    open=raw.open[trade_symbols],
+                    close=raw.close[trade_symbols],
+                    volume=raw.volume[trade_symbols],
+                    raw_open=raw.raw_open[trade_symbols] if raw.raw_open is not None else None,
+                    raw_close=raw.raw_close[trade_symbols] if raw.raw_close is not None else None,
+                    reference=raw.reference[trade_symbols] if raw.reference is not None else None,
+                    membership=raw.membership[trade_symbols] if raw.membership is not None else None,
+                    terminal_returns=(
+                        raw.terminal_returns[trade_symbols]
+                        if raw.terminal_returns is not None
+                        else None
+                    ),
+                    dividends=raw.dividends[trade_symbols] if raw.dividends is not None else None,
+                    stock_splits=(
+                        raw.stock_splits[trade_symbols] if raw.stock_splits is not None else None
+                    ),
+                    fx_to_base=raw.fx_to_base[trade_symbols] if raw.fx_to_base is not None else None,
+                    fx_age_days=(
+                        raw.fx_age_days[trade_symbols] if raw.fx_age_days is not None else None
+                    ),
+                    market_codes=(
+                        raw.market_codes[trade_symbols] if raw.market_codes is not None else None
+                    ),
+                    currency_codes=(
+                        raw.currency_codes[trade_symbols]
+                        if raw.currency_codes is not None
+                        else None
+                    ),
+                    base_currency=raw.base_currency,
+                    exchange=raw.exchange,
+                )
+                benchmark_symbol = requested_benchmark
             strategy = StrategyConfig(
                 max_weight=max_weight,
                 rebalance_every=rebalance_every,
@@ -235,9 +292,11 @@ if run:
                     "train_fraction": float(train_fraction),
                     "split_date": str(comparison.split_date.date()),
                 }
-                data_provenance = {
-                    "market_data_dataset_id": input_snapshot.dataset_id,
-                }
+                data_provenance = dict(source_data_provenance)
+                if data_provenance:
+                    data_provenance["derived_trade_dataset_id"] = input_snapshot.dataset_id
+                else:
+                    data_provenance["market_data_dataset_id"] = input_snapshot.dataset_id
                 run_manifest = build_run_manifest(
                     config,
                     input_snapshot.dataset_id,
@@ -265,7 +324,6 @@ if run:
                     },
                 )
                 report_export = (exported_run.run_id, report_directory, report_verified)
-            benchmark_symbol = benchmark.strip().upper()
             benchmark_close_base = (
                 raw.close[benchmark_symbol] * raw.fx_to_base[benchmark_symbol]
             ).ffill().dropna()
@@ -308,6 +366,12 @@ if run:
             f"資料 Provider：{data_provider}。"
             + (f" Failover 前失敗：{', '.join(provider_failed)}。" if provider_failed else "")
         )
+        if source_data_provenance:
+            st.caption(
+                "Verified provenance：market="
+                f"{source_data_provenance['market_data_dataset_id'][:12]}…；lifecycle="
+                f"{source_data_provenance['security_lifecycle_dataset_id'][:12]}…。"
+            )
         if report_export is not None:
             report_run_id, report_path, report_verified = report_export
             st.success(

@@ -80,7 +80,6 @@ def test_run_id_is_deterministic_and_config_sensitive():
     assert manifest.run_id == same
     assert manifest.config_schema_version == 1
     assert manifest.package_version == __version__
-    assert __version__ == "0.8.9"
     lifecycle_run = deterministic_run_id(
         config,
         "dataset-123",
