@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .config import BacktestConfig
+from .corporate_actions import apply_cash_dividend_events, apply_stock_split_events
 from .data import MarketData
 from .execution import (
     PortfolioState,
@@ -41,6 +42,7 @@ class BacktestResult:
     regimes: pd.DataFrame
     factor_weights: pd.DataFrame
     risk_controls: pd.DataFrame
+    corporate_actions: pd.DataFrame
 
 
 def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> BacktestResult:
@@ -76,6 +78,18 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         fx_to_base = data.fx_to_base
         fx_age_days = data.fx_age_days
     strategy = config.strategy
+    if config.execution_price_basis not in {"adjusted", "raw"}:
+        raise ValueError("execution_price_basis must be 'adjusted' or 'raw'")
+    if config.execution_price_basis == "raw":
+        execution_open = data.raw_open
+        valuation_close = data.raw_close
+        if execution_open is None or valuation_close is None:
+            raise ValueError("raw execution requires raw_open/raw_close market data")
+        execution_reference = valuation_close.shift(1)
+    else:
+        execution_open = data.open
+        valuation_close = data.close
+        execution_reference = data.reference
     dates = data.close.index
     if len(dates) < strategy.warmup_days + 2:
         raise ValueError(f"need at least {strategy.warmup_days + 2} bars")
@@ -89,6 +103,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     regime_rows: list[dict[str, object]] = []
     factor_weight_rows: list[pd.Series] = []
     risk_control_rows: list[dict[str, object]] = []
+    corporate_action_rows: list[dict[str, object]] = []
     target = pd.Series(0.0, index=data.symbols)
     factor_panel = pd.DataFrame()
     factor_ic = pd.DataFrame()
@@ -111,17 +126,33 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     for i in range(start_i, len(dates) - 1):
         signal_date = dates[i]
         execution_date = dates[i + 1]
-        close_now = data.close.loc[signal_date]
-        open_next = data.open.loc[execution_date]
-        close_next = data.close.loc[execution_date]
+        close_now = valuation_close.loc[signal_date]
+        open_next = execution_open.loc[execution_date]
+        close_next = valuation_close.loc[execution_date]
         volume_next = data.volume.loc[execution_date]
-        reference_next = data.reference.loc[execution_date]
+        reference_next = execution_reference.loc[execution_date]
         fx_signal = fx_to_base.loc[signal_date]
         fx_next = fx_to_base.loc[execution_date]
         terminal_next = data.terminal_returns.loc[execution_date]
         signal_equity = state.equity(close_now, fx_signal)
         running_peak = max(running_peak, signal_equity)
         current_drawdown = max(0.0, 1.0 - signal_equity / max(running_peak, 1e-12))
+        if config.execution_price_basis == "raw":
+            split_events = apply_stock_split_events(
+                state,
+                data.stock_splits.loc[execution_date],
+                open_next,
+                pd.Timestamp(execution_date),
+                fx_next,
+            )
+            dividend_events = apply_cash_dividend_events(
+                state,
+                data.dividends.loc[execution_date],
+                pd.Timestamp(execution_date),
+                fx_next,
+            )
+            corporate_action_rows.extend(asdict(event) for event in split_events)
+            corporate_action_rows.extend(asdict(event) for event in dividend_events)
         terminal_events = apply_terminal_returns(
             state=state,
             terminal_returns=terminal_next,
@@ -284,6 +315,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         if risk_control_rows
         else pd.DataFrame()
     )
+    corporate_actions_df = pd.DataFrame(corporate_action_rows)
     if fills_df.empty:
         costs_df = pd.DataFrame(columns=["gross_turnover", "fees", "slippage_cost", "total_cost", "turnover_rate"])
     else:
@@ -305,4 +337,5 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         regimes=regimes_df,
         factor_weights=factor_weights_df,
         risk_controls=risk_controls_df,
+        corporate_actions=corporate_actions_df,
     )

@@ -60,6 +60,7 @@ class BacktestConfig:
     initial_cash: float = 1_000_000.0
     base_currency: str | None = None
     max_fx_staleness_days: int = 5
+    execution_price_basis: str = "adjusted"
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     us_costs: MarketCostConfig = field(
         default_factory=lambda: MarketCostConfig(
