@@ -222,6 +222,11 @@ if run:
                         if raw.cash_in_lieu_prices is not None
                         else None
                     ),
+                    cash_in_lieu_settlement_dates=(
+                        raw.cash_in_lieu_settlement_dates[trade_symbols]
+                        if raw.cash_in_lieu_settlement_dates is not None
+                        else None
+                    ),
                     fx_to_base=raw.fx_to_base[trade_symbols] if raw.fx_to_base is not None else None,
                     fx_age_days=(
                         raw.fx_age_days[trade_symbols] if raw.fx_age_days is not None else None

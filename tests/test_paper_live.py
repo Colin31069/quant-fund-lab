@@ -504,6 +504,49 @@ def test_persistent_replay_records_daily_snapshots_and_nav(tmp_path):
         ledger.close()
 
 
+def test_persistent_replay_rejects_delayed_cash_in_lieu_until_m10_3(tmp_path):
+    dates = pd.bdate_range("2026-01-02", periods=40)
+    close = pd.DataFrame(
+        {
+            "AAA": [100.0 + i for i in range(len(dates))],
+            "BBB": [80.0 + i * 0.5 for i in range(len(dates))],
+        },
+        index=dates,
+    )
+    settlements = pd.DataFrame(float("nan"), index=dates, columns=close.columns)
+    settlements.loc[dates[22], "AAA"] = 51.0
+    settlement_dates = pd.DataFrame(pd.NaT, index=dates, columns=close.columns)
+    settlement_dates.loc[dates[20], "AAA"] = dates[22]
+    splits = pd.DataFrame(0.0, index=dates, columns=close.columns)
+    splits.loc[dates[20], "AAA"] = 0.5
+    data = MarketData(
+        open=close,
+        close=close,
+        raw_open=close,
+        raw_close=close,
+        volume=pd.DataFrame(100_000.0, index=dates, columns=close.columns),
+        stock_splits=splits,
+        cash_in_lieu_prices=settlements,
+        cash_in_lieu_settlement_dates=settlement_dates,
+    )
+    config = BacktestConfig(
+        execution_price_basis="raw",
+        strategy=StrategyConfig(warmup_days=20, rebalance_every=5, max_weight=0.6),
+    )
+    targets = pd.DataFrame(
+        [{"AAA": 0.5, "BBB": 0.4}],
+        index=[dates[20]],
+    )
+    with pytest.raises(ValueError, match="does not support delayed cash-in-lieu"):
+        replay_targets_persistently(
+            data,
+            targets,
+            config,
+            tmp_path / "delayed-cil.sqlite",
+            reset=True,
+        )
+
+
 def test_raw_persistent_replay_records_corporate_action_events(tmp_path):
     data = synthetic_market_data(symbols=("AAA", "BBB"), periods=90, seed=24)
     dates = data.close.index

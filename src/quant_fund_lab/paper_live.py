@@ -790,6 +790,15 @@ def replay_targets_persistently(
 
     if target_weights.empty:
         raise ValueError("target_weights cannot be empty")
+    if data.cash_in_lieu_settlement_dates is not None:
+        for timestamp, row in data.cash_in_lieu_settlement_dates.iterrows():
+            if any(
+                pd.notna(value) and pd.Timestamp(value) > pd.Timestamp(timestamp)
+                for value in row
+            ):
+                raise ValueError(
+                    "persistent replay does not support delayed cash-in-lieu settlement before M10-3"
+                )
     required_metadata = data.membership.fillna(False) | data.terminal_returns.notna()
     if data.market_codes is not None and bool(
         (required_metadata & data.market_codes.isna()).any().any()

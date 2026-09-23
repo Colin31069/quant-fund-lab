@@ -38,7 +38,7 @@ def test_market_data_defaults_raw_prices_to_existing_basis():
     pd.testing.assert_frame_equal(data.raw_close, data.close)
 
 
-def test_snapshot_v5_round_trips_raw_price_and_asset_metadata(tmp_path):
+def test_snapshot_v6_round_trips_raw_price_and_asset_metadata(tmp_path):
     dates = pd.bdate_range("2026-01-02", periods=3)
     adjusted = pd.DataFrame({"AAA": [50.0, 51.0, 52.0]}, index=dates)
     raw = pd.DataFrame({"AAA": [100.0, 102.0, 104.0]}, index=dates)
@@ -95,15 +95,21 @@ def test_cash_in_lieu_settlement_prices_validate_slice_and_snapshot(tmp_path):
         {"AAA": [float("nan"), 18.25, float("nan"), float("nan")]},
         index=dates,
     )
+    settlement_dates = pd.DataFrame(pd.NaT, index=dates, columns=["AAA"])
+    settlement_dates.loc[dates[1], "AAA"] = dates[3]
     data = MarketData(
         open=close,
         close=close,
         volume=pd.DataFrame(1000.0, index=dates, columns=["AAA"]),
         cash_in_lieu_prices=settlements,
+        cash_in_lieu_settlement_dates=settlement_dates,
     )
 
     sliced = data.slice(start=dates[1], end=dates[2])
     assert sliced.cash_in_lieu_prices.loc[dates[1], "AAA"] == pytest.approx(18.25)
+    assert pd.Timestamp(
+        sliced.cash_in_lieu_settlement_dates.loc[dates[1], "AAA"]
+    ) == dates[3]
 
     root = tmp_path / "cil-snapshot"
     save_market_data_snapshot(data, root)
@@ -111,6 +117,11 @@ def test_cash_in_lieu_settlement_prices_validate_slice_and_snapshot(tmp_path):
     pd.testing.assert_frame_equal(
         loaded.cash_in_lieu_prices,
         settlements,
+        check_freq=False,
+    )
+    pd.testing.assert_frame_equal(
+        loaded.cash_in_lieu_settlement_dates,
+        settlement_dates,
         check_freq=False,
     )
 
@@ -122,6 +133,16 @@ def test_cash_in_lieu_settlement_prices_validate_slice_and_snapshot(tmp_path):
             close=close,
             volume=pd.DataFrame(1000.0, index=dates, columns=["AAA"]),
             cash_in_lieu_prices=invalid,
+        )
+
+    invalid_dates = settlement_dates.copy()
+    invalid_dates.loc[dates[1], "AAA"] = dates[0]
+    with pytest.raises(ValueError, match="cannot precede"):
+        MarketData(
+            open=close,
+            close=close,
+            volume=pd.DataFrame(1000.0, index=dates, columns=["AAA"]),
+            cash_in_lieu_settlement_dates=invalid_dates,
         )
 
 

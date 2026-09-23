@@ -3,7 +3,12 @@ import pytest
 
 from quant_fund_lab.backtest import run_backtest
 from quant_fund_lab.config import BacktestConfig, DividendWithholdingConfig, StrategyConfig
-from quant_fund_lab.corporate_actions import apply_cash_dividend_events, apply_stock_split_events
+from quant_fund_lab.corporate_actions import (
+    apply_cash_dividend_events,
+    apply_stock_split_events,
+    mark_cash_in_lieu_receivables,
+    settle_cash_in_lieu_receivables,
+)
 from quant_fund_lab.data import MarketData
 from quant_fund_lab.execution import PortfolioState
 from quant_fund_lab.tax_analytics import dividend_tax_by_currency, summarize_dividend_tax
@@ -92,9 +97,75 @@ def test_reverse_split_prefers_explicit_cash_in_lieu_settlement_price():
     assert event.cash_value_local == pytest.approx(9.0)
 
 
+def test_delayed_cash_in_lieu_is_receivable_until_settlement_date():
+    state = PortfolioState(cash=100.0, shares={"AAA": 11})
+    receivables = []
+    split_date = pd.Timestamp("2026-01-05")
+    settlement_date = pd.Timestamp("2026-01-07")
+
+    events = apply_stock_split_events(
+        state,
+        pd.Series({"AAA": 0.5}),
+        pd.Series({"AAA": 20.0}),
+        split_date,
+        cash_in_lieu_settlement_dates=pd.Series({"AAA": settlement_date}),
+        receivables=receivables,
+    )
+
+    assert state.shares["AAA"] == 5
+    assert state.cash == pytest.approx(100.0)
+    assert len(receivables) == 1
+    assert receivables[0].fractional_quantity == pytest.approx(0.5)
+    assert events[0].cash_value == pytest.approx(0.0)
+    assert events[0].cash_in_lieu_price_source == "pending_settlement"
+    assert pd.Timestamp(events[0].cash_in_lieu_settlement_date) == settlement_date
+
+    marked = mark_cash_in_lieu_receivables(
+        receivables,
+        pd.Series({"AAA": 21.0}),
+    )
+    assert marked == pytest.approx(10.5)
+    state.receivable_value = marked
+    assert state.equity(pd.Series({"AAA": 21.0})) == pytest.approx(215.5)
+
+    settlement_events = settle_cash_in_lieu_receivables(
+        state,
+        receivables,
+        settlement_date,
+        pd.Series({"AAA": 18.0}),
+    )
+    state.receivable_value = mark_cash_in_lieu_receivables(
+        receivables,
+        pd.Series({"AAA": 18.0}),
+    )
+    assert receivables == []
+    assert state.cash == pytest.approx(109.0)
+    assert state.receivable_value == pytest.approx(0.0)
+    assert settlement_events[0].action == "cash_in_lieu_settlement"
+    assert settlement_events[0].cash_value == pytest.approx(9.0)
+    assert settlement_events[0].cash_in_lieu_price == pytest.approx(18.0)
+
+
+def test_future_settlement_rejects_ex_date_price_to_avoid_lookahead():
+    state = PortfolioState(cash=0.0, shares={"AAA": 11})
+    with pytest.raises(ValueError, match="future cash-in-lieu settlement"):
+        apply_stock_split_events(
+            state,
+            pd.Series({"AAA": 0.5}),
+            pd.Series({"AAA": 20.0}),
+            pd.Timestamp("2026-01-05"),
+            cash_in_lieu_prices=pd.Series({"AAA": 18.0}),
+            cash_in_lieu_settlement_dates=pd.Series(
+                {"AAA": pd.Timestamp("2026-01-07")}
+            ),
+            receivables=[],
+        )
+
+
 def _raw_split_market_data(
     split_ratio: float = 2.0,
     cash_in_lieu_price=None,
+    settlement_delay: int = 0,
 ) -> MarketData:
     dates = pd.bdate_range("2025-01-02", periods=80)
     adjusted_aaa = pd.Series(50.0 + 0.2 * pd.RangeIndex(len(dates)), index=dates, dtype=float)
@@ -109,9 +180,16 @@ def _raw_split_market_data(
     splits = pd.DataFrame(0.0, index=dates, columns=["AAA", "BBB"])
     splits.loc[split_date, "AAA"] = split_ratio
     settlements = None
+    settlement_dates = None
     if cash_in_lieu_price is not None:
         settlements = pd.DataFrame(float("nan"), index=dates, columns=["AAA", "BBB"])
-        settlements.loc[split_date, "AAA"] = cash_in_lieu_price
+        if settlement_delay > 0:
+            settlement_date = dates[50 + settlement_delay]
+            settlements.loc[settlement_date, "AAA"] = cash_in_lieu_price
+            settlement_dates = pd.DataFrame(pd.NaT, index=dates, columns=["AAA", "BBB"])
+            settlement_dates.loc[split_date, "AAA"] = settlement_date
+        else:
+            settlements.loc[split_date, "AAA"] = cash_in_lieu_price
     dividends = pd.DataFrame(0.0, index=dates, columns=["AAA", "BBB"])
     dividends.loc[dates[60], "AAA"] = 1.0
     return MarketData(
@@ -122,6 +200,7 @@ def _raw_split_market_data(
         volume=pd.DataFrame(2_000_000.0, index=dates, columns=["AAA", "BBB"]),
         stock_splits=splits,
         cash_in_lieu_prices=settlements,
+        cash_in_lieu_settlement_dates=settlement_dates,
         dividends=dividends,
         membership=pd.DataFrame(True, index=dates, columns=["AAA", "BBB"]),
     )
@@ -166,6 +245,39 @@ def test_raw_backtest_uses_explicit_cash_in_lieu_settlement_price():
     assert split["cash_in_lieu_price"] == pytest.approx(61.25)
     assert split["cash_in_lieu_price_source"] == "provider_settlement"
     assert split["cash_value_local"] > 0.0
+
+
+def test_raw_backtest_marks_delayed_cash_in_lieu_receivable_until_settlement():
+    data = _raw_split_market_data(
+        split_ratio=0.4,
+        cash_in_lieu_price=61.25,
+        settlement_delay=2,
+    )
+    config = BacktestConfig(
+        initial_cash=100_000.0,
+        execution_price_basis="raw",
+        strategy=StrategyConfig(
+            warmup_days=30,
+            rebalance_every=5,
+            max_weight=0.8,
+            regime_enabled=False,
+            factor_neutralization=False,
+            risk_aversion=0.2,
+        ),
+    )
+    result = run_backtest(data, config)
+    actions = result.corporate_actions
+    split = actions[actions["action"].eq("stock_split")].iloc[0]
+    settlement = actions[actions["action"].eq("cash_in_lieu_settlement")].iloc[0]
+    split_date = pd.Timestamp(split["timestamp"])
+    settlement_date = pd.Timestamp(settlement["timestamp"])
+
+    assert split["cash_value"] == pytest.approx(0.0)
+    assert split["cash_in_lieu_price_source"] == "pending_settlement"
+    assert settlement["cash_in_lieu_price"] == pytest.approx(61.25)
+    assert settlement_date > split_date
+    assert result.equity_curve.loc[split_date, "receivable_value"] > 0.0
+    assert result.equity_curve.loc[settlement_date, "receivable_value"] == pytest.approx(0.0)
 
 
 def test_raw_backtest_applies_configured_dividend_withholding():

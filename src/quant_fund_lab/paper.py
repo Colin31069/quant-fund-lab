@@ -50,6 +50,11 @@ def historical_vs_paper_replay(
             if data.cash_in_lieu_prices is not None
             else None
         ),
+        cash_in_lieu_settlement_dates=(
+            data.cash_in_lieu_settlement_dates.iloc[:split]
+            if data.cash_in_lieu_settlement_dates is not None
+            else None
+        ),
         fx_to_base=data.fx_to_base.iloc[:split] if data.fx_to_base is not None else None,
         fx_age_days=data.fx_age_days.iloc[:split] if data.fx_age_days is not None else None,
         market_codes=data.market_codes.iloc[:split] if data.market_codes is not None else None,
@@ -78,6 +83,11 @@ def historical_vs_paper_replay(
         cash_in_lieu_prices=(
             data.cash_in_lieu_prices.iloc[paper_start:]
             if data.cash_in_lieu_prices is not None
+            else None
+        ),
+        cash_in_lieu_settlement_dates=(
+            data.cash_in_lieu_settlement_dates.iloc[paper_start:]
+            if data.cash_in_lieu_settlement_dates is not None
             else None
         ),
         fx_to_base=data.fx_to_base.iloc[paper_start:] if data.fx_to_base is not None else None,

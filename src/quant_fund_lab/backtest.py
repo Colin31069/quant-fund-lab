@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 
 from .config import BacktestConfig
-from .corporate_actions import apply_cash_dividend_events, apply_stock_split_events
+from .corporate_actions import (
+    CashInLieuReceivable,
+    apply_cash_dividend_events,
+    apply_stock_split_events,
+    mark_cash_in_lieu_receivables,
+    settle_cash_in_lieu_receivables,
+)
 from .data import MarketData
 from .execution import (
     PortfolioState,
@@ -137,6 +143,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     factor_weight_rows: list[pd.Series] = []
     risk_control_rows: list[dict[str, object]] = []
     corporate_action_rows: list[dict[str, object]] = []
+    cash_in_lieu_receivables: list[CashInLieuReceivable] = []
     target = pd.Series(0.0, index=data.symbols)
     factor_panel = pd.DataFrame()
     factor_ic = pd.DataFrame()
@@ -154,7 +161,14 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     start_i = strategy.warmup_days - 1
     initial_date = dates[start_i]
     running_peak = float(config.initial_cash)
-    equity_rows.append({"timestamp": initial_date, "equity": config.initial_cash, "cash": state.cash})
+    equity_rows.append(
+        {
+            "timestamp": initial_date,
+            "equity": config.initial_cash,
+            "cash": state.cash,
+            "receivable_value": 0.0,
+        }
+    )
 
     for i in range(start_i, len(dates) - 1):
         signal_date = dates[i]
@@ -169,14 +183,39 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         market_next = (
             data.market_codes.loc[execution_date] if data.market_codes is not None else None
         )
+        currency_signal = (
+            data.currency_codes.loc[signal_date] if data.currency_codes is not None else None
+        )
         currency_next = (
             data.currency_codes.loc[execution_date] if data.currency_codes is not None else None
         )
         terminal_next = data.terminal_returns.loc[execution_date]
+        if config.execution_price_basis == "raw":
+            state.receivable_value = mark_cash_in_lieu_receivables(
+                cash_in_lieu_receivables,
+                close_now,
+                fx_signal,
+                currency_signal,
+            )
+        else:
+            state.receivable_value = 0.0
+        signal_receivable_value = state.receivable_value
         signal_equity = state.equity(close_now, fx_signal)
         running_peak = max(running_peak, signal_equity)
         current_drawdown = max(0.0, 1.0 - signal_equity / max(running_peak, 1e-12))
         if config.execution_price_basis == "raw":
+            settlement_events = settle_cash_in_lieu_receivables(
+                state,
+                cash_in_lieu_receivables,
+                pd.Timestamp(execution_date),
+                (
+                    data.cash_in_lieu_prices.loc[execution_date]
+                    if data.cash_in_lieu_prices is not None
+                    else None
+                ),
+                fx_next,
+                currency_next,
+            )
             split_events = apply_stock_split_events(
                 state,
                 data.stock_splits.loc[execution_date],
@@ -189,6 +228,18 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                     if data.cash_in_lieu_prices is not None
                     else None
                 ),
+                (
+                    data.cash_in_lieu_settlement_dates.loc[execution_date]
+                    if data.cash_in_lieu_settlement_dates is not None
+                    else None
+                ),
+                cash_in_lieu_receivables,
+            )
+            state.receivable_value = mark_cash_in_lieu_receivables(
+                cash_in_lieu_receivables,
+                open_next,
+                fx_next,
+                currency_next,
             )
             dividend_events = apply_cash_dividend_events(
                 state,
@@ -199,6 +250,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                 market_next,
                 config.dividend_withholding,
             )
+            corporate_action_rows.extend(asdict(event) for event in settlement_events)
             corporate_action_rows.extend(asdict(event) for event in split_events)
             corporate_action_rows.extend(asdict(event) for event in dividend_events)
         terminal_events = apply_terminal_returns(
@@ -247,7 +299,10 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                 alpha = raw_alpha.where(eligible, 0.0)
             alpha = alpha.reindex(data.symbols).fillna(0.0)
             returns = history.pct_change(fill_method=None).tail(strategy.covariance_lookback)
+            execution_receivable_value = state.receivable_value
+            state.receivable_value = signal_receivable_value
             previous = state.weights(close_now, fx_signal).reindex(data.symbols).fillna(0.0)
+            state.receivable_value = execution_receivable_value
             gross_limit = regime.gross_exposure_limit if strategy.regime_enabled else 1.0
             target = optimize_weights(
                 alpha,
@@ -338,11 +393,21 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
             )
             fill_rows.extend(asdict(fill) for fill in fills)
 
+        if config.execution_price_basis == "raw":
+            state.receivable_value = mark_cash_in_lieu_receivables(
+                cash_in_lieu_receivables,
+                close_next,
+                fx_next,
+                currency_next,
+            )
+        else:
+            state.receivable_value = 0.0
         equity_rows.append(
             {
                 "timestamp": execution_date,
                 "equity": state.equity(close_next, fx_next),
                 "cash": state.cash,
+                "receivable_value": state.receivable_value,
             }
         )
 

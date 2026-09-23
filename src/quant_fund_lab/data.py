@@ -20,6 +20,7 @@ class MarketData:
     dividends: pd.DataFrame | None = None
     stock_splits: pd.DataFrame | None = None
     cash_in_lieu_prices: pd.DataFrame | None = None
+    cash_in_lieu_settlement_dates: pd.DataFrame | None = None
     fx_to_base: pd.DataFrame | None = None
     fx_age_days: pd.DataFrame | None = None
     market_codes: pd.DataFrame | None = None
@@ -53,6 +54,7 @@ class MarketData:
             "dividends": self.dividends,
             "stock_splits": self.stock_splits,
             "cash_in_lieu_prices": self.cash_in_lieu_prices,
+            "cash_in_lieu_settlement_dates": self.cash_in_lieu_settlement_dates,
             "fx_to_base": self.fx_to_base,
             "fx_age_days": self.fx_age_days,
             "market_codes": self.market_codes,
@@ -97,6 +99,21 @@ class MarketData:
                 raise ValueError(
                     "cash_in_lieu_prices must contain positive finite settlement prices"
                 )
+        if self.cash_in_lieu_settlement_dates is not None:
+            normalized_dates = self.cash_in_lieu_settlement_dates.apply(
+                lambda column: pd.to_datetime(column, errors="coerce")
+            )
+            invalid_parse = self.cash_in_lieu_settlement_dates.notna() & normalized_dates.isna()
+            if bool(invalid_parse.any().any()):
+                raise ValueError("cash_in_lieu_settlement_dates contains invalid dates")
+            for timestamp, row in normalized_dates.iterrows():
+                for settlement_date in row.dropna():
+                    settlement = pd.Timestamp(settlement_date)
+                    if settlement < pd.Timestamp(timestamp):
+                        raise ValueError(
+                            "cash_in_lieu_settlement_dates cannot precede the split date"
+                        )
+            object.__setattr__(self, "cash_in_lieu_settlement_dates", normalized_dates)
         code_fields = {
             "market_codes": (self.market_codes, {"US", "TW"}),
             "currency_codes": (self.currency_codes, {"USD", "TWD"}),
@@ -148,6 +165,11 @@ class MarketData:
             cash_in_lieu_prices=(
                 self.cash_in_lieu_prices.loc[start:end]
                 if self.cash_in_lieu_prices is not None
+                else None
+            ),
+            cash_in_lieu_settlement_dates=(
+                self.cash_in_lieu_settlement_dates.loc[start:end]
+                if self.cash_in_lieu_settlement_dates is not None
                 else None
             ),
             fx_to_base=self.fx_to_base.loc[start:end] if self.fx_to_base is not None else None,

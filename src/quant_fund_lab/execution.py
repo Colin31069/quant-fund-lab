@@ -44,6 +44,7 @@ class TerminalEvent:
 class PortfolioState:
     cash: float
     shares: dict[str, int] = field(default_factory=dict)
+    receivable_value: float = 0.0
 
     def equity(self, prices: pd.Series, fx_to_base: pd.Series | None = None) -> float:
         factors = (
@@ -57,7 +58,7 @@ class PortfolioState:
             * float(factors.get(symbol, 1.0))
             for symbol in self.shares
         )
-        return float(self.cash + holdings)
+        return float(self.cash + holdings + self.receivable_value)
 
     def weights(self, prices: pd.Series, fx_to_base: pd.Series | None = None) -> pd.Series:
         factors = (

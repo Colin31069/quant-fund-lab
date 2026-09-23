@@ -80,6 +80,7 @@ def stitch_market_data_by_identity(
         "dividends": data.dividends,
         "stock_splits": data.stock_splits,
         "cash_in_lieu_prices": data.cash_in_lieu_prices,
+        "cash_in_lieu_settlement_dates": data.cash_in_lieu_settlement_dates,
         "fx_to_base": None if has_currency_transition else data.fx_to_base,
         "fx_age_days": None if has_currency_transition else data.fx_age_days,
     }
@@ -93,6 +94,11 @@ def stitch_market_data_by_identity(
         "stock_splits": pd.DataFrame(index=index),
         "cash_in_lieu_prices": (
             pd.DataFrame(index=index) if data.cash_in_lieu_prices is not None else None
+        ),
+        "cash_in_lieu_settlement_dates": (
+            pd.DataFrame(index=index)
+            if data.cash_in_lieu_settlement_dates is not None
+            else None
         ),
         "fx_to_base": (
             pd.DataFrame(index=index)
@@ -218,6 +224,11 @@ def stitch_market_data_by_identity(
         output["cash_in_lieu_prices"] = cash_in_lieu_prices.reindex(
             columns=[row["asset_key"] for row in asset_rows]
         )
+    cash_in_lieu_settlement_dates = output["cash_in_lieu_settlement_dates"]
+    if cash_in_lieu_settlement_dates is not None:
+        output["cash_in_lieu_settlement_dates"] = cash_in_lieu_settlement_dates.reindex(
+            columns=[row["asset_key"] for row in asset_rows]
+        )
 
     close = output["close"]
     if close is None:
@@ -236,6 +247,7 @@ def stitch_market_data_by_identity(
         dividends=output["dividends"],
         stock_splits=output["stock_splits"],
         cash_in_lieu_prices=output["cash_in_lieu_prices"],
+        cash_in_lieu_settlement_dates=output["cash_in_lieu_settlement_dates"],
         fx_to_base=output["fx_to_base"],
         fx_age_days=output["fx_age_days"],
         market_codes=market_codes.reindex(columns=close.columns),
