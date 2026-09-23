@@ -39,3 +39,5 @@ M5-3 Portfolio Risk Controls 已完成：optimizer 產生相對權重後，可�
 M5-4 Robustness Lab 已完成：固定 paper split 下可執行 1.0x / 1.5x / 2.0x execution-cost stress、circular block bootstrap 績效分布與 regime return attribution。成本壓力只放大 commission、slippage 與 market-impact 模型，不任意放大法定稅費；bootstrap 產生 total return / CAGR / volatility / Sharpe / MDD / Calmar 的 P05/median/P95；regime attribution 顯示各市場狀態的報酬、波動、Sharpe、hit rate 與 log-return contribution。這些診斷不參與策略選參，避免把 robustness test 反過來變成另一層 data snooping。Quant Fund Lab M5 定版為 v0.5.0。
 
 M6-1 Point-in-Time Fundamentals（US）已完成核心資料層：統一 fundamental event schema 明確區分 `period_end` 與 `filed_at`，as-of/panel 查詢一律以申報日作資訊可得時間；SEC adapter 使用官方 ticker→CIK mapping 與 CompanyFacts XBRL API，支援 revenue、net income、operating income、assets、equity、cash、shares outstanding 等標準概念，並要求使用者以 `QFL_SEC_USER_AGENT` 宣告聯絡資訊。此階段先建立可靠 raw facts，不直接把不同 duration/instant context 混成財務因子。
+
+M6-2 Point-in-Time Fundamentals（TW）已完成核心資料層：FinMind 財報列若沒有外部歷史 `available_at` 對照表會直接拒絕進入回測，避免把財報期末日誤當公開日；月營收僅把 `create_time` 當 observed-availability proxy，並預設排除 FinMind 2026-04-21 初始化回填批次。支援財務報表、資產負債表、現金流量表與月營收 raw provider，normalized facts 與 US SEC 共用 `FundamentalDataset` / `filed_at` 語意。
