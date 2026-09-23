@@ -52,6 +52,9 @@ with st.sidebar:
         lifecycle_snapshot_directory = st.text_input(
             "Lifecycle snapshot 目錄", "artifacts/security_lifecycle/latest"
         )
+        cash_in_lieu_snapshot_directory = st.text_input(
+            "Cash-in-lieu settlement snapshot 目錄（選填）", ""
+        )
         st.caption(
             "此模式只接受 stable security_id；兩份 snapshot 都會先做 hash / dataset-ID 驗證。"
         )
@@ -60,6 +63,7 @@ with st.sidebar:
         benchmark = st.text_input("比較基準", "SPY")
         market_snapshot_directory = ""
         lifecycle_snapshot_directory = ""
+        cash_in_lieu_snapshot_directory = ""
     base_currency = st.selectbox("投資組合基準幣別", ["TWD", "USD"])
     end_date = st.date_input("結束日", value=datetime.now(timezone.utc).date())
     start_date = st.date_input("開始日", value=end_date - timedelta(days=365 * 4))
@@ -157,6 +161,7 @@ if run:
                     lifecycle_snapshot_directory,
                     requested_trade_assets,
                     requested_benchmark,
+                    cash_in_lieu_snapshot_directory=cash_in_lieu_snapshot_directory or None,
                     start=start_date,
                     end=end_date,
                     base_currency=base_currency,
@@ -401,6 +406,11 @@ if run:
                 f"{source_data_provenance['market_data_dataset_id'][:12]}…；lifecycle="
                 f"{source_data_provenance['security_lifecycle_dataset_id'][:12]}…。"
             )
+            if "cash_in_lieu_settlement_dataset_id" in source_data_provenance:
+                st.caption(
+                    "Cash-in-lieu provenance："
+                    f"{source_data_provenance['cash_in_lieu_settlement_dataset_id'][:12]}…。"
+                )
         if report_export is not None:
             report_run_id, report_path, report_verified = report_export
             st.success(
@@ -416,7 +426,13 @@ if run:
                 "企業行動資料有可疑項目："
                 f"負股利 {len(action_report.negative_dividend_events)}、"
                 f"無效拆股 {len(action_report.invalid_split_events)}、"
-                f"拆股後調整報酬異常 {len(action_report.suspicious_split_adjustments)}。"
+                f"拆股後調整報酬異常 {len(action_report.suspicious_split_adjustments)}、"
+                f"孤兒 settlement price {len(action_report.orphan_cash_in_lieu_prices)}、"
+                "孤兒 settlement date "
+                f"{len(action_report.orphan_cash_in_lieu_settlement_dates)}、"
+                f"提前 settlement price {len(action_report.premature_cash_in_lieu_prices)}、"
+                "到期缺 settlement price "
+                f"{len(action_report.missing_cash_in_lieu_settlement_prices)}。"
             )
         for market, session_report in session_reports.items():
             if not (session_report.missing_sessions or session_report.off_calendar_sessions):

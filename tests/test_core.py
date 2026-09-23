@@ -383,6 +383,64 @@ def test_corporate_action_validation_flags_bad_metadata():
     assert report.negative_dividend_events
 
 
+def test_cash_in_lieu_validation_accepts_declared_future_settlement():
+    data = synthetic_market_data(symbols=("AAA", "BBB"), periods=80)
+    dates = data.close.index
+    splits = data.stock_splits.copy()
+    splits.loc[dates[20], "AAA"] = 0.5
+    settlement_dates = pd.DataFrame(pd.NaT, index=dates, columns=data.symbols)
+    settlement_dates.loc[dates[20], "AAA"] = dates[22]
+    settlement_prices = pd.DataFrame(float("nan"), index=dates, columns=data.symbols)
+    settlement_prices.loc[dates[22], "AAA"] = 50.0
+    custom = MarketData(
+        open=data.open,
+        close=data.close,
+        volume=data.volume,
+        membership=data.membership,
+        dividends=data.dividends,
+        stock_splits=splits,
+        cash_in_lieu_prices=settlement_prices,
+        cash_in_lieu_settlement_dates=settlement_dates,
+    )
+
+    report = validate_corporate_actions(custom)
+    assert report.is_valid
+    assert not report.orphan_cash_in_lieu_prices
+    assert not report.orphan_cash_in_lieu_settlement_dates
+    assert not report.premature_cash_in_lieu_prices
+    assert not report.missing_cash_in_lieu_settlement_prices
+
+
+def test_cash_in_lieu_validation_flags_orphan_premature_and_missing_inputs():
+    data = synthetic_market_data(symbols=("AAA", "BBB"), periods=80)
+    dates = data.close.index
+    splits = data.stock_splits.copy()
+    splits.loc[dates[20], "AAA"] = 0.5
+    settlement_dates = pd.DataFrame(pd.NaT, index=dates, columns=data.symbols)
+    settlement_dates.loc[dates[20], "AAA"] = dates[22]
+    settlement_dates.loc[dates[30], "BBB"] = dates[31]
+    settlement_prices = pd.DataFrame(float("nan"), index=dates, columns=data.symbols)
+    settlement_prices.loc[dates[20], "AAA"] = 49.0
+    settlement_prices.loc[dates[40], "BBB"] = 10.0
+    custom = MarketData(
+        open=data.open,
+        close=data.close,
+        volume=data.volume,
+        membership=data.membership,
+        dividends=data.dividends,
+        stock_splits=splits,
+        cash_in_lieu_prices=settlement_prices,
+        cash_in_lieu_settlement_dates=settlement_dates,
+    )
+
+    report = validate_corporate_actions(custom)
+    assert not report.is_valid
+    assert (dates[30], "BBB") in report.orphan_cash_in_lieu_settlement_dates
+    assert (dates[40], "BBB") in report.orphan_cash_in_lieu_prices
+    assert (dates[20], "AAA") in report.premature_cash_in_lieu_prices
+    assert (dates[22], "AAA") in report.missing_cash_in_lieu_settlement_prices
+
+
 def test_snapshot_preserves_fx_metadata(tmp_path):
     data = synthetic_market_data(symbols=("AAPL", "2330.TW"), periods=80)
     usd_twd = pd.Series(32.0, index=data.close.index, dtype=float)
