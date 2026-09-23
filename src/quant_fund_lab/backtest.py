@@ -47,8 +47,20 @@ class BacktestResult:
 
 def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> BacktestResult:
     config = config or BacktestConfig()
-    markets = {market_for_symbol(symbol) for symbol in data.symbols}
-    currencies = {currency_for_symbol(symbol) for symbol in data.symbols}
+    if data.market_codes is not None:
+        required_market = data.membership.fillna(False) | data.terminal_returns.notna()
+        if bool((required_market & data.market_codes.isna()).any().any()):
+            raise ValueError("market_codes missing for active/terminal asset cells")
+        markets = set(data.market_codes.stack().astype(str))
+    else:
+        markets = {market_for_symbol(symbol) for symbol in data.symbols}
+    if data.currency_codes is not None:
+        required_currency = data.membership.fillna(False) | data.terminal_returns.notna()
+        if bool((required_currency & data.currency_codes.isna()).any().any()):
+            raise ValueError("currency_codes missing for active/terminal asset cells")
+        currencies = set(data.currency_codes.stack().astype(str))
+    else:
+        currencies = {currency_for_symbol(symbol) for symbol in data.symbols}
     session_validation: SessionValidation | None = None
     if len(markets) == 1 and data.exchange is not None:
         market = next(iter(markets))
@@ -133,6 +145,12 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         reference_next = execution_reference.loc[execution_date]
         fx_signal = fx_to_base.loc[signal_date]
         fx_next = fx_to_base.loc[execution_date]
+        market_next = (
+            data.market_codes.loc[execution_date] if data.market_codes is not None else None
+        )
+        currency_next = (
+            data.currency_codes.loc[execution_date] if data.currency_codes is not None else None
+        )
         terminal_next = data.terminal_returns.loc[execution_date]
         signal_equity = state.equity(close_now, fx_signal)
         running_peak = max(running_peak, signal_equity)
@@ -144,12 +162,14 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                 open_next,
                 pd.Timestamp(execution_date),
                 fx_next,
+                currency_next,
             )
             dividend_events = apply_cash_dividend_events(
                 state,
                 data.dividends.loc[execution_date],
                 pd.Timestamp(execution_date),
                 fx_next,
+                currency_next,
             )
             corporate_action_rows.extend(asdict(event) for event in split_events)
             corporate_action_rows.extend(asdict(event) for event in dividend_events)
@@ -159,6 +179,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
             reference_prices=reference_next,
             timestamp=pd.Timestamp(execution_date),
             fx_to_base=fx_next,
+            currency_codes=currency_next,
         )
         terminal_rows.extend(asdict(event) for event in terminal_events)
 
@@ -284,6 +305,8 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                 timestamp=pd.Timestamp(execution_date),
                 config=config,
                 fx_to_base=fx_next,
+                market_codes=market_next,
+                currency_codes=currency_next,
             )
             fill_rows.extend(asdict(fill) for fill in fills)
 

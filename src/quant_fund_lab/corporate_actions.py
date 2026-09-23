@@ -37,6 +37,7 @@ def apply_stock_split_events(
     raw_open_prices: pd.Series,
     timestamp: pd.Timestamp,
     fx_to_base: pd.Series | None = None,
+    currency_codes: pd.Series | None = None,
 ) -> list[CorporateActionEvent]:
     """Apply observed split ratios to actual share quantities before ex-date trading.
 
@@ -73,7 +74,10 @@ def apply_stock_split_events(
                 ratio_or_amount=ratio,
                 cash_value=float(cash_base),
                 cash_value_local=float(cash_local),
-                local_currency=currency_for_symbol(symbol),
+                local_currency=currency_for_symbol(
+                    symbol,
+                    None if currency_codes is None else currency_codes.get(symbol),
+                ),
                 fx_to_base=float(factor),
             )
         )
@@ -85,6 +89,7 @@ def apply_cash_dividend_events(
     dividends: pd.Series,
     timestamp: pd.Timestamp,
     fx_to_base: pd.Series | None = None,
+    currency_codes: pd.Series | None = None,
 ) -> list[CorporateActionEvent]:
     """Credit gross cash dividends for positions carried into the ex-date."""
 
@@ -110,7 +115,10 @@ def apply_cash_dividend_events(
                 ratio_or_amount=amount,
                 cash_value=float(cash_base),
                 cash_value_local=float(cash_local),
-                local_currency=currency_for_symbol(symbol),
+                local_currency=currency_for_symbol(
+                    symbol,
+                    None if currency_codes is None else currency_codes.get(symbol),
+                ),
                 fx_to_base=float(factor),
             )
         )

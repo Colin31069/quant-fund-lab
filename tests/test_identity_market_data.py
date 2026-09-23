@@ -4,7 +4,7 @@ import pytest
 
 from quant_fund_lab.data import MarketData
 from quant_fund_lab.execution import market_for_symbol
-from quant_fund_lab.fx import currency_for_symbol
+from quant_fund_lab.fx import attach_fx_rates, currency_for_symbol
 from quant_fund_lab.identity_market_data import stitch_market_data_by_identity
 from quant_fund_lab.security_master_events import SecurityMasterEventDataset
 
@@ -170,19 +170,20 @@ def test_missing_alias_market_data_fails_closed():
         stitch_market_data_by_identity(missing, lifecycle, ["us:001"])
 
 
-def test_exchange_and_currency_transitions_fail_closed_until_per_date_metadata_exists():
+def test_exchange_and_currency_transitions_materialize_point_in_time_metadata_and_fx():
     dates = pd.bdate_range("2024-01-02", periods=4)
-    data = MarketData(
+    base = MarketData(
         open=pd.DataFrame({"AAA": [10.0, 11.0, 12.0, 13.0]}, index=dates),
         close=pd.DataFrame({"AAA": [10.0, 11.0, 12.0, 13.0]}, index=dates),
         volume=pd.DataFrame({"AAA": [100.0] * 4}, index=dates),
         exchange="US",
     )
-    exchange_change = SecurityMasterEventDataset(
+    source_with_us_fx = attach_fx_rates(base, "USD")
+    lifecycle = SecurityMasterEventDataset(
         pd.DataFrame(
             [
                 {
-                    "security_id": "us:1",
+                    "security_id": "global:1",
                     "event_at": dates[0],
                     "event_type": "LISTED",
                     "symbol": "AAA",
@@ -193,39 +194,18 @@ def test_exchange_and_currency_transitions_fail_closed_until_per_date_metadata_e
                     "source": "fixture",
                 },
                 {
-                    "security_id": "us:1",
+                    "security_id": "global:1",
                     "event_at": dates[2],
                     "event_type": "EXCHANGE_CHANGED",
                     "symbol": None,
-                    "exchange": "NYSE",
+                    "exchange": "TWSE",
                     "currency": None,
                     "last_tradable_at": None,
                     "terminal_return": None,
                     "source": "fixture",
                 },
-            ],
-            columns=COLUMNS,
-        )
-    )
-    with pytest.raises(ValueError, match="changes exchange"):
-        stitch_market_data_by_identity(data, exchange_change, ["us:1"])
-
-    currency_change = SecurityMasterEventDataset(
-        pd.DataFrame(
-            [
                 {
-                    "security_id": "us:2",
-                    "event_at": dates[0],
-                    "event_type": "LISTED",
-                    "symbol": "AAA",
-                    "exchange": "NASDAQ",
-                    "currency": "USD",
-                    "last_tradable_at": None,
-                    "terminal_return": None,
-                    "source": "fixture",
-                },
-                {
-                    "security_id": "us:2",
+                    "security_id": "global:1",
                     "event_at": dates[2],
                     "event_type": "CURRENCY_CHANGED",
                     "symbol": None,
@@ -239,8 +219,16 @@ def test_exchange_and_currency_transitions_fail_closed_until_per_date_metadata_e
             columns=COLUMNS,
         )
     )
-    with pytest.raises(ValueError, match="changes currency"):
-        stitch_market_data_by_identity(data, currency_change, ["us:2"])
+    result = stitch_market_data_by_identity(source_with_us_fx, lifecycle, ["global:1"])
+    asset = result.data.symbols[0]
+    assert list(result.data.market_codes[asset]) == ["US", "US", "TW", "TW"]
+    assert list(result.data.currency_codes[asset]) == ["USD", "USD", "TWD", "TWD"]
+    assert result.data.exchange is None
+    assert result.data.fx_to_base is None
+    usd_twd = pd.Series(32.0, index=dates, dtype=float)
+    converted = attach_fx_rates(result.data, "USD", usd_twd=usd_twd)
+    assert converted.fx_to_base.loc[dates[1], asset] == pytest.approx(1.0)
+    assert converted.fx_to_base.loc[dates[2], asset] == pytest.approx(1.0 / 32.0)
 
 
 def test_tw_stable_asset_key_preserves_market_and_currency_inference():

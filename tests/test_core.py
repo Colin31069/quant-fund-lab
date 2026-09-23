@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -52,6 +54,51 @@ def test_fx_direction_and_mixed_currency_backtest():
     assert result.base_currency == "USD"
     assert not result.fills.empty
     assert result.equity_curve["equity"].gt(0).all()
+
+
+def test_fx_uses_point_in_time_currency_metadata_for_same_stable_asset():
+    dates = pd.bdate_range("2026-01-02", periods=4)
+    symbol = "ASSET@@stable-id"
+    close = pd.DataFrame({symbol: [100.0, 101.0, 3_232.0, 3_264.0]}, index=dates)
+    data = MarketData(
+        open=close,
+        close=close,
+        volume=pd.DataFrame(10_000.0, index=dates, columns=[symbol]),
+        membership=pd.DataFrame(True, index=dates, columns=[symbol]),
+        market_codes=pd.DataFrame(["US", "US", "TW", "TW"], index=dates, columns=[symbol]),
+        currency_codes=pd.DataFrame(["USD", "USD", "TWD", "TWD"], index=dates, columns=[symbol]),
+    )
+    usd_twd = pd.Series(32.0, index=dates, dtype=float)
+    converted = attach_fx_rates(data, "USD", usd_twd=usd_twd)
+
+    assert converted.fx_to_base.loc[dates[0], symbol] == pytest.approx(1.0)
+    assert converted.fx_to_base.loc[dates[1], symbol] == pytest.approx(1.0)
+    assert converted.fx_to_base.loc[dates[2], symbol] == pytest.approx(1.0 / 32.0)
+    assert converted.fx_to_base.loc[dates[3], symbol] == pytest.approx(1.0 / 32.0)
+    assert validate_fx(converted).is_valid
+
+
+def test_backtest_execution_uses_point_in_time_market_and_currency_metadata():
+    symbols = ("ASSET@@tw-a", "ASSET@@tw-b")
+    data = synthetic_market_data(symbols=symbols, periods=220, seed=93)
+    data = replace(
+        data,
+        market_codes=pd.DataFrame("TW", index=data.close.index, columns=data.symbols),
+        currency_codes=pd.DataFrame("TWD", index=data.close.index, columns=data.symbols),
+        exchange=None,
+    )
+    usd_twd = pd.Series(32.0, index=data.close.index, dtype=float)
+    converted = attach_fx_rates(data, "USD", usd_twd=usd_twd)
+    cfg = BacktestConfig(
+        initial_cash=1_000_000.0,
+        base_currency="USD",
+        strategy=StrategyConfig(warmup_days=80, rebalance_every=5, max_weight=0.5),
+    )
+    result = run_backtest(converted, cfg)
+
+    assert not result.fills.empty
+    assert set(result.fills["local_currency"]) == {"TWD"}
+    assert (result.fills["quantity"] % 1_000 == 0).all()
 
 
 def test_fx_alignment_never_backfills_and_rejects_stale_rates():

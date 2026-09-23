@@ -23,9 +23,41 @@ class FXValidation:
         return self.stale_cells == 0 and self.missing_cells == 0
 
 
-def currency_for_symbol(symbol: str) -> str:
+def currency_for_symbol(symbol: str, currency_code: object = None) -> str:
+    if pd.notna(currency_code):
+        normalized = str(currency_code).upper().strip()
+        if normalized not in SUPPORTED_CURRENCIES:
+            raise ValueError(f"unsupported currency code for {symbol}: {currency_code}")
+        return normalized
     upper = symbol.upper()
     return "TWD" if upper.endswith((".TW", ".TWO")) else "USD"
+
+
+def _currency_panel(data: MarketData) -> pd.DataFrame:
+    if data.currency_codes is None:
+        return pd.DataFrame(
+            {
+                symbol: currency_for_symbol(symbol)
+                for symbol in data.symbols
+            },
+            index=data.close.index,
+        )
+    panel = data.currency_codes.copy()
+    required = data.membership.fillna(False)
+    if data.terminal_returns is not None:
+        required = required | data.terminal_returns.notna()
+    missing_required = required & panel.isna()
+    if bool(missing_required.any().any()):
+        missing_index = missing_required.stack()
+        locations = [
+            f"{pd.Timestamp(timestamp).date()}:{symbol}"
+            for timestamp, symbol in missing_index[missing_index].index[:5]
+        ]
+        raise ValueError(
+            "currency_codes missing for active/terminal asset cells: "
+            f"{locations}"
+        )
+    return panel
 
 
 def _normalize_series(series: pd.Series) -> pd.Series:
@@ -67,8 +99,9 @@ def attach_fx_rates(
     base_currency = base_currency.upper()
     if base_currency not in SUPPORTED_CURRENCIES:
         raise ValueError("base_currency must be USD or TWD")
-    currencies = {symbol: currency_for_symbol(symbol) for symbol in data.symbols}
-    needs_cross = any(currency != base_currency for currency in currencies.values())
+    currency_panel = _currency_panel(data)
+    observed_currencies = set(currency_panel.stack().astype(str))
+    needs_cross = any(currency != base_currency for currency in observed_currencies)
 
     aligned: pd.Series | None = None
     age: pd.Series | None = None
@@ -84,18 +117,24 @@ def attach_fx_rates(
                 f"FX series is stale: max age {max_age:.0f} days exceeds {max_staleness_days}"
             )
 
-    factors = pd.DataFrame(index=data.close.index, columns=data.symbols, dtype=float)
+    factors = pd.DataFrame(1.0, index=data.close.index, columns=data.symbols, dtype=float)
     ages = pd.DataFrame(0.0, index=data.close.index, columns=data.symbols, dtype=float)
-    for symbol, currency in currencies.items():
+    for currency in observed_currencies:
+        mask = currency_panel.eq(currency)
         if currency == base_currency:
-            factors[symbol] = 1.0
-            ages[symbol] = 0.0
-        elif base_currency == "TWD" and currency == "USD":
-            factors[symbol] = aligned
-            ages[symbol] = age
+            continue
+        if aligned is None or age is None:
+            raise ValueError(f"FX series is required for {currency}->{base_currency}")
+        if base_currency == "TWD" and currency == "USD":
+            for symbol in data.symbols:
+                rows = mask[symbol]
+                factors.loc[rows, symbol] = aligned.loc[rows]
+                ages.loc[rows, symbol] = age.loc[rows]
         elif base_currency == "USD" and currency == "TWD":
-            factors[symbol] = 1.0 / aligned
-            ages[symbol] = age
+            for symbol in data.symbols:
+                rows = mask[symbol]
+                factors.loc[rows, symbol] = (1.0 / aligned.loc[rows]).to_numpy()
+                ages.loc[rows, symbol] = age.loc[rows]
         else:
             raise ValueError(f"unsupported currency conversion {currency}->{base_currency}")
 
@@ -110,11 +149,17 @@ def attach_fx_rates(
 def validate_fx(data: MarketData, max_staleness_days: int = 5) -> FXValidation:
     if data.fx_to_base is None or data.fx_age_days is None or data.base_currency is None:
         raise ValueError("market data does not have attached FX conversion factors")
-    missing = int(data.fx_to_base.isna().sum().sum())
-    stale = int((data.fx_age_days > max_staleness_days).sum().sum())
+    required = (
+        data.currency_codes.notna()
+        if data.currency_codes is not None
+        else pd.DataFrame(True, index=data.close.index, columns=data.symbols, dtype=bool)
+    )
+    missing = int((required & data.fx_to_base.isna()).sum().sum())
+    stale = int((required & (data.fx_age_days > max_staleness_days)).sum().sum())
+    observed_ages = data.fx_age_days.where(required).stack()
     return FXValidation(
         base_currency=data.base_currency,
-        max_age_days=float(data.fx_age_days.max().max()),
+        max_age_days=float(observed_ages.max()) if not observed_ages.empty else 0.0,
         stale_cells=stale,
         missing_cells=missing,
     )
@@ -150,7 +195,7 @@ def download_yahoo_usd_twd(start: str, end: str) -> pd.Series:
 def attach_yahoo_fx(
     data: MarketData, base_currency: str, max_staleness_days: int = 5
 ) -> MarketData:
-    currencies = {currency_for_symbol(symbol) for symbol in data.symbols}
+    currencies = set(_currency_panel(data).stack().astype(str))
     if currencies == {base_currency.upper()}:
         return attach_fx_rates(data, base_currency, max_staleness_days=max_staleness_days)
     start = (pd.Timestamp(data.close.index.min()) - timedelta(days=10)).date().isoformat()

@@ -16,6 +16,15 @@ class IdentityStitchResult:
     assets: pd.DataFrame
 
 
+def _market_from_exchange(exchange: object, symbol: str) -> str:
+    normalized = str(exchange).upper().strip()
+    if normalized in {"TW", "TWSE", "TPEX", "TSE", "OTC", "TWO"}:
+        return "TW"
+    if normalized in {"US", "NASDAQ", "NYSE", "AMEX", "NYSE ARCA", "ARCA"}:
+        return "US"
+    return market_for_symbol(symbol)
+
+
 def _stable_asset_key(security_id: str, canonical_symbol: str) -> str:
     symbol = canonical_symbol.upper().strip()
     if symbol.endswith(".TWO"):
@@ -43,9 +52,8 @@ def stitch_market_data_by_identity(
 ) -> IdentityStitchResult:
     """Stitch ticker-history segments into stable internal asset keys.
 
-    This stage intentionally fails closed on exchange/currency transitions. Ticker changes and
-    ticker reuse are supported because lifecycle intervals determine which security owns a source
-    symbol at each date. The output keys are internal identifiers, not provider tickers.
+    Ticker changes, exchange/currency transitions and ticker reuse are resolved from lifecycle
+    intervals. The output keys are internal identifiers, not provider tickers.
     """
 
     requested = list(dict.fromkeys(str(value).strip() for value in security_ids if str(value).strip()))
@@ -61,6 +69,8 @@ def stitch_market_data_by_identity(
     if missing_ids:
         raise ValueError(f"security lifecycle missing security_ids: {missing_ids}")
 
+    requested_events = lifecycle.events[lifecycle.events["security_id"].isin(requested)]
+    has_currency_transition = requested_events["event_type"].eq("CURRENCY_CHANGED").any()
     source_frames: dict[str, pd.DataFrame | None] = {
         "open": data.open,
         "close": data.close,
@@ -69,8 +79,8 @@ def stitch_market_data_by_identity(
         "raw_close": data.raw_close,
         "dividends": data.dividends,
         "stock_splits": data.stock_splits,
-        "fx_to_base": data.fx_to_base,
-        "fx_age_days": data.fx_age_days,
+        "fx_to_base": None if has_currency_transition else data.fx_to_base,
+        "fx_age_days": None if has_currency_transition else data.fx_age_days,
     }
     output: dict[str, pd.DataFrame | None] = {
         "open": pd.DataFrame(index=index),
@@ -80,8 +90,16 @@ def stitch_market_data_by_identity(
         "raw_close": pd.DataFrame(index=index),
         "dividends": pd.DataFrame(index=index),
         "stock_splits": pd.DataFrame(index=index),
-        "fx_to_base": pd.DataFrame(index=index) if data.fx_to_base is not None else None,
-        "fx_age_days": pd.DataFrame(index=index) if data.fx_age_days is not None else None,
+        "fx_to_base": (
+            pd.DataFrame(index=index)
+            if data.fx_to_base is not None and not has_currency_transition
+            else None
+        ),
+        "fx_age_days": (
+            pd.DataFrame(index=index)
+            if data.fx_age_days is not None and not has_currency_transition
+            else None
+        ),
     }
     membership = pd.DataFrame(index=index)
     terminal_returns = pd.DataFrame(index=index)
@@ -98,31 +116,16 @@ def stitch_market_data_by_identity(
             raise ValueError(f"security_id {security_id} has no identity history")
 
         lifecycle_rows = lifecycle.events[lifecycle.events["security_id"].eq(security_id)]
-        if lifecycle_rows["event_type"].eq("EXCHANGE_CHANGED").any():
-            raise ValueError(
-                f"security_id {security_id} changes exchange; identity stitching requires "
-                "per-date market metadata before this transition can be backtested safely"
-            )
-        if lifecycle_rows["event_type"].eq("CURRENCY_CHANGED").any():
-            raise ValueError(
-                f"security_id {security_id} changes currency; identity stitching requires "
-                "per-date FX metadata before this transition can be backtested safely"
-            )
 
         eligible_identity = identity[identity["effective_from"] <= index.max()]
         if eligible_identity.empty:
             raise ValueError(f"security_id {security_id} is not listed by the market-data end date")
         canonical = eligible_identity.iloc[-1]
         canonical_symbol = str(canonical["symbol"])
-        market = market_for_symbol(canonical_symbol)
-        currency = str(canonical["currency"])
-        if any(market_for_symbol(str(value)) != market for value in identity["symbol"]):
-            raise ValueError(f"security_id {security_id} crosses market families")
-        if any(str(value) != currency for value in identity["currency"]):
-            raise ValueError(f"security_id {security_id} has inconsistent currency history")
+        market = _market_from_exchange(canonical["exchange"], canonical_symbol)
+        currency = str(canonical["currency"]).upper()
 
         asset_key = _stable_asset_key(security_id, canonical_symbol)
-        broad_markets.add(market)
         market_codes[asset_key] = pd.Series(pd.NA, index=index, dtype="object")
         currency_codes[asset_key] = pd.Series(pd.NA, index=index, dtype="object")
         aliases: list[str] = []
@@ -135,9 +138,12 @@ def stitch_market_data_by_identity(
             if dates.empty:
                 continue
             source_symbol = str(segment.symbol)
+            segment_market = _market_from_exchange(segment.exchange, source_symbol)
+            segment_currency = str(segment.currency).upper()
             aliases.append(source_symbol)
-            market_codes.loc[dates, asset_key] = market
-            currency_codes.loc[dates, asset_key] = currency
+            broad_markets.add(segment_market)
+            market_codes.loc[dates, asset_key] = segment_market
+            currency_codes.loc[dates, asset_key] = segment_currency
             if source_symbol not in data.symbols:
                 raise ValueError(
                     f"market data missing lifecycle symbol {source_symbol} for {security_id}"
@@ -168,6 +174,13 @@ def stitch_market_data_by_identity(
             location = index.searchsorted(pd.Timestamp(row["event_at"]), side="left")
             if location < len(index):
                 terminal.iloc[location] = float(row["terminal_return"])
+                last_identity = identity.iloc[-1]
+                market_codes.iloc[location, market_codes.columns.get_loc(asset_key)] = (
+                    _market_from_exchange(last_identity["exchange"], str(last_identity["symbol"]))
+                )
+                currency_codes.iloc[location, currency_codes.columns.get_loc(asset_key)] = str(
+                    last_identity["currency"]
+                ).upper()
         membership[asset_key] = active
         terminal_returns[asset_key] = terminal
 

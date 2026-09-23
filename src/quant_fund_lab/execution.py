@@ -81,13 +81,20 @@ class PortfolioState:
         )
 
 
-def market_for_symbol(symbol: str) -> str:
+def market_for_symbol(symbol: str, market_code: object = None) -> str:
+    if pd.notna(market_code):
+        normalized = str(market_code).upper().strip()
+        if normalized not in {"US", "TW"}:
+            raise ValueError(f"unsupported market code for {symbol}: {market_code}")
+        return normalized
     upper = symbol.upper()
     return "TW" if upper.endswith((".TW", ".TWO")) else "US"
 
 
-def _cost_config(symbol: str, config: BacktestConfig) -> MarketCostConfig:
-    return config.tw_costs if market_for_symbol(symbol) == "TW" else config.us_costs
+def _cost_config(
+    symbol: str, config: BacktestConfig, market_code: object = None
+) -> MarketCostConfig:
+    return config.tw_costs if market_for_symbol(symbol, market_code) == "TW" else config.us_costs
 
 
 def _trade_costs(side: str, gross: float, costs: MarketCostConfig) -> float:
@@ -117,10 +124,11 @@ def _blocked_by_price_limit(
     open_price: float,
     reference_price: float,
     costs: MarketCostConfig,
+    market_code: object = None,
 ) -> bool:
     """Conservative Taiwan locked-limit proxy when official auction reference is unavailable."""
 
-    if market_for_symbol(symbol) != "TW" or costs.price_limit_pct is None:
+    if market_for_symbol(symbol, market_code) != "TW" or costs.price_limit_pct is None:
         return False
     if not pd.notna(reference_price) or reference_price <= 0:
         return False
@@ -146,6 +154,7 @@ def apply_terminal_returns(
     reference_prices: pd.Series,
     timestamp: pd.Timestamp,
     fx_to_base: pd.Series | None = None,
+    currency_codes: pd.Series | None = None,
 ) -> list[TerminalEvent]:
     events: list[TerminalEvent] = []
     for symbol, terminal_return in terminal_returns.items():
@@ -173,7 +182,10 @@ def apply_terminal_returns(
                 reference_price=reference,
                 terminal_return=terminal_return,
                 proceeds=float(proceeds),
-                local_currency=currency_for_symbol(symbol),
+                local_currency=currency_for_symbol(
+                    symbol,
+                    None if currency_codes is None else currency_codes.get(symbol),
+                ),
                 fx_to_base=float(factor),
                 proceeds_local=float(proceeds_local),
             )
@@ -187,6 +199,7 @@ def desired_quantities(
     prices: pd.Series,
     config: BacktestConfig,
     fx_to_base: pd.Series | None = None,
+    market_codes: pd.Series | None = None,
 ) -> dict[str, int]:
     """Translate target weights into lot-rounded desired share quantities."""
 
@@ -201,7 +214,11 @@ def desired_quantities(
         if not pd.notna(price) or price <= 0.0:
             desired[symbol] = state.shares.get(symbol, 0)
             continue
-        costs = _cost_config(symbol, config)
+        costs = _cost_config(
+            symbol,
+            config,
+            None if market_codes is None else market_codes.get(symbol),
+        )
         desired_value = max(float(target_weights[symbol]), 0.0) * equity
         base_price = price * float(factors[symbol])
         desired[symbol] = int(
@@ -221,18 +238,27 @@ def execute_market_order(
     timestamp: pd.Timestamp,
     config: BacktestConfig,
     fx_to_base: float = 1.0,
+    market_code: object = None,
+    local_currency: object = None,
 ) -> Fill | None:
     """Execute one virtual market order with the same rules used by backtests."""
 
     side = side.upper()
     if side not in {"BUY", "SELL"}:
         raise ValueError("side must be BUY or SELL")
-    costs = _cost_config(symbol, config)
+    costs = _cost_config(symbol, config, market_code)
     ref = float(open_price)
     available_volume = max(float(volume), 0.0)
     if quantity <= 0 or available_volume <= 0.0 or not pd.notna(ref) or ref <= 0.0:
         return None
-    if _blocked_by_price_limit(symbol, side, ref, float(reference_price), costs):
+    if _blocked_by_price_limit(
+        symbol,
+        side,
+        ref,
+        float(reference_price),
+        costs,
+        market_code,
+    ):
         return None
     if not pd.notna(fx_to_base) or fx_to_base <= 0.0:
         raise ValueError(f"missing or invalid FX conversion factor for {symbol}")
@@ -287,7 +313,7 @@ def execute_market_order(
         gross_value=float(gross),
         fees=float(fees),
         slippage_cost=float(slippage_local * factor),
-        local_currency=currency_for_symbol(symbol),
+        local_currency=currency_for_symbol(symbol, local_currency),
         fx_to_base=factor,
         gross_value_local=float(gross_local),
         fees_local=float(fees_local),
@@ -304,6 +330,8 @@ def rebalance_at_open(
     timestamp: pd.Timestamp,
     config: BacktestConfig,
     fx_to_base: pd.Series | None = None,
+    market_codes: pd.Series | None = None,
+    currency_codes: pd.Series | None = None,
 ) -> list[Fill]:
     """Execute sells first, then buys, using a configurable liquidity/slippage model."""
 
@@ -314,7 +342,12 @@ def rebalance_at_open(
         {symbol: _fx_factor(symbol, fx_to_base) for symbol in symbols}, dtype=float
     )
     desired_qty = desired_quantities(
-        state, target_weights, valuation_prices, config, factors
+        state,
+        target_weights,
+        valuation_prices,
+        config,
+        factors,
+        market_codes,
     )
 
     for side in ("SELL", "BUY"):
@@ -334,6 +367,8 @@ def rebalance_at_open(
                 timestamp=timestamp,
                 config=config,
                 fx_to_base=float(factors[symbol]),
+                market_code=None if market_codes is None else market_codes.get(symbol),
+                local_currency=None if currency_codes is None else currency_codes.get(symbol),
             )
             if fill is not None:
                 fills.append(fill)
