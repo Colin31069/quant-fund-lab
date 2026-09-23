@@ -36,6 +36,22 @@ def test_taiwan_statement_asof_uses_external_available_at():
     assert set(visible["symbol"]) == {"2330.TW"}
 
 
+def test_taiwan_statement_allows_explicit_schema_mapping_without_guessing():
+    raw = pd.DataFrame([
+        {"date": "2025-03-31", "stock_id": "2330", "type": "CustomTotalAssets", "value": 500.0}
+    ])
+    availability = pd.DataFrame([
+        {"stock_id": "2330", "period_end": "2025-03-31", "available_at": "2025-05-08"}
+    ])
+    dataset = normalize_finmind_statement(
+        raw,
+        availability,
+        "TaiwanStockBalanceSheet",
+        metric_map={"CustomTotalAssets": "assets"},
+    )
+    assert dataset.facts.iloc[0]["metric"] == "assets"
+
+
 def test_month_revenue_uses_create_time_proxy_and_drops_initialization_backfill():
     raw = pd.DataFrame([
         {

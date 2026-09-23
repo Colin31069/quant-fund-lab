@@ -40,6 +40,7 @@ def normalize_finmind_statement(
     availability: pd.DataFrame,
     dataset_name: str,
     symbol_map: dict[str, str] | None = None,
+    metric_map: dict[str, str] | None = None,
 ) -> FundamentalDataset:
     """Normalize FinMind statement rows only when an explicit historical availability date exists."""
 
@@ -52,6 +53,9 @@ def normalize_finmind_statement(
             "Taiwan statements require stock_id/period_end/available_at availability mapping"
         )
     source = raw.copy()
+    normalized_metrics = dict(FINMIND_METRIC_MAP)
+    if metric_map:
+        normalized_metrics.update(metric_map)
     source["period_end"] = pd.to_datetime(source["date"], errors="coerce")
     calendar = availability.copy()
     calendar["period_end"] = pd.to_datetime(calendar["period_end"], errors="coerce")
@@ -73,7 +77,7 @@ def normalize_finmind_statement(
         stock_id = str(row.stock_id)
         period_end = pd.Timestamp(row.period_end)
         raw_type = str(row.type)
-        metric = FINMIND_METRIC_MAP.get(raw_type, f"finmind:{raw_type}")
+        metric = normalized_metrics.get(raw_type, f"finmind:{raw_type}")
         rows.append(
             {
                 "symbol": _symbol_for(stock_id, symbol_map),

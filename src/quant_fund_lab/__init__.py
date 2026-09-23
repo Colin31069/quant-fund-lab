@@ -3,4 +3,4 @@
 from .config import BacktestConfig, StrategyConfig
 
 __all__ = ["BacktestConfig", "StrategyConfig"]
-__version__ = "0.5.0"
+__version__ = "0.6.0"
