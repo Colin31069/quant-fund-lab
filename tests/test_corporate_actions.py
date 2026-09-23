@@ -47,6 +47,7 @@ def test_dividend_withholding_records_gross_tax_and_net_cash():
     assert event.cash_value_local == pytest.approx(14.0)
     assert event.gross_cash_value == pytest.approx(20.0)
     assert event.withholding_tax == pytest.approx(6.0)
+    assert event.withholding_rate == pytest.approx(0.30)
     assert event.cash_value == pytest.approx(14.0)
 
 
@@ -139,6 +140,7 @@ def test_raw_backtest_applies_configured_dividend_withholding():
     assert not dividends.empty
     event = dividends.iloc[0]
     assert event["withholding_tax"] == pytest.approx(event["gross_cash_value"] * 0.30)
+    assert event["withholding_rate"] == pytest.approx(0.30)
     assert event["cash_value"] == pytest.approx(event["gross_cash_value"] * 0.70)
 
 

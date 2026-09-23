@@ -121,6 +121,7 @@ class PaperLedger:
                 gross_cash_value_local REAL NOT NULL DEFAULT 0,
                 withholding_tax REAL NOT NULL DEFAULT 0,
                 withholding_tax_local REAL NOT NULL DEFAULT 0,
+                withholding_rate REAL NOT NULL DEFAULT 0,
                 realized_pnl_delta REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS terminal_events (
@@ -178,6 +179,7 @@ class PaperLedger:
             "gross_cash_value_local": "REAL NOT NULL DEFAULT 0",
             "withholding_tax": "REAL NOT NULL DEFAULT 0",
             "withholding_tax_local": "REAL NOT NULL DEFAULT 0",
+            "withholding_rate": "REAL NOT NULL DEFAULT 0",
         }
         added: set[str] = set()
         for column, declaration in additions.items():
@@ -193,6 +195,12 @@ class PaperLedger:
         if "gross_cash_value_local" in added:
             self.connection.execute(
                 "UPDATE corporate_actions SET gross_cash_value_local=cash_value_local"
+            )
+        if "withholding_rate" in added:
+            self.connection.execute(
+                "UPDATE corporate_actions SET withholding_rate="
+                "CASE WHEN gross_cash_value_local > 0 "
+                "THEN withholding_tax_local / gross_cash_value_local ELSE 0 END"
             )
 
     def _get_meta(self, key: str) -> str | None:
@@ -428,12 +436,57 @@ class PaperLedger:
         elif str(existing) != basis:
             raise ValueError("execution_price_basis does not match the existing paper ledger")
 
+    def ensure_dividend_withholding(self, config: DividendWithholdingConfig) -> None:
+        expected = {"US": float(config.us_rate), "TW": float(config.tw_rate)}
+        existing = self._meta_value("dividend_withholding")
+        if existing is not None:
+            observed = {str(key): float(value) for key, value in dict(existing).items()}
+            if observed != expected:
+                raise ValueError(
+                    "dividend withholding assumptions do not match the existing paper ledger"
+                )
+            return
+
+        rows = self.connection.execute(
+            "SELECT local_currency, gross_cash_value_local, withholding_tax_local, "
+            "withholding_rate FROM corporate_actions WHERE action='cash_dividend'"
+        ).fetchall()
+        observed_by_market: dict[str, list[float]] = {"US": [], "TW": []}
+        has_unknown_legacy_dividend = False
+        for row in rows:
+            gross_local = float(row["gross_cash_value_local"])
+            if gross_local <= 0.0:
+                continue
+            currency = str(row["local_currency"]).upper().strip()
+            market = {"USD": "US", "TWD": "TW"}.get(currency)
+            if market is None:
+                has_unknown_legacy_dividend = True
+                continue
+            rate = float(row["withholding_rate"])
+            if rate == 0.0 and float(row["withholding_tax_local"]) != 0.0:
+                rate = float(row["withholding_tax_local"]) / gross_local
+            observed_by_market[market].append(rate)
+
+        if has_unknown_legacy_dividend and any(value != 0.0 for value in expected.values()):
+            raise ValueError(
+                "legacy dividend withholding assumptions cannot be verified for this paper ledger"
+            )
+        for market, rates in observed_by_market.items():
+            if any(abs(rate - expected[market]) > 1e-12 for rate in rates):
+                raise ValueError(
+                    "dividend withholding assumptions do not match existing dividend history"
+                )
+
+        self._set_meta("dividend_withholding", expected)
+        self.connection.commit()
+
     def _record_corporate_action(self, event: object, realized_pnl_delta: float) -> None:
         self.connection.execute(
             "INSERT INTO corporate_actions(timestamp, symbol, action, quantity_before, quantity_after, "
             "ratio_or_amount, cash_value, cash_value_local, local_currency, fx_to_base, "
             "gross_cash_value, gross_cash_value_local, withholding_tax, withholding_tax_local, "
-            "realized_pnl_delta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "withholding_rate, realized_pnl_delta) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 pd.Timestamp(event.timestamp).isoformat(),
                 event.symbol,
@@ -449,6 +502,7 @@ class PaperLedger:
                 event.gross_cash_value_local,
                 event.withholding_tax,
                 event.withholding_tax_local,
+                event.withholding_rate,
                 realized_pnl_delta,
             ),
         )
@@ -481,6 +535,8 @@ class PaperLedger:
     ) -> int:
         """Apply raw-basis corporate actions before terminal events and open-order execution."""
 
+        tax_config = dividend_withholding or DividendWithholdingConfig()
+        self.ensure_dividend_withholding(tax_config)
         state = self.portfolio_state()
         processed = 0
         split_events = apply_stock_split_events(
@@ -525,7 +581,7 @@ class PaperLedger:
             fx_to_base,
             currency_codes,
             market_codes,
-            dividend_withholding,
+            tax_config,
         )
         for event in dividend_events:
             row = self._position_row(event.symbol)
@@ -758,6 +814,8 @@ def replay_targets_persistently(
         reset=reset,
     )
     ledger.ensure_execution_price_basis(config.execution_price_basis)
+    if config.execution_price_basis == "raw":
+        ledger.ensure_dividend_withholding(config.dividend_withholding)
     if config.execution_price_basis == "raw":
         if data.raw_open is None or data.raw_close is None:
             ledger.close()

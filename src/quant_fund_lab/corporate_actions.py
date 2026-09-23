@@ -27,6 +27,7 @@ class CorporateActionEvent:
     gross_cash_value_local: float
     withholding_tax: float
     withholding_tax_local: float
+    withholding_rate: float
 
 
 def _fx(symbol: str, fx_to_base: pd.Series | None) -> float:
@@ -88,6 +89,7 @@ def apply_stock_split_events(
                 gross_cash_value_local=float(cash_local),
                 withholding_tax=0.0,
                 withholding_tax_local=0.0,
+                withholding_rate=0.0,
             )
         )
     return events
@@ -143,6 +145,7 @@ def apply_cash_dividend_events(
                 gross_cash_value_local=float(gross_local),
                 withholding_tax=float(withholding_base),
                 withholding_tax_local=float(withholding_local),
+                withholding_rate=float(rate),
             )
         )
     return events

@@ -188,7 +188,14 @@ def test_paper_ledger_dividend_withholding_is_net_cash_and_auditable(tmp_path):
         event = ledger.corporate_actions().iloc[-1]
         assert event["gross_cash_value"] == pytest.approx(20.0)
         assert event["withholding_tax"] == pytest.approx(6.0)
+        assert event["withholding_rate"] == pytest.approx(0.30)
         assert event["cash_value"] == pytest.approx(14.0)
+
+
+    with PaperLedger(path, base_currency="USD") as reopened:
+        reopened.ensure_dividend_withholding(DividendWithholdingConfig(us_rate=0.30))
+        with pytest.raises(ValueError, match="withholding assumptions"):
+            reopened.ensure_dividend_withholding(DividendWithholdingConfig(us_rate=0.0))
 
 
 def test_existing_paper_ledger_migrates_corporate_action_audit_columns(tmp_path):
@@ -231,6 +238,62 @@ def test_existing_paper_ledger_migrates_corporate_action_audit_columns(tmp_path)
         assert event["gross_cash_value_local"] == pytest.approx(20.0)
         assert event["withholding_tax"] == pytest.approx(0.0)
         assert event["withholding_tax_local"] == pytest.approx(0.0)
+        assert event["withholding_rate"] == pytest.approx(0.0)
+        ledger.ensure_dividend_withholding(DividendWithholdingConfig())
+        with pytest.raises(ValueError, match="withholding assumptions"):
+            ledger.ensure_dividend_withholding(DividendWithholdingConfig(us_rate=0.30))
+
+
+def test_m9_1_ledger_infers_existing_us_withholding_before_locking_metadata(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "m9-1.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE corporate_actions (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            action TEXT NOT NULL,
+            quantity_before INTEGER NOT NULL,
+            quantity_after INTEGER NOT NULL,
+            ratio_or_amount REAL NOT NULL,
+            cash_value REAL NOT NULL,
+            cash_value_local REAL NOT NULL,
+            local_currency TEXT NOT NULL DEFAULT '',
+            fx_to_base REAL NOT NULL,
+            gross_cash_value REAL NOT NULL DEFAULT 0,
+            gross_cash_value_local REAL NOT NULL DEFAULT 0,
+            withholding_tax REAL NOT NULL DEFAULT 0,
+            withholding_tax_local REAL NOT NULL DEFAULT 0,
+            realized_pnl_delta REAL NOT NULL
+        );
+        INSERT INTO metadata(key, value) VALUES
+            ('initial_cash', '10000.0'),
+            ('cash', '10014.0'),
+            ('base_currency', '"USD"');
+        INSERT INTO corporate_actions(
+            timestamp, symbol, action, quantity_before, quantity_after,
+            ratio_or_amount, cash_value, cash_value_local, local_currency, fx_to_base,
+            gross_cash_value, gross_cash_value_local, withholding_tax, withholding_tax_local,
+            realized_pnl_delta
+        ) VALUES(
+            '2026-01-06', 'AAA', 'cash_dividend', 10, 10,
+            2.0, 14.0, 14.0, 'USD', 1.0, 20.0, 20.0, 6.0, 6.0, 14.0
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with PaperLedger(path, base_currency="USD") as ledger:
+        event = ledger.corporate_actions().iloc[0]
+        assert event["withholding_rate"] == pytest.approx(0.30)
+        ledger.ensure_dividend_withholding(DividendWithholdingConfig(us_rate=0.30))
+        with pytest.raises(ValueError, match="withholding assumptions"):
+            ledger.ensure_dividend_withholding(DividendWithholdingConfig(us_rate=0.0))
 
 
 def test_split_rebases_persistent_open_order_quantity(tmp_path):
