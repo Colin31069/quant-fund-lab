@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quant-fund-lab"
-version = "0.7.0"
+version = "0.8.0"
 description = "Local quantitative research, backtesting, paper-trading and visualization platform."
 readme = "README.md"
 requires-python = ">=3.9"
