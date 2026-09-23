@@ -1,7 +1,12 @@
 import pandas as pd
 import pytest
 
-from quant_fund_lab.config import BacktestConfig, MarketCostConfig, StrategyConfig
+from quant_fund_lab.config import (
+    BacktestConfig,
+    DividendWithholdingConfig,
+    MarketCostConfig,
+    StrategyConfig,
+)
 from quant_fund_lab.data import MarketData, synthetic_market_data
 from quant_fund_lab.fx import attach_fx_rates
 from quant_fund_lab.paper_live import PaperLedger, replay_targets_persistently
@@ -136,6 +141,96 @@ def test_paper_ledger_raw_corporate_actions_adjust_cost_basis_and_realized_pnl(t
         assert ledger.cash == pytest.approx(9_020.0)
         actions = ledger.corporate_actions()
         assert list(actions["action"]) == ["stock_split", "cash_dividend"]
+
+
+def test_paper_ledger_dividend_withholding_is_net_cash_and_auditable(tmp_path):
+    config = BacktestConfig(
+        initial_cash=10_000.0,
+        base_currency="USD",
+        execution_price_basis="raw",
+        dividend_withholding=DividendWithholdingConfig(us_rate=0.30),
+        strategy=StrategyConfig(warmup_days=20),
+        us_costs=MarketCostConfig(
+            commission_bps=0.0,
+            sec_fee_per_million=0.0,
+            slippage_bps=0.0,
+            impact_coefficient=0.0,
+            max_participation=1.0,
+            lot_size=1,
+        ),
+    )
+    path = tmp_path / "withholding.sqlite"
+    with PaperLedger(path, 10_000.0, "USD", reset=True) as ledger:
+        ledger.ensure_execution_price_basis("raw")
+        ledger.submit_target_orders(
+            pd.Timestamp("2026-01-02"),
+            pd.Series({"AAA": 0.10}),
+            pd.Series({"AAA": 100.0}),
+            config,
+        )
+        ledger.process_open(
+            pd.Timestamp("2026-01-05"),
+            pd.Series({"AAA": 100.0}),
+            pd.Series({"AAA": 100_000.0}),
+            pd.Series({"AAA": 100.0}),
+            config,
+        )
+        ledger.process_corporate_actions(
+            pd.Timestamp("2026-01-06"),
+            pd.Series({"AAA": 0.0}),
+            pd.Series({"AAA": 2.0}),
+            pd.Series({"AAA": 100.0}),
+            market_codes=pd.Series({"AAA": "US"}),
+            dividend_withholding=config.dividend_withholding,
+        )
+        assert ledger.cash == pytest.approx(9_014.0)
+        assert ledger.positions().loc["AAA", "realized_pnl_base"] == pytest.approx(14.0)
+        event = ledger.corporate_actions().iloc[-1]
+        assert event["gross_cash_value"] == pytest.approx(20.0)
+        assert event["withholding_tax"] == pytest.approx(6.0)
+        assert event["cash_value"] == pytest.approx(14.0)
+
+
+def test_existing_paper_ledger_migrates_corporate_action_audit_columns(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE corporate_actions (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            action TEXT NOT NULL,
+            quantity_before INTEGER NOT NULL,
+            quantity_after INTEGER NOT NULL,
+            ratio_or_amount REAL NOT NULL,
+            cash_value REAL NOT NULL,
+            cash_value_local REAL NOT NULL,
+            fx_to_base REAL NOT NULL,
+            realized_pnl_delta REAL NOT NULL
+        );
+        INSERT INTO metadata(key, value) VALUES
+            ('initial_cash', '10000.0'),
+            ('cash', '10020.0'),
+            ('base_currency', '"USD"');
+        INSERT INTO corporate_actions(
+            timestamp, symbol, action, quantity_before, quantity_after,
+            ratio_or_amount, cash_value, cash_value_local, fx_to_base, realized_pnl_delta
+        ) VALUES('2026-01-06', 'AAA', 'cash_dividend', 10, 10, 2.0, 20.0, 20.0, 1.0, 20.0);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with PaperLedger(path, base_currency="USD") as ledger:
+        event = ledger.corporate_actions().iloc[0]
+        assert event["gross_cash_value"] == pytest.approx(20.0)
+        assert event["gross_cash_value_local"] == pytest.approx(20.0)
+        assert event["withholding_tax"] == pytest.approx(0.0)
+        assert event["withholding_tax_local"] == pytest.approx(0.0)
 
 
 def test_split_rebases_persistent_open_order_quantity(tmp_path):

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import BacktestConfig
+from .config import BacktestConfig, DividendWithholdingConfig
 from .corporate_actions import apply_cash_dividend_events, apply_stock_split_events
 from .data import MarketData
 from .execution import (
@@ -115,7 +115,12 @@ class PaperLedger:
                 ratio_or_amount REAL NOT NULL,
                 cash_value REAL NOT NULL,
                 cash_value_local REAL NOT NULL,
+                local_currency TEXT NOT NULL DEFAULT '',
                 fx_to_base REAL NOT NULL,
+                gross_cash_value REAL NOT NULL DEFAULT 0,
+                gross_cash_value_local REAL NOT NULL DEFAULT 0,
+                withholding_tax REAL NOT NULL DEFAULT 0,
+                withholding_tax_local REAL NOT NULL DEFAULT 0,
                 realized_pnl_delta REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS terminal_events (
@@ -159,7 +164,36 @@ class PaperLedger:
             );
             """
         )
+        self._migrate_corporate_action_schema()
         self.connection.commit()
+
+    def _migrate_corporate_action_schema(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(corporate_actions)").fetchall()
+        }
+        additions = {
+            "local_currency": "TEXT NOT NULL DEFAULT ''",
+            "gross_cash_value": "REAL NOT NULL DEFAULT 0",
+            "gross_cash_value_local": "REAL NOT NULL DEFAULT 0",
+            "withholding_tax": "REAL NOT NULL DEFAULT 0",
+            "withholding_tax_local": "REAL NOT NULL DEFAULT 0",
+        }
+        added: set[str] = set()
+        for column, declaration in additions.items():
+            if column not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE corporate_actions ADD COLUMN {column} {declaration}"
+                )
+                added.add(column)
+        if "gross_cash_value" in added:
+            self.connection.execute(
+                "UPDATE corporate_actions SET gross_cash_value=cash_value"
+            )
+        if "gross_cash_value_local" in added:
+            self.connection.execute(
+                "UPDATE corporate_actions SET gross_cash_value_local=cash_value_local"
+            )
 
     def _get_meta(self, key: str) -> str | None:
         row = self.connection.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
@@ -397,8 +431,9 @@ class PaperLedger:
     def _record_corporate_action(self, event: object, realized_pnl_delta: float) -> None:
         self.connection.execute(
             "INSERT INTO corporate_actions(timestamp, symbol, action, quantity_before, quantity_after, "
-            "ratio_or_amount, cash_value, cash_value_local, fx_to_base, realized_pnl_delta) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "ratio_or_amount, cash_value, cash_value_local, local_currency, fx_to_base, "
+            "gross_cash_value, gross_cash_value_local, withholding_tax, withholding_tax_local, "
+            "realized_pnl_delta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 pd.Timestamp(event.timestamp).isoformat(),
                 event.symbol,
@@ -408,7 +443,12 @@ class PaperLedger:
                 event.ratio_or_amount,
                 event.cash_value,
                 event.cash_value_local,
+                event.local_currency,
                 event.fx_to_base,
+                event.gross_cash_value,
+                event.gross_cash_value_local,
+                event.withholding_tax,
+                event.withholding_tax_local,
                 realized_pnl_delta,
             ),
         )
@@ -436,6 +476,8 @@ class PaperLedger:
         raw_open_prices: pd.Series,
         fx_to_base: pd.Series | None = None,
         currency_codes: pd.Series | None = None,
+        market_codes: pd.Series | None = None,
+        dividend_withholding: DividendWithholdingConfig | None = None,
     ) -> int:
         """Apply raw-basis corporate actions before terminal events and open-order execution."""
 
@@ -482,6 +524,8 @@ class PaperLedger:
             pd.Timestamp(timestamp),
             fx_to_base,
             currency_codes,
+            market_codes,
+            dividend_withholding,
         )
         for event in dividend_events:
             row = self._position_row(event.symbol)
@@ -751,6 +795,8 @@ def replay_targets_persistently(
                 execution_open.loc[timestamp],
                 fx,
                 currency_codes,
+                market_codes,
+                config.dividend_withholding,
             )
         ledger.process_terminal_returns(
             timestamp,

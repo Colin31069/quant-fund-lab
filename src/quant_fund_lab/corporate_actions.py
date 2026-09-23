@@ -6,7 +6,8 @@ from math import floor
 import numpy as np
 import pandas as pd
 
-from .execution import PortfolioState
+from .config import DividendWithholdingConfig
+from .execution import PortfolioState, market_for_symbol
 from .fx import currency_for_symbol
 
 
@@ -22,6 +23,10 @@ class CorporateActionEvent:
     cash_value_local: float
     local_currency: str
     fx_to_base: float
+    gross_cash_value: float
+    gross_cash_value_local: float
+    withholding_tax: float
+    withholding_tax_local: float
 
 
 def _fx(symbol: str, fx_to_base: pd.Series | None) -> float:
@@ -79,6 +84,10 @@ def apply_stock_split_events(
                     None if currency_codes is None else currency_codes.get(symbol),
                 ),
                 fx_to_base=float(factor),
+                gross_cash_value=float(cash_base),
+                gross_cash_value_local=float(cash_local),
+                withholding_tax=0.0,
+                withholding_tax_local=0.0,
             )
         )
     return events
@@ -90,9 +99,12 @@ def apply_cash_dividend_events(
     timestamp: pd.Timestamp,
     fx_to_base: pd.Series | None = None,
     currency_codes: pd.Series | None = None,
+    market_codes: pd.Series | None = None,
+    withholding: DividendWithholdingConfig | None = None,
 ) -> list[CorporateActionEvent]:
-    """Credit gross cash dividends for positions carried into the ex-date."""
+    """Credit dividend cash after explicit market-level withholding assumptions."""
 
+    tax_config = withholding or DividendWithholdingConfig()
     events: list[CorporateActionEvent] = []
     for symbol, value in dividends.items():
         amount = float(value)
@@ -102,7 +114,14 @@ def apply_cash_dividend_events(
         if quantity <= 0:
             continue
         factor = _fx(symbol, fx_to_base)
-        cash_local = quantity * amount
+        market_code = None if market_codes is None else market_codes.get(symbol)
+        market = market_for_symbol(symbol, market_code)
+        rate = tax_config.tw_rate if market == "TW" else tax_config.us_rate
+        gross_local = quantity * amount
+        withholding_local = gross_local * rate
+        cash_local = gross_local - withholding_local
+        gross_base = gross_local * factor
+        withholding_base = withholding_local * factor
         cash_base = cash_local * factor
         state.cash += cash_base
         events.append(
@@ -120,6 +139,10 @@ def apply_cash_dividend_events(
                     None if currency_codes is None else currency_codes.get(symbol),
                 ),
                 fx_to_base=float(factor),
+                gross_cash_value=float(gross_base),
+                gross_cash_value_local=float(gross_local),
+                withholding_tax=float(withholding_base),
+                withholding_tax_local=float(withholding_local),
             )
         )
     return events

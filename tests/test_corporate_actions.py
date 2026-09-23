@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from quant_fund_lab.backtest import run_backtest
-from quant_fund_lab.config import BacktestConfig, StrategyConfig
+from quant_fund_lab.config import BacktestConfig, DividendWithholdingConfig, StrategyConfig
 from quant_fund_lab.corporate_actions import apply_cash_dividend_events, apply_stock_split_events
 from quant_fund_lab.data import MarketData
 from quant_fund_lab.execution import PortfolioState
@@ -28,6 +28,33 @@ def test_split_and_dividend_adjust_actual_position_and_cash():
     )
     assert state.cash == pytest.approx(125.0)
     assert dividend_events[0].cash_value == pytest.approx(25.0)
+
+
+def test_dividend_withholding_records_gross_tax_and_net_cash():
+    state = PortfolioState(cash=100.0, shares={"ASSET@@us-security": 10})
+    events = apply_cash_dividend_events(
+        state,
+        pd.Series({"ASSET@@us-security": 2.0}),
+        pd.Timestamp("2026-01-05"),
+        market_codes=pd.Series({"ASSET@@us-security": "US"}),
+        withholding=DividendWithholdingConfig(us_rate=0.30),
+    )
+
+    event = events[0]
+    assert state.cash == pytest.approx(114.0)
+    assert event.gross_cash_value_local == pytest.approx(20.0)
+    assert event.withholding_tax_local == pytest.approx(6.0)
+    assert event.cash_value_local == pytest.approx(14.0)
+    assert event.gross_cash_value == pytest.approx(20.0)
+    assert event.withholding_tax == pytest.approx(6.0)
+    assert event.cash_value == pytest.approx(14.0)
+
+
+def test_dividend_withholding_config_rejects_invalid_rates():
+    with pytest.raises(ValueError, match="us_rate"):
+        DividendWithholdingConfig(us_rate=1.01)
+    with pytest.raises(ValueError, match="tw_rate"):
+        DividendWithholdingConfig(tw_rate=-0.01)
 
 
 def test_reverse_split_fractional_share_becomes_cash_in_lieu():
@@ -88,6 +115,31 @@ def test_raw_execution_backtest_records_corporate_actions_when_position_is_held(
     assert not result.corporate_actions.empty
     assert "stock_split" in set(result.corporate_actions["action"])
     assert result.equity_curve["equity"].gt(0.0).all()
+
+
+def test_raw_backtest_applies_configured_dividend_withholding():
+    data = _raw_split_market_data()
+    config = BacktestConfig(
+        initial_cash=100_000.0,
+        execution_price_basis="raw",
+        dividend_withholding=DividendWithholdingConfig(us_rate=0.30),
+        strategy=StrategyConfig(
+            warmup_days=30,
+            rebalance_every=5,
+            max_weight=0.8,
+            regime_enabled=False,
+            factor_neutralization=False,
+            risk_aversion=0.2,
+        ),
+    )
+    result = run_backtest(data, config)
+    dividends = result.corporate_actions[
+        result.corporate_actions["action"].eq("cash_dividend")
+    ]
+    assert not dividends.empty
+    event = dividends.iloc[0]
+    assert event["withholding_tax"] == pytest.approx(event["gross_cash_value"] * 0.30)
+    assert event["cash_value"] == pytest.approx(event["gross_cash_value"] * 0.70)
 
 
 def test_adjusted_execution_mode_does_not_double_count_corporate_actions():

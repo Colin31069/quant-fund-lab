@@ -191,6 +191,8 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                 pd.Timestamp(execution_date),
                 fx_next,
                 currency_next,
+                market_next,
+                config.dividend_withholding,
             )
             corporate_action_rows.extend(asdict(event) for event in split_events)
             corporate_action_rows.extend(asdict(event) for event in dividend_events)

@@ -18,6 +18,19 @@ class MarketCostConfig:
 
 
 @dataclass(frozen=True)
+class DividendWithholdingConfig:
+    """Configurable dividend withholding assumptions by market."""
+
+    us_rate: float = 0.0
+    tw_rate: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name, value in {"us_rate": self.us_rate, "tw_rate": self.tw_rate}.items():
+            if not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"{name} must be between 0 and 1")
+
+
+@dataclass(frozen=True)
 class StrategyConfig:
     warmup_days: int = 120
     covariance_lookback: int = 60
@@ -61,6 +74,7 @@ class BacktestConfig:
     base_currency: str | None = None
     max_fx_staleness_days: int = 5
     execution_price_basis: str = "adjusted"
+    dividend_withholding: DividendWithholdingConfig = field(default_factory=DividendWithholdingConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     us_costs: MarketCostConfig = field(
         default_factory=lambda: MarketCostConfig(

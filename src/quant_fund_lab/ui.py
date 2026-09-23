@@ -7,7 +7,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from quant_fund_lab.analytics import buy_and_hold_equity, metric_frame
-from quant_fund_lab.config import BacktestConfig, StrategyConfig
+from quant_fund_lab.config import (
+    BacktestConfig,
+    DividendWithholdingConfig,
+    StrategyConfig,
+)
 from quant_fund_lab.data import MarketData, synthetic_market_data
 from quant_fund_lab.data_quality import validate_corporate_actions
 from quant_fund_lab.diagnostics import diagnose_walk_forward
@@ -70,6 +74,14 @@ with st.sidebar:
         index=0,
         help="adjusted 維持總報酬價格；raw 會另行入帳 split/dividend corporate actions。",
     )
+    st.markdown("**M9 股息稅務假設**")
+    us_dividend_withholding_pct = st.number_input(
+        "US 股息預扣率（%）", min_value=0.0, max_value=100.0, value=0.0, step=1.0
+    )
+    tw_dividend_withholding_pct = st.number_input(
+        "TW 股息預扣率（%）", min_value=0.0, max_value=100.0, value=0.0, step=1.0
+    )
+    st.caption("僅 raw-price corporate-action 模式套用；預設 0%，不替使用者假定稅務身分。")
     max_weight = st.slider("單一標的最大權重", 0.05, 0.50, 0.25, 0.05)
     rebalance_every = st.slider("再平衡頻率（交易日）", 1, 20, 5)
     train_fraction = st.slider("回測 / paper replay 切分", 0.55, 0.90, 0.70, 0.05)
@@ -242,6 +254,10 @@ if run:
                 initial_cash=initial_cash,
                 base_currency=base_currency,
                 execution_price_basis=execution_price_basis,
+                dividend_withholding=DividendWithholdingConfig(
+                    us_rate=float(us_dividend_withholding_pct) / 100.0,
+                    tw_rate=float(tw_dividend_withholding_pct) / 100.0,
+                ),
                 strategy=strategy,
             )
             comparison = historical_vs_paper_replay(trade_data, config, train_fraction=train_fraction)
