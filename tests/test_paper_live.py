@@ -3,6 +3,7 @@ import pytest
 
 from quant_fund_lab.config import BacktestConfig, MarketCostConfig, StrategyConfig
 from quant_fund_lab.data import MarketData, synthetic_market_data
+from quant_fund_lab.fx import attach_fx_rates
 from quant_fund_lab.paper_live import PaperLedger, replay_targets_persistently
 
 
@@ -157,6 +158,113 @@ def test_split_rebases_persistent_open_order_quantity(tmp_path):
         )
         after = ledger.orders().iloc[0]
         assert int(after["remaining_qty"]) == int(before["remaining_qty"]) * 2
+
+
+def test_paper_target_sizing_uses_market_metadata_for_internal_tw_asset(tmp_path):
+    symbol = "ASSET@@tw-security"
+    config = BacktestConfig(
+        initial_cash=1_000_000.0,
+        base_currency="USD",
+        strategy=StrategyConfig(warmup_days=20),
+        us_costs=MarketCostConfig(
+            commission_bps=0.0,
+            slippage_bps=0.0,
+            impact_coefficient=0.0,
+            max_participation=1.0,
+            lot_size=1,
+        ),
+        tw_costs=MarketCostConfig(
+            commission_bps=0.0,
+            sell_tax_bps=0.0,
+            slippage_bps=0.0,
+            impact_coefficient=0.0,
+            max_participation=1.0,
+            lot_size=1_000,
+            price_limit_pct=0.10,
+        ),
+    )
+    with PaperLedger(tmp_path / "metadata-orders.sqlite", 1_000_000.0, "USD", reset=True) as ledger:
+        ledger.submit_target_orders(
+            pd.Timestamp("2026-01-02"),
+            pd.Series({symbol: 0.53}),
+            pd.Series({symbol: 3_200.0}),
+            config,
+            fx_to_base=pd.Series({symbol: 1.0 / 32.0}),
+            market_codes=pd.Series({symbol: "TW"}),
+        )
+        order = ledger.orders().iloc[0]
+        assert int(order["requested_qty"]) == 5_000
+        assert int(order["requested_qty"]) % 1_000 == 0
+
+
+def test_persistent_replay_uses_transition_day_metadata_and_masks_old_reference(tmp_path):
+    dates = pd.bdate_range("2026-01-02", periods=5)
+    symbol = "ASSET@@global-security"
+    prices = pd.DataFrame(
+        {symbol: [100.0, 100.0, 100.0, 3_200.0, 3_200.0]},
+        index=dates,
+    )
+    data = MarketData(
+        open=prices.copy(),
+        close=prices.copy(),
+        volume=pd.DataFrame(1_000_000.0, index=dates, columns=[symbol]),
+        market_codes=pd.DataFrame(
+            ["US", "US", "US", "TW", "TW"],
+            index=dates,
+            columns=[symbol],
+        ),
+        currency_codes=pd.DataFrame(
+            ["USD", "USD", "USD", "TWD", "TWD"],
+            index=dates,
+            columns=[symbol],
+        ),
+    )
+    converted = attach_fx_rates(
+        data,
+        "USD",
+        usd_twd=pd.Series(32.0, index=dates, dtype=float),
+    )
+    config = BacktestConfig(
+        initial_cash=1_000_000.0,
+        base_currency="USD",
+        strategy=StrategyConfig(warmup_days=20),
+        us_costs=MarketCostConfig(
+            commission_bps=0.0,
+            slippage_bps=0.0,
+            impact_coefficient=0.0,
+            max_participation=1.0,
+            lot_size=1,
+        ),
+        tw_costs=MarketCostConfig(
+            commission_bps=0.0,
+            sell_tax_bps=0.0,
+            slippage_bps=0.0,
+            impact_coefficient=0.0,
+            max_participation=1.0,
+            lot_size=1_000,
+            price_limit_pct=0.10,
+        ),
+    )
+    targets = pd.DataFrame([{symbol: 0.5}], index=[dates[2]])
+    ledger = replay_targets_persistently(
+        converted,
+        targets,
+        config,
+        tmp_path / "transition.sqlite",
+        reset=True,
+    )
+    try:
+        fills = ledger.fills()
+        assert len(fills) == 1
+        fill = fills.iloc[0]
+        assert pd.Timestamp(fill["timestamp"]) == dates[3]
+        assert fill["local_currency"] == "TWD"
+        assert int(fill["quantity"]) == 5_000
+        assert int(fill["quantity"]) % 1_000 == 0
+        assert ledger.orders().iloc[0]["status"] == "FILLED"
+        assert ledger.nav_history()["reconciliation_error"].abs().max() < 1e-8
+    finally:
+        ledger.close()
 
 
 def test_persistent_replay_records_daily_snapshots_and_nav(tmp_path):

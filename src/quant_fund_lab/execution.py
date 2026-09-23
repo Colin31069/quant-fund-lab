@@ -321,6 +321,21 @@ def execute_market_order(
     )
 
 
+def transition_safe_reference(
+    reference_prices: pd.DataFrame,
+    market_codes: pd.DataFrame | None = None,
+    currency_codes: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Mask local-price references across market/currency identity transitions."""
+
+    safe = reference_prices.copy()
+    if market_codes is not None:
+        safe = safe.where(market_codes.eq(market_codes.shift(1)))
+    if currency_codes is not None:
+        safe = safe.where(currency_codes.eq(currency_codes.shift(1)))
+    return safe
+
+
 def rebalance_at_open(
     state: PortfolioState,
     target_weights: pd.Series,

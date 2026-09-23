@@ -15,7 +15,9 @@ from .execution import (
     apply_terminal_returns,
     desired_quantities,
     execute_market_order,
+    transition_safe_reference,
 )
+from .fx import currency_for_symbol, validate_fx
 from .snapshot import SnapshotManifest, save_market_data_snapshot
 
 _OPEN_ORDER_STATUSES = ("NEW", "PARTIAL")
@@ -235,6 +237,7 @@ class PaperLedger:
         mark_prices: pd.Series,
         config: BacktestConfig,
         fx_to_base: pd.Series | None = None,
+        market_codes: pd.Series | None = None,
     ) -> list[int]:
         """Replace outstanding target orders after the signal-date close."""
 
@@ -245,7 +248,14 @@ class PaperLedger:
             if fx_to_base is not None
             else pd.Series(1.0, index=target_weights.index, dtype=float)
         )
-        desired = desired_quantities(state, target_weights, mark_prices, config, factors)
+        desired = desired_quantities(
+            state,
+            target_weights,
+            mark_prices,
+            config,
+            factors,
+            market_codes,
+        )
         created: list[int] = []
         for symbol in target_weights.index:
             current = state.shares.get(symbol, 0)
@@ -338,6 +348,8 @@ class PaperLedger:
         reference_prices: pd.Series,
         config: BacktestConfig,
         fx_to_base: pd.Series | None = None,
+        market_codes: pd.Series | None = None,
+        currency_codes: pd.Series | None = None,
     ) -> list[Fill]:
         """Retry all NEW/PARTIAL orders; unfilled quantities remain persistent."""
 
@@ -361,6 +373,8 @@ class PaperLedger:
                 timestamp=pd.Timestamp(timestamp),
                 config=config,
                 fx_to_base=factor,
+                market_code=None if market_codes is None else market_codes.get(symbol),
+                local_currency=None if currency_codes is None else currency_codes.get(symbol),
             )
             if fill is None:
                 continue
@@ -421,6 +435,7 @@ class PaperLedger:
         dividends: pd.Series,
         raw_open_prices: pd.Series,
         fx_to_base: pd.Series | None = None,
+        currency_codes: pd.Series | None = None,
     ) -> int:
         """Apply raw-basis corporate actions before terminal events and open-order execution."""
 
@@ -432,6 +447,7 @@ class PaperLedger:
             raw_open_prices,
             pd.Timestamp(timestamp),
             fx_to_base,
+            currency_codes,
         )
         for symbol, ratio_value in stock_splits.astype(float).items():
             ratio = float(ratio_value)
@@ -465,6 +481,7 @@ class PaperLedger:
             dividends,
             pd.Timestamp(timestamp),
             fx_to_base,
+            currency_codes,
         )
         for event in dividend_events:
             row = self._position_row(event.symbol)
@@ -494,6 +511,7 @@ class PaperLedger:
         terminal_returns: pd.Series,
         reference_prices: pd.Series,
         fx_to_base: pd.Series | None = None,
+        currency_codes: pd.Series | None = None,
     ) -> int:
         state = self.portfolio_state()
         events = apply_terminal_returns(
@@ -502,6 +520,7 @@ class PaperLedger:
             reference_prices,
             pd.Timestamp(timestamp),
             fx_to_base,
+            currency_codes,
         )
         for event in events:
             row = self._position_row(event.symbol)
@@ -663,9 +682,31 @@ def replay_targets_persistently(
 
     if target_weights.empty:
         raise ValueError("target_weights cannot be empty")
+    required_metadata = data.membership.fillna(False) | data.terminal_returns.notna()
+    if data.market_codes is not None and bool(
+        (required_metadata & data.market_codes.isna()).any().any()
+    ):
+        raise ValueError("market_codes missing for active/terminal asset cells")
+    if data.currency_codes is not None:
+        if bool((required_metadata & data.currency_codes.isna()).any().any()):
+            raise ValueError("currency_codes missing for active/terminal asset cells")
+        observed_currencies = set(data.currency_codes.stack().astype(str))
+    else:
+        observed_currencies = {currency_for_symbol(symbol) for symbol in data.symbols}
+
     base_currency = config.base_currency or data.base_currency
     if base_currency is None:
-        base_currency = "USD" if all(not s.upper().endswith((".TW", ".TWO")) for s in data.symbols) else "TWD"
+        base_currency = "USD" if observed_currencies == {"USD"} else "TWD"
+    base_currency = base_currency.upper()
+    if data.fx_to_base is None:
+        if any(currency != base_currency for currency in observed_currencies):
+            raise ValueError("persistent replay requires attached FX for cross-currency assets")
+    else:
+        if data.base_currency is None or data.base_currency.upper() != base_currency:
+            raise ValueError("persistent replay base currency does not match attached FX data")
+        if not validate_fx(data, config.max_fx_staleness_days).is_valid:
+            raise ValueError("attached FX conversion factors failed validation")
+
     ledger = PaperLedger(
         ledger_path,
         initial_cash=config.initial_cash,
@@ -687,10 +728,21 @@ def replay_targets_persistently(
     else:
         ledger.close()
         raise ValueError("execution_price_basis must be 'adjusted' or 'raw'")
+    execution_reference = transition_safe_reference(
+        execution_reference,
+        data.market_codes,
+        data.currency_codes,
+    )
     first_signal = pd.Timestamp(target_weights.index.min())
     dates = data.close.index[data.close.index >= first_signal]
     for timestamp in dates:
         fx = data.fx_to_base.loc[timestamp] if data.fx_to_base is not None else None
+        market_codes = (
+            data.market_codes.loc[timestamp] if data.market_codes is not None else None
+        )
+        currency_codes = (
+            data.currency_codes.loc[timestamp] if data.currency_codes is not None else None
+        )
         if config.execution_price_basis == "raw":
             ledger.process_corporate_actions(
                 timestamp,
@@ -698,12 +750,14 @@ def replay_targets_persistently(
                 data.dividends.loc[timestamp],
                 execution_open.loc[timestamp],
                 fx,
+                currency_codes,
             )
         ledger.process_terminal_returns(
             timestamp,
             data.terminal_returns.loc[timestamp],
             execution_reference.loc[timestamp],
             fx,
+            currency_codes,
         )
         ledger.process_open(
             timestamp,
@@ -712,6 +766,8 @@ def replay_targets_persistently(
             execution_reference.loc[timestamp],
             config,
             fx,
+            market_codes,
+            currency_codes,
         )
         benchmark_value = None
         if benchmark_close_base is not None and timestamp in benchmark_close_base.index:
@@ -726,5 +782,6 @@ def replay_targets_persistently(
                 valuation_close.loc[timestamp],
                 config,
                 fx,
+                market_codes,
             )
     return ledger

@@ -13,6 +13,7 @@ from .execution import (
     apply_terminal_returns,
     market_for_symbol,
     rebalance_at_open,
+    transition_safe_reference,
 )
 from .factors import (
     build_market_factor_panel,
@@ -102,6 +103,11 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         execution_open = data.open
         valuation_close = data.close
         execution_reference = data.reference
+    execution_reference = transition_safe_reference(
+        execution_reference,
+        data.market_codes,
+        data.currency_codes,
+    )
     dates = data.close.index
     if len(dates) < strategy.warmup_days + 2:
         raise ValueError(f"need at least {strategy.warmup_days + 2} bars")
