@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import pytest
 
+from quant_fund_lab import __version__
 from quant_fund_lab.backtest import run_backtest
 from quant_fund_lab.config import BacktestConfig, StrategyConfig
 from quant_fund_lab.data import synthetic_market_data
@@ -78,6 +79,8 @@ def test_run_id_is_deterministic_and_config_sensitive():
     manifest = build_run_manifest(config, "dataset-123")
     assert manifest.run_id == same
     assert manifest.config_schema_version == 1
+    assert manifest.package_version == __version__
+    assert __version__ == "0.8.9"
     lifecycle_run = deterministic_run_id(
         config,
         "dataset-123",

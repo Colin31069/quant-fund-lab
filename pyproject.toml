@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quant-fund-lab"
-version = "0.8.8"
+dynamic = ["version"]
 description = "Local quantitative research, backtesting, paper-trading and visualization platform."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -27,6 +27,9 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "quant_fund_lab.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
