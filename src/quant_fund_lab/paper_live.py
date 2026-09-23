@@ -7,7 +7,13 @@ from pathlib import Path
 import pandas as pd
 
 from .config import BacktestConfig, DividendWithholdingConfig
-from .corporate_actions import apply_cash_dividend_events, apply_stock_split_events
+from .corporate_actions import (
+    CashInLieuReceivable,
+    apply_cash_dividend_events,
+    apply_stock_split_events,
+    mark_cash_in_lieu_receivables,
+    settle_cash_in_lieu_receivables,
+)
 from .data import MarketData
 from .execution import (
     Fill,
@@ -126,6 +132,21 @@ class PaperLedger:
                 cash_in_lieu_price_source TEXT NOT NULL DEFAULT '',
                 realized_pnl_delta REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS cash_in_lieu_receivables (
+                receivable_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                fractional_quantity REAL NOT NULL,
+                settlement_date TEXT NOT NULL,
+                local_currency TEXT NOT NULL,
+                cost_basis_base REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                settled_at TEXT,
+                settlement_price REAL,
+                settlement_fx_to_base REAL,
+                cash_value REAL,
+                realized_pnl_delta REAL
+            );
             CREATE TABLE IF NOT EXISTS terminal_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
@@ -151,6 +172,7 @@ class PaperLedger:
                 timestamp TEXT PRIMARY KEY,
                 cash REAL NOT NULL,
                 market_value REAL NOT NULL,
+                receivable_value REAL NOT NULL DEFAULT 0,
                 equity REAL NOT NULL,
                 realized_pnl REAL NOT NULL,
                 unrealized_pnl REAL NOT NULL,
@@ -168,6 +190,7 @@ class PaperLedger:
             """
         )
         self._migrate_corporate_action_schema()
+        self._migrate_nav_schema()
         self.connection.commit()
 
     def _migrate_corporate_action_schema(self) -> None:
@@ -184,6 +207,8 @@ class PaperLedger:
             "withholding_rate": "REAL NOT NULL DEFAULT 0",
             "cash_in_lieu_price": "REAL NOT NULL DEFAULT 0",
             "cash_in_lieu_price_source": "TEXT NOT NULL DEFAULT ''",
+            "fractional_quantity": "REAL NOT NULL DEFAULT 0",
+            "cash_in_lieu_settlement_date": "TEXT NOT NULL DEFAULT ''",
         }
         added: set[str] = set()
         for column, declaration in additions.items():
@@ -205,6 +230,16 @@ class PaperLedger:
                 "UPDATE corporate_actions SET withholding_rate="
                 "CASE WHEN gross_cash_value_local > 0 "
                 "THEN withholding_tax_local / gross_cash_value_local ELSE 0 END"
+            )
+
+    def _migrate_nav_schema(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(nav)").fetchall()
+        }
+        if "receivable_value" not in columns:
+            self.connection.execute(
+                "ALTER TABLE nav ADD COLUMN receivable_value REAL NOT NULL DEFAULT 0"
             )
 
     def _get_meta(self, key: str) -> str | None:
@@ -259,6 +294,16 @@ class PaperLedger:
             "SELECT * FROM corporate_actions ORDER BY event_id", self.connection
         )
 
+    def cash_in_lieu_receivables(self) -> pd.DataFrame:
+        frame = pd.read_sql_query(
+            "SELECT * FROM cash_in_lieu_receivables ORDER BY receivable_id",
+            self.connection,
+        )
+        for column in ("created_at", "settlement_date", "settled_at"):
+            if column in frame.columns:
+                frame[column] = pd.to_datetime(frame[column], errors="coerce")
+        return frame
+
     def nav_history(self) -> pd.DataFrame:
         frame = pd.read_sql_query("SELECT * FROM nav ORDER BY timestamp", self.connection)
         if not frame.empty:
@@ -284,11 +329,17 @@ class PaperLedger:
         config: BacktestConfig,
         fx_to_base: pd.Series | None = None,
         market_codes: pd.Series | None = None,
+        currency_codes: pd.Series | None = None,
     ) -> list[int]:
         """Replace outstanding target orders after the signal-date close."""
 
         self.cancel_open_orders("CANCELLED_REPLACED")
         state = self.portfolio_state()
+        state.receivable_value = self._mark_open_receivables(
+            mark_prices,
+            fx_to_base,
+            currency_codes,
+        )[0]
         factors = (
             fx_to_base.reindex(target_weights.index).astype(float)
             if fx_to_base is not None
@@ -490,7 +541,8 @@ class PaperLedger:
             "ratio_or_amount, cash_value, cash_value_local, local_currency, fx_to_base, "
             "gross_cash_value, gross_cash_value_local, withholding_tax, withholding_tax_local, "
             "withholding_rate, cash_in_lieu_price, cash_in_lieu_price_source, "
-            "realized_pnl_delta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "fractional_quantity, cash_in_lieu_settlement_date, realized_pnl_delta) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 pd.Timestamp(event.timestamp).isoformat(),
                 event.symbol,
@@ -509,9 +561,120 @@ class PaperLedger:
                 event.withholding_rate,
                 event.cash_in_lieu_price,
                 event.cash_in_lieu_price_source,
+                event.fractional_quantity,
+                event.cash_in_lieu_settlement_date,
                 realized_pnl_delta,
             ),
         )
+
+    def _open_receivable_rows(self) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM cash_in_lieu_receivables "
+            "WHERE status='OPEN' ORDER BY settlement_date, receivable_id"
+        ).fetchall()
+
+    def _mark_open_receivables(
+        self,
+        prices: pd.Series,
+        fx_to_base: pd.Series | None = None,
+        currency_codes: pd.Series | None = None,
+    ) -> tuple[float, float]:
+        rows = self._open_receivable_rows()
+        receivables = [
+            CashInLieuReceivable(
+                symbol=str(row["symbol"]),
+                fractional_quantity=float(row["fractional_quantity"]),
+                settlement_date=pd.Timestamp(row["settlement_date"]),
+                local_currency=str(row["local_currency"]),
+            )
+            for row in rows
+        ]
+        value = mark_cash_in_lieu_receivables(
+            receivables,
+            prices,
+            fx_to_base,
+            currency_codes,
+        )
+        cost_basis = sum(float(row["cost_basis_base"]) for row in rows)
+        return float(value), float(value - cost_basis)
+
+    def process_cash_in_lieu_settlements(
+        self,
+        timestamp: pd.Timestamp,
+        settlement_prices: pd.Series | None,
+        fx_to_base: pd.Series | None = None,
+        currency_codes: pd.Series | None = None,
+    ) -> int:
+        timestamp = pd.Timestamp(timestamp)
+        rows = self._open_receivable_rows()
+        overdue = [
+            row for row in rows if pd.Timestamp(row["settlement_date"]) < timestamp
+        ]
+        if overdue:
+            raise ValueError(
+                "cash-in-lieu receivable settlement date was skipped in persistent replay"
+            )
+        due = [
+            row for row in rows if pd.Timestamp(row["settlement_date"]) == timestamp
+        ]
+        if not due:
+            return 0
+
+        state = self.portfolio_state()
+        processed = 0
+        for row in due:
+            pending = [
+                CashInLieuReceivable(
+                    symbol=str(row["symbol"]),
+                    fractional_quantity=float(row["fractional_quantity"]),
+                    settlement_date=timestamp,
+                    local_currency=str(row["local_currency"]),
+                )
+            ]
+            events = settle_cash_in_lieu_receivables(
+                state,
+                pending,
+                timestamp,
+                settlement_prices,
+                fx_to_base,
+                currency_codes,
+            )
+            event = events[0]
+            position = self._position_row(event.symbol)
+            prior_realized = (
+                float(position["realized_pnl_base"]) if position is not None else 0.0
+            )
+            realized_delta = event.cash_value - float(row["cost_basis_base"])
+            if position is None:
+                self.connection.execute(
+                    "INSERT INTO positions(symbol, quantity, avg_cost_base, realized_pnl_base) "
+                    "VALUES(?, 0, 0, ?)",
+                    (event.symbol, float(realized_delta)),
+                )
+            else:
+                self.connection.execute(
+                    "UPDATE positions SET realized_pnl_base=? WHERE symbol=?",
+                    (float(prior_realized + realized_delta), event.symbol),
+                )
+            self._record_corporate_action(event, realized_delta)
+            self.connection.execute(
+                "UPDATE cash_in_lieu_receivables SET status='SETTLED', settled_at=?, "
+                "settlement_price=?, settlement_fx_to_base=?, cash_value=?, "
+                "realized_pnl_delta=? WHERE receivable_id=?",
+                (
+                    timestamp.isoformat(),
+                    event.cash_in_lieu_price,
+                    event.fx_to_base,
+                    event.cash_value,
+                    realized_delta,
+                    int(row["receivable_id"]),
+                ),
+            )
+            processed += 1
+
+        self._set_meta("cash", float(state.cash))
+        self.connection.commit()
+        return processed
 
     def _rebase_open_orders_for_split(self, symbol: str, ratio: float) -> None:
         orders = self.connection.execute(
@@ -539,6 +702,7 @@ class PaperLedger:
         market_codes: pd.Series | None = None,
         dividend_withholding: DividendWithholdingConfig | None = None,
         cash_in_lieu_prices: pd.Series | None = None,
+        cash_in_lieu_settlement_dates: pd.Series | None = None,
     ) -> int:
         """Apply raw-basis corporate actions before terminal events and open-order execution."""
 
@@ -546,6 +710,7 @@ class PaperLedger:
         self.ensure_dividend_withholding(tax_config)
         state = self.portfolio_state()
         processed = 0
+        new_receivables: list[CashInLieuReceivable] = []
         split_events = apply_stock_split_events(
             state,
             stock_splits,
@@ -554,6 +719,8 @@ class PaperLedger:
             fx_to_base,
             currency_codes,
             cash_in_lieu_prices,
+            cash_in_lieu_settlement_dates,
+            new_receivables,
         )
         for symbol, ratio_value in stock_splits.astype(float).items():
             ratio = float(ratio_value)
@@ -563,10 +730,27 @@ class PaperLedger:
             row = self._position_row(event.symbol)
             prior_avg = float(row["avg_cost_base"]) if row is not None else 0.0
             prior_realized = float(row["realized_pnl_base"]) if row is not None else 0.0
-            new_avg = prior_avg / event.ratio_or_amount if event.quantity_after > 0 else 0.0
-            exact_after = event.quantity_before * event.ratio_or_amount
-            fractional = max(exact_after - event.quantity_after, 0.0)
-            realized_delta = event.cash_value - fractional * new_avg
+            post_split_avg = prior_avg / event.ratio_or_amount
+            position_avg = post_split_avg if event.quantity_after > 0 else 0.0
+            fractional_basis = event.fractional_quantity * post_split_avg
+            if event.cash_in_lieu_price_source == "pending_settlement":
+                realized_delta = 0.0
+                self.connection.execute(
+                    "INSERT INTO cash_in_lieu_receivables("
+                    "symbol, created_at, fractional_quantity, settlement_date, "
+                    "local_currency, cost_basis_base, status"
+                    ") VALUES(?, ?, ?, ?, ?, ?, 'OPEN')",
+                    (
+                        event.symbol,
+                        pd.Timestamp(timestamp).isoformat(),
+                        event.fractional_quantity,
+                        event.cash_in_lieu_settlement_date,
+                        event.local_currency,
+                        float(fractional_basis),
+                    ),
+                )
+            else:
+                realized_delta = event.cash_value - fractional_basis
             self.connection.execute(
                 "INSERT INTO positions(symbol, quantity, avg_cost_base, realized_pnl_base) "
                 "VALUES(?, ?, ?, ?) ON CONFLICT(symbol) DO UPDATE SET "
@@ -575,7 +759,7 @@ class PaperLedger:
                 (
                     event.symbol,
                     event.quantity_after,
-                    float(new_avg),
+                    float(position_avg),
                     float(prior_realized + realized_delta),
                 ),
             )
@@ -669,6 +853,7 @@ class PaperLedger:
         close_prices: pd.Series,
         fx_to_base: pd.Series | None = None,
         benchmark_close_base: float | None = None,
+        currency_codes: pd.Series | None = None,
     ) -> dict[str, float]:
         state = self.portfolio_state()
         positions = self.connection.execute(
@@ -707,7 +892,14 @@ class PaperLedger:
                 ),
             )
 
-        equity = self.cash + market_value
+        receivable_value, receivable_unrealized = self._mark_open_receivables(
+            close_prices,
+            fx_to_base,
+            currency_codes,
+        )
+        unrealized += receivable_unrealized
+        state.receivable_value = receivable_value
+        equity = self.cash + market_value + receivable_value
         fees = float(
             self.connection.execute("SELECT COALESCE(SUM(fees), 0) AS value FROM fills").fetchone()["value"]
         )
@@ -732,13 +924,15 @@ class PaperLedger:
         state_equity = state.equity(close_prices, factors)
         reconciliation_error = state_equity - equity
         self.connection.execute(
-            "INSERT OR REPLACE INTO nav(timestamp, cash, market_value, equity, realized_pnl, unrealized_pnl, "
-            "cumulative_fees, cumulative_slippage, benchmark_close_base, benchmark_equity, reconciliation_error) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO nav(timestamp, cash, market_value, receivable_value, equity, "
+            "realized_pnl, unrealized_pnl, cumulative_fees, cumulative_slippage, "
+            "benchmark_close_base, benchmark_equity, reconciliation_error) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 pd.Timestamp(timestamp).isoformat(),
                 self.cash,
                 market_value,
+                receivable_value,
                 equity,
                 realized,
                 unrealized,
@@ -753,6 +947,7 @@ class PaperLedger:
         return {
             "cash": self.cash,
             "market_value": market_value,
+            "receivable_value": receivable_value,
             "equity": equity,
             "realized_pnl": realized,
             "unrealized_pnl": unrealized,
@@ -790,15 +985,6 @@ def replay_targets_persistently(
 
     if target_weights.empty:
         raise ValueError("target_weights cannot be empty")
-    if data.cash_in_lieu_settlement_dates is not None:
-        for timestamp, row in data.cash_in_lieu_settlement_dates.iterrows():
-            if any(
-                pd.notna(value) and pd.Timestamp(value) > pd.Timestamp(timestamp)
-                for value in row
-            ):
-                raise ValueError(
-                    "persistent replay does not support delayed cash-in-lieu settlement before M10-3"
-                )
     required_metadata = data.membership.fillna(False) | data.terminal_returns.notna()
     if data.market_codes is not None and bool(
         (required_metadata & data.market_codes.isna()).any().any()
@@ -853,7 +1039,17 @@ def replay_targets_persistently(
         data.currency_codes,
     )
     first_signal = pd.Timestamp(target_weights.index.min())
-    dates = data.close.index[data.close.index >= first_signal]
+    pending_row = ledger.connection.execute(
+        "SELECT MIN(settlement_date) AS value FROM cash_in_lieu_receivables "
+        "WHERE status='OPEN'"
+    ).fetchone()
+    pending_date = (
+        None
+        if pending_row is None or pending_row["value"] is None
+        else pd.Timestamp(pending_row["value"])
+    )
+    replay_start = first_signal if pending_date is None else min(first_signal, pending_date)
+    dates = data.close.index[data.close.index >= replay_start]
     for timestamp in dates:
         fx = data.fx_to_base.loc[timestamp] if data.fx_to_base is not None else None
         market_codes = (
@@ -863,6 +1059,17 @@ def replay_targets_persistently(
             data.currency_codes.loc[timestamp] if data.currency_codes is not None else None
         )
         if config.execution_price_basis == "raw":
+            settlement_prices = (
+                data.cash_in_lieu_prices.loc[timestamp]
+                if data.cash_in_lieu_prices is not None
+                else None
+            )
+            ledger.process_cash_in_lieu_settlements(
+                timestamp,
+                settlement_prices,
+                fx,
+                currency_codes,
+            )
             ledger.process_corporate_actions(
                 timestamp,
                 data.stock_splits.loc[timestamp],
@@ -872,9 +1079,10 @@ def replay_targets_persistently(
                 currency_codes,
                 market_codes,
                 config.dividend_withholding,
+                settlement_prices,
                 (
-                    data.cash_in_lieu_prices.loc[timestamp]
-                    if data.cash_in_lieu_prices is not None
+                    data.cash_in_lieu_settlement_dates.loc[timestamp]
+                    if data.cash_in_lieu_settlement_dates is not None
                     else None
                 ),
             )
@@ -898,7 +1106,13 @@ def replay_targets_persistently(
         benchmark_value = None
         if benchmark_close_base is not None and timestamp in benchmark_close_base.index:
             benchmark_value = float(benchmark_close_base.loc[timestamp])
-        ledger.mark_close(timestamp, valuation_close.loc[timestamp], fx, benchmark_value)
+        ledger.mark_close(
+            timestamp,
+            valuation_close.loc[timestamp],
+            fx,
+            benchmark_value,
+            currency_codes,
+        )
         if snapshot_root is not None:
             ledger.record_snapshot(timestamp, data, snapshot_root)
         if timestamp in target_weights.index:
@@ -909,5 +1123,6 @@ def replay_targets_persistently(
                 config,
                 fx,
                 market_codes,
+                currency_codes,
             )
     return ledger

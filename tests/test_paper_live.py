@@ -244,6 +244,52 @@ def test_existing_paper_ledger_migrates_corporate_action_audit_columns(tmp_path)
             ledger.ensure_dividend_withholding(DividendWithholdingConfig(us_rate=0.30))
 
 
+def test_existing_paper_ledger_migrates_nav_receivable_value(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "legacy-nav.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE nav (
+            timestamp TEXT PRIMARY KEY,
+            cash REAL NOT NULL,
+            market_value REAL NOT NULL,
+            equity REAL NOT NULL,
+            realized_pnl REAL NOT NULL,
+            unrealized_pnl REAL NOT NULL,
+            cumulative_fees REAL NOT NULL,
+            cumulative_slippage REAL NOT NULL,
+            benchmark_close_base REAL,
+            benchmark_equity REAL,
+            reconciliation_error REAL NOT NULL
+        );
+        INSERT INTO metadata(key, value) VALUES
+            ('initial_cash', '10000.0'),
+            ('cash', '10000.0'),
+            ('base_currency', '"USD"');
+        INSERT INTO nav(
+            timestamp, cash, market_value, equity, realized_pnl, unrealized_pnl,
+            cumulative_fees, cumulative_slippage, benchmark_close_base,
+            benchmark_equity, reconciliation_error
+        ) VALUES(
+            '2026-01-05', 9000.0, 1000.0, 10000.0, 0.0, 0.0,
+            0.0, 0.0, NULL, NULL, 0.0
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with PaperLedger(path, base_currency="USD") as ledger:
+        nav = ledger.nav_history()
+        assert "receivable_value" in nav.columns
+        assert nav.iloc[0]["receivable_value"] == pytest.approx(0.0)
+
+
+
+
 def test_m9_1_ledger_infers_existing_us_withholding_before_locking_metadata(tmp_path):
     import sqlite3
 
@@ -342,6 +388,84 @@ def test_paper_ledger_uses_explicit_cash_in_lieu_settlement_price(tmp_path):
         assert event["cash_in_lieu_price_source"] == "provider_settlement"
         assert event["cash_value"] == pytest.approx(9.0)
         assert event["realized_pnl_delta"] == pytest.approx(-91.0)
+
+
+def test_paper_ledger_persists_delayed_cash_in_lieu_through_reopen(tmp_path):
+    config = BacktestConfig(
+        initial_cash=10_000.0,
+        base_currency="USD",
+        execution_price_basis="raw",
+        strategy=StrategyConfig(warmup_days=20),
+        us_costs=MarketCostConfig(
+            commission_bps=0.0,
+            sec_fee_per_million=0.0,
+            slippage_bps=0.0,
+            impact_coefficient=0.0,
+            max_participation=1.0,
+            lot_size=1,
+        ),
+    )
+    path = tmp_path / "delayed-cash-in-lieu.sqlite"
+    split_date = pd.Timestamp("2026-01-06")
+    settlement_date = pd.Timestamp("2026-01-08")
+    with PaperLedger(path, 10_000.0, "USD", reset=True) as ledger:
+        ledger.ensure_execution_price_basis("raw")
+        ledger.submit_target_orders(
+            pd.Timestamp("2026-01-02"),
+            pd.Series({"AAA": 0.11}),
+            pd.Series({"AAA": 100.0}),
+            config,
+        )
+        ledger.process_open(
+            pd.Timestamp("2026-01-05"),
+            pd.Series({"AAA": 100.0}),
+            pd.Series({"AAA": 100_000.0}),
+            pd.Series({"AAA": 100.0}),
+            config,
+        )
+        ledger.process_corporate_actions(
+            split_date,
+            pd.Series({"AAA": 0.5}),
+            pd.Series({"AAA": 0.0}),
+            pd.Series({"AAA": 20.0}),
+            cash_in_lieu_settlement_dates=pd.Series({"AAA": settlement_date}),
+        )
+
+        position = ledger.positions().loc["AAA"]
+        receivable = ledger.cash_in_lieu_receivables().iloc[0]
+        assert int(position["quantity"]) == 5
+        assert position["realized_pnl_base"] == pytest.approx(0.0)
+        assert receivable["status"] == "OPEN"
+        assert receivable["fractional_quantity"] == pytest.approx(0.5)
+        assert receivable["cost_basis_base"] == pytest.approx(100.0)
+        assert ledger.cash == pytest.approx(8_900.0)
+
+        nav = ledger.mark_close(split_date, pd.Series({"AAA": 20.0}))
+        assert nav["receivable_value"] == pytest.approx(10.0)
+        assert nav["equity"] == pytest.approx(9_010.0)
+        assert nav["unrealized_pnl"] == pytest.approx(-990.0)
+        assert nav["reconciliation_error"] == pytest.approx(0.0)
+
+    with PaperLedger(path, base_currency="USD") as reopened:
+        receivable = reopened.cash_in_lieu_receivables().iloc[0]
+        assert receivable["status"] == "OPEN"
+        assert pd.Timestamp(receivable["settlement_date"]) == settlement_date
+        processed = reopened.process_cash_in_lieu_settlements(
+            settlement_date,
+            pd.Series({"AAA": 18.0}),
+        )
+        assert processed == 1
+        settled = reopened.cash_in_lieu_receivables().iloc[0]
+        assert settled["status"] == "SETTLED"
+        assert settled["cash_value"] == pytest.approx(9.0)
+        assert settled["realized_pnl_delta"] == pytest.approx(-91.0)
+        assert reopened.cash == pytest.approx(8_909.0)
+        assert reopened.positions().loc["AAA", "realized_pnl_base"] == pytest.approx(-91.0)
+        actions = reopened.corporate_actions()
+        assert actions.iloc[-1]["action"] == "cash_in_lieu_settlement"
+        assert actions.iloc[-1]["cash_in_lieu_price"] == pytest.approx(18.0)
+
+
 
 
 def test_split_rebases_persistent_open_order_quantity(tmp_path):
@@ -504,7 +628,7 @@ def test_persistent_replay_records_daily_snapshots_and_nav(tmp_path):
         ledger.close()
 
 
-def test_persistent_replay_rejects_delayed_cash_in_lieu_until_m10_3(tmp_path):
+def test_persistent_replay_settles_delayed_cash_in_lieu_and_reconciles(tmp_path):
     dates = pd.bdate_range("2026-01-02", periods=40)
     close = pd.DataFrame(
         {
@@ -530,21 +654,36 @@ def test_persistent_replay_rejects_delayed_cash_in_lieu_until_m10_3(tmp_path):
         cash_in_lieu_settlement_dates=settlement_dates,
     )
     config = BacktestConfig(
+        initial_cash=10_000.0,
         execution_price_basis="raw",
         strategy=StrategyConfig(warmup_days=20, rebalance_every=5, max_weight=0.6),
     )
     targets = pd.DataFrame(
-        [{"AAA": 0.5, "BBB": 0.4}],
-        index=[dates[20]],
+        [{"AAA": 0.11, "BBB": 0.10}],
+        index=[dates[15]],
     )
-    with pytest.raises(ValueError, match="does not support delayed cash-in-lieu"):
-        replay_targets_persistently(
-            data,
-            targets,
-            config,
-            tmp_path / "delayed-cil.sqlite",
-            reset=True,
-        )
+    ledger = replay_targets_persistently(
+        data,
+        targets,
+        config,
+        tmp_path / "delayed-cil.sqlite",
+        reset=True,
+    )
+    try:
+        receivable = ledger.cash_in_lieu_receivables().iloc[0]
+        assert receivable["status"] == "SETTLED"
+        assert pd.Timestamp(receivable["created_at"]) == dates[20]
+        assert pd.Timestamp(receivable["settlement_date"]) == dates[22]
+        assert pd.Timestamp(receivable["settled_at"]) == dates[22]
+        actions = ledger.corporate_actions()
+        assert "cash_in_lieu_settlement" in set(actions["action"])
+        nav = ledger.nav_history()
+        assert nav.loc[dates[20], "receivable_value"] > 0.0
+        assert nav.loc[dates[21], "receivable_value"] > 0.0
+        assert nav.loc[dates[22], "receivable_value"] == pytest.approx(0.0)
+        assert nav["reconciliation_error"].abs().max() < 1e-8
+    finally:
+        ledger.close()
 
 
 def test_raw_persistent_replay_records_corporate_action_events(tmp_path):

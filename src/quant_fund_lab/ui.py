@@ -360,6 +360,7 @@ if run:
             persistent_positions = None
             persistent_snapshots = None
             persistent_actions = None
+            persistent_receivables = None
             if persist_paper_ledger:
                 ledger = replay_targets_persistently(
                     trade_data,
@@ -377,6 +378,7 @@ if run:
                     persistent_positions = ledger.positions()
                     persistent_snapshots = ledger.snapshots()
                     persistent_actions = ledger.corporate_actions()
+                    persistent_receivables = ledger.cash_in_lieu_receivables()
                 finally:
                     ledger.close()
 
@@ -572,6 +574,16 @@ if run:
             p2.metric("Realized PnL", f"{float(latest_nav['realized_pnl']):,.2f}")
             p3.metric("Unrealized PnL", f"{float(latest_nav['unrealized_pnl']):,.2f}")
             p4.metric("Open / Partial Orders", str(open_order_count))
+            open_receivable_count = int(
+                persistent_receivables["status"].eq("OPEN").sum()
+                if persistent_receivables is not None and not persistent_receivables.empty
+                else 0
+            )
+            st.caption(
+                "Cash-in-lieu receivables：open "
+                f"{open_receivable_count}；current NAV mark "
+                f"{float(latest_nav.get('receivable_value', 0.0)):,.2f} {base_currency}。"
+            )
             persistent_tax = summarize_dividend_tax(persistent_actions)
             st.caption(
                 "Dividend cashflow：gross "
@@ -602,12 +614,13 @@ if run:
                 "SQLite: artifacts/paper_trading.sqlite；每日可重現 market snapshots: "
                 "artifacts/paper_snapshots/。未成交數量會保持 NEW/PARTIAL 並在後續交易日重試。"
             )
-            pt1, pt2, pt3, pt4, pt5 = st.tabs(
+            pt1, pt2, pt3, pt4, pt5, pt6 = st.tabs(
                 [
                     "Persistent Orders",
                     "Persistent Fills",
                     "Positions",
                     "Corporate Actions",
+                    "Cash-in-Lieu Receivables",
                     "Daily Snapshots",
                 ]
             )
@@ -620,6 +633,8 @@ if run:
             with pt4:
                 st.dataframe(persistent_actions, use_container_width=True, height=300)
             with pt5:
+                st.dataframe(persistent_receivables, use_container_width=True, height=300)
+            with pt6:
                 st.dataframe(persistent_snapshots, use_container_width=True, height=300)
 
         if robustness is not None:
