@@ -616,10 +616,16 @@ if run:
             st.subheader("M5-4 Robustness Lab")
             st.caption(
                 "Robustness 結果只作診斷，不參與參數選擇：成本壓力固定為 1.0x / 1.5x / 2.0x；"
-                "block bootstrap 保留短期報酬相依；regime attribution 只使用當時已知的最新 regime。"
+                "block bootstrap 保留短期報酬相依；regime attribution 只使用當時已知的最新 regime；"
+                "raw 模式另測 dividend withholding 基準 ±10 個百分點。"
             )
-            rb1, rb2, rb3 = st.tabs(
-                ["Execution Cost Stress", "Block Bootstrap", "Regime Attribution"]
+            rb1, rb2, rb3, rb4 = st.tabs(
+                [
+                    "Execution Cost Stress",
+                    "Block Bootstrap",
+                    "Regime Attribution",
+                    "Dividend Tax Sensitivity",
+                ]
             )
             with rb1:
                 st.dataframe(robustness.cost_stress, use_container_width=True, height=320)
@@ -627,6 +633,15 @@ if run:
                 st.dataframe(robustness.bootstrap_summary, use_container_width=True, height=320)
             with rb3:
                 st.dataframe(robustness.regime_attribution, use_container_width=True, height=320)
+            with rb4:
+                if robustness.dividend_tax_sensitivity.empty:
+                    st.info("Dividend tax sensitivity 僅適用 raw-price corporate-action 模式。")
+                else:
+                    st.dataframe(
+                        robustness.dividend_tax_sensitivity,
+                        use_container_width=True,
+                        height=320,
+                    )
 
         if run_walkforward:
             st.subheader("Walk-forward Out-of-Sample")

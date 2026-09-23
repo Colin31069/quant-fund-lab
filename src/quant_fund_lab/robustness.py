@@ -7,9 +7,10 @@ import pandas as pd
 
 from .analytics import performance_metrics
 from .backtest import BacktestResult
-from .config import BacktestConfig, MarketCostConfig
+from .config import BacktestConfig, DividendWithholdingConfig, MarketCostConfig
 from .data import MarketData
 from .paper import historical_vs_paper_replay
+from .tax_analytics import summarize_dividend_tax
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class RobustnessResult:
     bootstrap_distribution: pd.DataFrame
     bootstrap_summary: pd.DataFrame
     regime_attribution: pd.DataFrame
+    dividend_tax_sensitivity: pd.DataFrame
 
 
 def _stress_market_costs(costs: MarketCostConfig, multiplier: float) -> MarketCostConfig:
@@ -73,6 +75,68 @@ def run_paper_cost_stress(
             }
         )
     return pd.DataFrame(rows).set_index("cost_multiplier").sort_index()
+
+
+def run_dividend_tax_sensitivity(
+    data: MarketData,
+    config: BacktestConfig,
+    train_fraction: float,
+    rate_shifts: tuple[float, ...] = (-0.10, 0.0, 0.10),
+    baseline_paper_result: BacktestResult | None = None,
+) -> pd.DataFrame:
+    """Stress withholding assumptions without using the result for model selection."""
+
+    columns = [
+        "us_withholding_rate",
+        "tw_withholding_rate",
+        "total_return",
+        "annual_return",
+        "annual_volatility",
+        "sharpe",
+        "max_drawdown",
+        "calmar",
+        "gross_dividend_cash",
+        "withholding_tax",
+        "net_dividend_cash",
+        "effective_withholding_rate",
+    ]
+    if config.execution_price_basis != "raw":
+        return pd.DataFrame(columns=columns).rename_axis("rate_shift_pp")
+
+    rows: list[dict[str, float]] = []
+    for shift in sorted({float(value) for value in rate_shifts}):
+        us_rate = min(max(config.dividend_withholding.us_rate + shift, 0.0), 1.0)
+        tw_rate = min(max(config.dividend_withholding.tw_rate + shift, 0.0), 1.0)
+        stressed = replace(
+            config,
+            dividend_withholding=DividendWithholdingConfig(
+                us_rate=us_rate,
+                tw_rate=tw_rate,
+            ),
+        )
+        if abs(shift) < 1e-12 and baseline_paper_result is not None:
+            paper = baseline_paper_result
+        else:
+            paper = historical_vs_paper_replay(
+                data,
+                stressed,
+                train_fraction=train_fraction,
+            ).paper_replay
+        metrics = performance_metrics(paper.equity_curve["equity"])
+        tax = summarize_dividend_tax(paper.corporate_actions)
+        rows.append(
+            {
+                "rate_shift_pp": shift * 100.0,
+                "us_withholding_rate": us_rate,
+                "tw_withholding_rate": tw_rate,
+                **metrics,
+                "gross_dividend_cash": float(tax["gross_dividend_cash"]),
+                "withholding_tax": float(tax["withholding_tax"]),
+                "net_dividend_cash": float(tax["net_dividend_cash"]),
+                "effective_withholding_rate": float(tax["effective_withholding_rate"]),
+            }
+        )
+    return pd.DataFrame(rows).set_index("rate_shift_pp").sort_index()
 
 
 def block_bootstrap_performance(
@@ -176,6 +240,12 @@ def build_robustness_report(
         multipliers=cost_multipliers,
         baseline_paper_result=baseline_paper_result,
     )
+    tax_sensitivity = run_dividend_tax_sensitivity(
+        data,
+        config,
+        train_fraction,
+        baseline_paper_result=baseline_paper_result,
+    )
     distribution = block_bootstrap_performance(
         baseline_paper_result.equity_curve["equity"],
         iterations=bootstrap_iterations,
@@ -187,4 +257,5 @@ def build_robustness_report(
         bootstrap_distribution=distribution,
         bootstrap_summary=summarize_bootstrap_distribution(distribution),
         regime_attribution=regime_return_attribution(baseline_paper_result),
+        dividend_tax_sensitivity=tax_sensitivity,
     )

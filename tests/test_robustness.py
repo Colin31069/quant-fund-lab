@@ -1,12 +1,18 @@
 import pandas as pd
 
-from quant_fund_lab.config import BacktestConfig, MarketCostConfig, StrategyConfig
+from quant_fund_lab.config import (
+    BacktestConfig,
+    DividendWithholdingConfig,
+    MarketCostConfig,
+    StrategyConfig,
+)
 from quant_fund_lab.data import synthetic_market_data
 from quant_fund_lab.paper import historical_vs_paper_replay
 from quant_fund_lab.robustness import (
     block_bootstrap_performance,
     build_robustness_report,
     regime_return_attribution,
+    run_dividend_tax_sensitivity,
     stress_execution_costs,
     summarize_bootstrap_distribution,
 )
@@ -28,6 +34,29 @@ def test_execution_cost_stress_scales_only_modelled_costs():
     assert stressed.us_costs.impact_coefficient == 0.2
     assert stressed.us_costs.sell_tax_bps == 2.0
     assert stressed.us_costs.sec_fee_per_million == 20.6
+
+
+def test_dividend_tax_sensitivity_is_raw_only_and_clamps_rates():
+    data = synthetic_market_data(symbols=("A", "B", "C", "D"), periods=220, seed=33)
+    adjusted = BacktestConfig(strategy=StrategyConfig(warmup_days=60))
+    assert run_dividend_tax_sensitivity(data, adjusted, 0.70).empty
+
+    raw = BacktestConfig(
+        execution_price_basis="raw",
+        dividend_withholding=DividendWithholdingConfig(us_rate=0.05, tw_rate=0.95),
+        strategy=StrategyConfig(warmup_days=60),
+    )
+    comparison = historical_vs_paper_replay(data, raw, train_fraction=0.70)
+    sensitivity = run_dividend_tax_sensitivity(
+        data,
+        raw,
+        0.70,
+        rate_shifts=(-0.10, 0.0, 0.10),
+        baseline_paper_result=comparison.paper_replay,
+    )
+    assert list(sensitivity.index) == [-10.0, 0.0, 10.0]
+    assert sensitivity.loc[-10.0, "us_withholding_rate"] == 0.0
+    assert sensitivity.loc[10.0, "tw_withholding_rate"] == 1.0
 
 
 def test_block_bootstrap_is_deterministic_and_summarized():
@@ -66,3 +95,4 @@ def test_regime_attribution_and_robustness_report():
     assert len(report.bootstrap_distribution) == 20
     assert not report.bootstrap_summary.empty
     assert not report.regime_attribution.empty
+    assert report.dividend_tax_sensitivity.empty
