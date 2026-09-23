@@ -91,6 +91,8 @@ def test_stitch_ticker_change_preserves_continuous_identity_and_terminal_event()
     assert result.data.terminal_returns.loc[dates[6], asset] == pytest.approx(-0.8)
     assert market_for_symbol(asset) == "US"
     assert currency_for_symbol(asset) == "USD"
+    assert set(result.data.market_codes[asset].dropna()) == {"US"}
+    assert set(result.data.currency_codes[asset].dropna()) == {"USD"}
 
 
 def test_ticker_reuse_creates_two_stable_assets_without_prelisting_price_leakage():
@@ -273,3 +275,5 @@ def test_tw_stable_asset_key_preserves_market_and_currency_inference():
     assert market_for_symbol(asset) == "TW"
     assert currency_for_symbol(asset) == "TWD"
     assert result.data.exchange == "TW"
+    assert set(result.data.market_codes[asset].dropna()) == {"TW"}
+    assert set(result.data.currency_codes[asset].dropna()) == {"TWD"}

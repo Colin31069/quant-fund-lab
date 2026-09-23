@@ -47,6 +47,10 @@ def historical_vs_paper_replay(
         stock_splits=data.stock_splits.iloc[:split] if data.stock_splits is not None else None,
         fx_to_base=data.fx_to_base.iloc[:split] if data.fx_to_base is not None else None,
         fx_age_days=data.fx_age_days.iloc[:split] if data.fx_age_days is not None else None,
+        market_codes=data.market_codes.iloc[:split] if data.market_codes is not None else None,
+        currency_codes=(
+            data.currency_codes.iloc[:split] if data.currency_codes is not None else None
+        ),
         base_currency=data.base_currency,
         exchange=data.exchange,
     )
@@ -68,6 +72,12 @@ def historical_vs_paper_replay(
         ),
         fx_to_base=data.fx_to_base.iloc[paper_start:] if data.fx_to_base is not None else None,
         fx_age_days=data.fx_age_days.iloc[paper_start:] if data.fx_age_days is not None else None,
+        market_codes=(
+            data.market_codes.iloc[paper_start:] if data.market_codes is not None else None
+        ),
+        currency_codes=(
+            data.currency_codes.iloc[paper_start:] if data.currency_codes is not None else None
+        ),
         base_currency=data.base_currency,
         exchange=data.exchange,
     )

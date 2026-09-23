@@ -66,6 +66,8 @@ def _subset_market_data(data: MarketData, symbols: list[str], start: str, end: s
         stock_splits=subset(data.stock_splits),
         fx_to_base=subset(data.fx_to_base),
         fx_age_days=subset(data.fx_age_days),
+        market_codes=subset(data.market_codes),
+        currency_codes=subset(data.currency_codes),
         base_currency=data.base_currency,
         exchange=data.exchange,
     )

@@ -85,6 +85,8 @@ def stitch_market_data_by_identity(
     }
     membership = pd.DataFrame(index=index)
     terminal_returns = pd.DataFrame(index=index)
+    market_codes = pd.DataFrame(index=index)
+    currency_codes = pd.DataFrame(index=index)
     asset_rows: list[dict[str, object]] = []
     broad_markets: set[str] = set()
 
@@ -121,6 +123,8 @@ def stitch_market_data_by_identity(
 
         asset_key = _stable_asset_key(security_id, canonical_symbol)
         broad_markets.add(market)
+        market_codes[asset_key] = pd.Series(pd.NA, index=index, dtype="object")
+        currency_codes[asset_key] = pd.Series(pd.NA, index=index, dtype="object")
         aliases: list[str] = []
         for segment in identity.itertuples(index=False):
             dates = _interval_dates(
@@ -132,6 +136,8 @@ def stitch_market_data_by_identity(
                 continue
             source_symbol = str(segment.symbol)
             aliases.append(source_symbol)
+            market_codes.loc[dates, asset_key] = market
+            currency_codes.loc[dates, asset_key] = currency
             if source_symbol not in data.symbols:
                 raise ValueError(
                     f"market data missing lifecycle symbol {source_symbol} for {security_id}"
@@ -209,6 +215,8 @@ def stitch_market_data_by_identity(
         stock_splits=output["stock_splits"],
         fx_to_base=output["fx_to_base"],
         fx_age_days=output["fx_age_days"],
+        market_codes=market_codes.reindex(columns=close.columns),
+        currency_codes=currency_codes.reindex(columns=close.columns),
         base_currency=data.base_currency,
         exchange=exchange,
     )

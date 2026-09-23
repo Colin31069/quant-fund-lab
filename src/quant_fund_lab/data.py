@@ -21,6 +21,8 @@ class MarketData:
     stock_splits: pd.DataFrame | None = None
     fx_to_base: pd.DataFrame | None = None
     fx_age_days: pd.DataFrame | None = None
+    market_codes: pd.DataFrame | None = None
+    currency_codes: pd.DataFrame | None = None
     base_currency: str | None = None
     exchange: str | None = None
 
@@ -51,6 +53,8 @@ class MarketData:
             "stock_splits": self.stock_splits,
             "fx_to_base": self.fx_to_base,
             "fx_age_days": self.fx_age_days,
+            "market_codes": self.market_codes,
+            "currency_codes": self.currency_codes,
         }
         for name, frame in optional.items():
             if frame is not None and (
@@ -83,6 +87,23 @@ class MarketData:
                 "stock_splits",
                 pd.DataFrame(0.0, index=self.close.index, columns=self.close.columns, dtype=float),
             )
+        code_fields = {
+            "market_codes": (self.market_codes, {"US", "TW"}),
+            "currency_codes": (self.currency_codes, {"USD", "TWD"}),
+        }
+        for name, (frame, allowed) in code_fields.items():
+            if frame is None:
+                continue
+            normalized = frame.apply(
+                lambda column: column.map(
+                    lambda value: str(value).upper().strip() if pd.notna(value) else pd.NA
+                )
+            )
+            observed = set(normalized.stack().astype(str))
+            invalid = sorted(observed - allowed)
+            if invalid:
+                raise ValueError(f"{name} contains unsupported values: {invalid}")
+            object.__setattr__(self, name, normalized)
         if self.fx_to_base is not None:
             invalid_fx = self.fx_to_base.notna() & (
                 (self.fx_to_base <= 0.0) | ~np.isfinite(self.fx_to_base)
@@ -116,6 +137,10 @@ class MarketData:
             stock_splits=self.stock_splits.loc[start:end] if self.stock_splits is not None else None,
             fx_to_base=self.fx_to_base.loc[start:end] if self.fx_to_base is not None else None,
             fx_age_days=self.fx_age_days.loc[start:end] if self.fx_age_days is not None else None,
+            market_codes=self.market_codes.loc[start:end] if self.market_codes is not None else None,
+            currency_codes=(
+                self.currency_codes.loc[start:end] if self.currency_codes is not None else None
+            ),
             base_currency=self.base_currency,
             exchange=self.exchange,
         )
@@ -205,8 +230,22 @@ def download_yahoo(
     dividends = dividends.loc[valid].fillna(0.0)
     stock_splits = stock_splits.loc[valid].fillna(0.0)
     reference = close_px.shift(1)
-    markets = {"TW" if s.upper().endswith((".TW", ".TWO")) else "US" for s in symbol_list}
+    market_by_symbol = {
+        symbol: "TW" if symbol.upper().endswith((".TW", ".TWO")) else "US"
+        for symbol in symbol_list
+    }
+    currency_by_symbol = {
+        symbol: "TWD" if market == "TW" else "USD"
+        for symbol, market in market_by_symbol.items()
+    }
+    markets = set(market_by_symbol.values())
     exchange = markets.pop() if len(markets) == 1 else None
+    market_codes = pd.DataFrame(
+        {symbol: market_by_symbol[symbol] for symbol in symbol_list}, index=open_px.index
+    )
+    currency_codes = pd.DataFrame(
+        {symbol: currency_by_symbol[symbol] for symbol in symbol_list}, index=open_px.index
+    )
     return MarketData(
         open=open_px,
         close=close_px,
@@ -217,6 +256,8 @@ def download_yahoo(
         membership=membership,
         dividends=dividends,
         stock_splits=stock_splits,
+        market_codes=market_codes,
+        currency_codes=currency_codes,
         exchange=exchange,
     )
 
@@ -255,5 +296,19 @@ def synthetic_market_data(
         raw_close=pd.DataFrame(close, index=dates),
         reference=pd.DataFrame(close, index=dates).shift(1),
         membership=pd.DataFrame(True, index=dates, columns=symbols, dtype=bool),
+        market_codes=pd.DataFrame(
+            {
+                symbol: "TW" if symbol.upper().endswith((".TW", ".TWO")) else "US"
+                for symbol in symbols
+            },
+            index=dates,
+        ),
+        currency_codes=pd.DataFrame(
+            {
+                symbol: "TWD" if symbol.upper().endswith((".TW", ".TWO")) else "USD"
+                for symbol in symbols
+            },
+            index=dates,
+        ),
         exchange=None,
     )

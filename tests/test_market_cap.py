@@ -38,7 +38,7 @@ def test_market_data_defaults_raw_prices_to_existing_basis():
     pd.testing.assert_frame_equal(data.raw_close, data.close)
 
 
-def test_snapshot_v3_round_trips_raw_price_basis(tmp_path):
+def test_snapshot_v4_round_trips_raw_price_and_asset_metadata(tmp_path):
     dates = pd.bdate_range("2026-01-02", periods=3)
     adjusted = pd.DataFrame({"AAA": [50.0, 51.0, 52.0]}, index=dates)
     raw = pd.DataFrame({"AAA": [100.0, 102.0, 104.0]}, index=dates)
@@ -48,6 +48,8 @@ def test_snapshot_v3_round_trips_raw_price_basis(tmp_path):
         volume=pd.DataFrame(1000.0, index=dates, columns=["AAA"]),
         raw_open=raw,
         raw_close=raw,
+        market_codes=pd.DataFrame("US", index=dates, columns=["AAA"]),
+        currency_codes=pd.DataFrame("USD", index=dates, columns=["AAA"]),
     )
     root = tmp_path / "snapshot"
     save_market_data_snapshot(data, root)
@@ -55,6 +57,35 @@ def test_snapshot_v3_round_trips_raw_price_basis(tmp_path):
     pd.testing.assert_frame_equal(loaded.raw_open, raw, check_freq=False)
     pd.testing.assert_frame_equal(loaded.raw_close, raw, check_freq=False)
     pd.testing.assert_frame_equal(loaded.close, adjusted, check_freq=False)
+    pd.testing.assert_frame_equal(
+        loaded.market_codes, data.market_codes, check_freq=False, check_dtype=False
+    )
+    pd.testing.assert_frame_equal(
+        loaded.currency_codes, data.currency_codes, check_freq=False, check_dtype=False
+    )
+
+
+def test_market_data_validates_and_slices_point_in_time_asset_metadata():
+    dates = pd.bdate_range("2026-01-02", periods=4)
+    close = pd.DataFrame({"AAA": [10.0, 11.0, 12.0, 13.0]}, index=dates)
+    data = MarketData(
+        open=close,
+        close=close,
+        volume=pd.DataFrame(1000.0, index=dates, columns=["AAA"]),
+        market_codes=pd.DataFrame(["us", "US", "US", "US"], index=dates, columns=["AAA"]),
+        currency_codes=pd.DataFrame("usd", index=dates, columns=["AAA"]),
+    )
+    sliced = data.slice(start=dates[1], end=dates[2])
+    assert set(sliced.market_codes["AAA"].dropna()) == {"US"}
+    assert set(sliced.currency_codes["AAA"].dropna()) == {"USD"}
+
+    with pytest.raises(ValueError, match="market_codes contains unsupported"):
+        MarketData(
+            open=close,
+            close=close,
+            volume=pd.DataFrame(1000.0, index=dates, columns=["AAA"]),
+            market_codes=pd.DataFrame("EU", index=dates, columns=["AAA"]),
+        )
 
 
 def test_split_adjusted_reported_shares_keeps_raw_market_cap_continuous():

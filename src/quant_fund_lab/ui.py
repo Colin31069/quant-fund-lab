@@ -154,6 +154,12 @@ if run:
                 stock_splits=raw.stock_splits[trade_symbols] if raw.stock_splits is not None else None,
                 fx_to_base=raw.fx_to_base[trade_symbols] if raw.fx_to_base is not None else None,
                 fx_age_days=raw.fx_age_days[trade_symbols] if raw.fx_age_days is not None else None,
+                market_codes=(
+                    raw.market_codes[trade_symbols] if raw.market_codes is not None else None
+                ),
+                currency_codes=(
+                    raw.currency_codes[trade_symbols] if raw.currency_codes is not None else None
+                ),
                 base_currency=raw.base_currency,
                 exchange=raw.exchange,
             )
