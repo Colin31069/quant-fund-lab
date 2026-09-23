@@ -6,6 +6,7 @@ from quant_fund_lab.config import BacktestConfig, DividendWithholdingConfig, Str
 from quant_fund_lab.corporate_actions import apply_cash_dividend_events, apply_stock_split_events
 from quant_fund_lab.data import MarketData
 from quant_fund_lab.execution import PortfolioState
+from quant_fund_lab.tax_analytics import dividend_tax_by_currency, summarize_dividend_tax
 
 
 def test_split_and_dividend_adjust_actual_position_and_cash():
@@ -142,6 +143,33 @@ def test_raw_backtest_applies_configured_dividend_withholding():
     assert event["withholding_tax"] == pytest.approx(event["gross_cash_value"] * 0.30)
     assert event["withholding_rate"] == pytest.approx(0.30)
     assert event["cash_value"] == pytest.approx(event["gross_cash_value"] * 0.70)
+
+    summary = summarize_dividend_tax(result.corporate_actions)
+    assert summary["dividend_event_count"] == 1
+    assert summary["effective_withholding_rate"] == pytest.approx(0.30)
+    assert summary["gross_dividend_cash"] == pytest.approx(event["gross_cash_value"])
+    assert summary["withholding_tax"] == pytest.approx(event["withholding_tax"])
+    assert summary["net_dividend_cash"] == pytest.approx(event["cash_value"])
+    by_currency = dividend_tax_by_currency(result.corporate_actions)
+    assert list(by_currency.index) == ["USD"]
+    assert by_currency.loc["USD", "effective_withholding_rate"] == pytest.approx(0.30)
+
+
+def test_dividend_tax_analytics_rejects_unreconciled_cashflow():
+    actions = pd.DataFrame(
+        [
+            {
+                "action": "cash_dividend",
+                "cash_value": 8.0,
+                "gross_cash_value": 10.0,
+                "withholding_tax": 3.0,
+                "local_currency": "USD",
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="does not reconcile"):
+        summarize_dividend_tax(actions)
+
 
 
 def test_adjusted_execution_mode_does_not_double_count_corporate_actions():

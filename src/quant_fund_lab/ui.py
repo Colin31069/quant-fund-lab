@@ -24,6 +24,7 @@ from quant_fund_lab.providers import SnapshotProvider, YahooProvider, load_with_
 from quant_fund_lab.reporting import export_research_report, verify_research_report
 from quant_fund_lab.robustness import build_robustness_report
 from quant_fund_lab.snapshot import save_market_data_snapshot
+from quant_fund_lab.tax_analytics import dividend_tax_by_currency, summarize_dividend_tax
 from quant_fund_lab.ui_inputs import load_verified_ui_inputs
 from quant_fund_lab.walkforward import (
     WalkForwardSpec,
@@ -438,6 +439,20 @@ if run:
             comparison_frame = metric_frame({"paper_replay": paper_equity, "benchmark": benchmark_equity})
             st.dataframe(comparison_frame, use_container_width=True)
 
+        tax_summary = summarize_dividend_tax(comparison.paper_replay.corporate_actions)
+        st.subheader("M9-3 Dividend Tax Drag")
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("Gross dividend", f"{float(tax_summary['gross_dividend_cash']):,.2f}")
+        t2.metric("Withholding tax", f"{float(tax_summary['withholding_tax']):,.2f}")
+        t3.metric("Net dividend", f"{float(tax_summary['net_dividend_cash']):,.2f}")
+        t4.metric(
+            "Effective withholding",
+            f"{float(tax_summary['effective_withholding_rate']):.1%}",
+        )
+        tax_currency = dividend_tax_by_currency(comparison.paper_replay.corporate_actions)
+        if not tax_currency.empty:
+            st.dataframe(tax_currency, use_container_width=True)
+
         fig = go.Figure()
         bt = comparison.backtest.equity_curve["equity"]
         pp = comparison.paper_replay.equity_curve["equity"]
@@ -547,6 +562,14 @@ if run:
             p2.metric("Realized PnL", f"{float(latest_nav['realized_pnl']):,.2f}")
             p3.metric("Unrealized PnL", f"{float(latest_nav['unrealized_pnl']):,.2f}")
             p4.metric("Open / Partial Orders", str(open_order_count))
+            persistent_tax = summarize_dividend_tax(persistent_actions)
+            st.caption(
+                "Dividend cashflow：gross "
+                f"{float(persistent_tax['gross_dividend_cash']):,.2f}；withholding "
+                f"{float(persistent_tax['withholding_tax']):,.2f}；net "
+                f"{float(persistent_tax['net_dividend_cash']):,.2f}；effective rate "
+                f"{float(persistent_tax['effective_withholding_rate']):.1%}。"
+            )
             ledger_fig = go.Figure()
             ledger_fig.add_trace(
                 go.Scatter(x=persistent_nav.index, y=persistent_nav["equity"], name="Paper ledger NAV")

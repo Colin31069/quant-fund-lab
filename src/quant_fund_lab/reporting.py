@@ -12,6 +12,7 @@ from .analytics import performance_metrics
 from .backtest import BacktestResult
 from .config import BacktestConfig
 from .provenance import RunManifest, build_run_manifest
+from .tax_analytics import dividend_tax_by_currency, summarize_dividend_tax
 
 
 def _sha256(path: Path) -> str:
@@ -63,6 +64,8 @@ def export_research_report(
     )
     metrics = performance_metrics(result.equity_curve["equity"])
     session_validations = _session_validation_payload(result)
+    dividend_tax = summarize_dividend_tax(result.corporate_actions)
+    dividend_tax_currency = dividend_tax_by_currency(result.corporate_actions)
 
     files: dict[str, Path] = {
         "equity_curve.csv": root / "equity_curve.csv",
@@ -74,6 +77,7 @@ def export_research_report(
         "factor_weights.csv": root / "factor_weights.csv",
         "risk_controls.csv": root / "risk_controls.csv",
         "corporate_actions.csv": root / "corporate_actions.csv",
+        "dividend_tax_by_currency.csv": root / "dividend_tax_by_currency.csv",
     }
     _write_frame(result.equity_curve, files["equity_curve.csv"])
     _write_frame(result.fills, files["fills.csv"])
@@ -84,10 +88,18 @@ def export_research_report(
     _write_frame(result.factor_weights, files["factor_weights.csv"])
     _write_frame(result.risk_controls, files["risk_controls.csv"])
     _write_frame(result.corporate_actions, files["corporate_actions.csv"])
+    _write_frame(dividend_tax_currency, files["dividend_tax_by_currency.csv"])
 
     metrics_path = root / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
     files[metrics_path.name] = metrics_path
+
+    dividend_tax_path = root / "dividend_tax_summary.json"
+    dividend_tax_path.write_text(
+        json.dumps(dividend_tax, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    files[dividend_tax_path.name] = dividend_tax_path
 
     run_path = root / "run_manifest.json"
     run_path.write_text(json.dumps(asdict(run), indent=2, sort_keys=True), encoding="utf-8")
@@ -110,6 +122,10 @@ def export_research_report(
     html_path = root / "report.html"
     summary_rows = "".join(
         f"<tr><th>{html.escape(key)}</th><td>{value:.6f}</td></tr>" for key, value in metrics.items()
+    )
+    dividend_tax_rows = "".join(
+        f"<tr><th>{html.escape(key)}</th><td>{float(value):.6f}</td></tr>"
+        for key, value in dividend_tax.items()
     )
     provenance_rows = "".join(
         f"<tr><th>{html.escape(key)}</th><td><code>{html.escape(value)}</code></td></tr>"
@@ -134,6 +150,7 @@ def export_research_report(
         f"<h1>Quant Fund Lab Research Report</h1><p>Run ID: <code>{run.run_id}</code></p>"
         f"<p>Dataset ID: <code>{html.escape(dataset_id)}</code></p>"
         f"<h2>Performance</h2><table>{summary_rows}</table>"
+        f"<h2>Dividend Tax Drag</h2><table>{dividend_tax_rows}</table>"
         f"<h2>Data Provenance</h2><table>{provenance_rows}</table>"
         "<h2>Market Session Validation</h2><table>"
         "<tr><th>Market</th><th>Observed</th><th>Expected</th>"
@@ -153,7 +170,7 @@ def export_research_report(
         ).encode("utf-8")
     ).hexdigest()
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "report_id": report_id,
         "run_id": run.run_id,
         "dataset_id": dataset_id,
