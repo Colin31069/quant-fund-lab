@@ -63,6 +63,7 @@ def save_market_data_snapshot(
         "terminal_returns": data.terminal_returns,
         "dividends": data.dividends,
         "stock_splits": data.stock_splits,
+        "cash_in_lieu_prices": data.cash_in_lieu_prices,
         "fx_to_base": data.fx_to_base,
         "fx_age_days": data.fx_age_days,
         "market_codes": data.market_codes,
@@ -77,7 +78,7 @@ def save_market_data_snapshot(
         file_hashes[path.name] = _sha256(path)
 
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "exchange": data.exchange,
         "base_currency": data.base_currency,
         "symbols": data.symbols,
@@ -105,7 +106,7 @@ def load_market_data_snapshot(directory: str | Path) -> MarketData:
     root = Path(directory)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     schema_version = manifest.get("schema_version")
-    if schema_version not in {2, 3, 4}:
+    if schema_version not in {2, 3, 4, 5}:
         raise ValueError("unsupported snapshot schema version")
     files: dict[str, str] = manifest["files"]
     required = {"open.parquet", "close.parquet", "volume.parquet"}
@@ -135,6 +136,9 @@ def load_market_data_snapshot(directory: str | Path) -> MarketData:
         terminal_returns=read("terminal_returns"),
         dividends=read("dividends"),
         stock_splits=read("stock_splits"),
+        cash_in_lieu_prices=(
+            read("cash_in_lieu_prices") if schema_version >= 5 else None
+        ),
         fx_to_base=read("fx_to_base"),
         fx_age_days=read("fx_age_days"),
         market_codes=read("market_codes") if schema_version >= 4 else None,

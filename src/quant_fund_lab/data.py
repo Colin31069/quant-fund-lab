@@ -19,6 +19,7 @@ class MarketData:
     terminal_returns: pd.DataFrame | None = None
     dividends: pd.DataFrame | None = None
     stock_splits: pd.DataFrame | None = None
+    cash_in_lieu_prices: pd.DataFrame | None = None
     fx_to_base: pd.DataFrame | None = None
     fx_age_days: pd.DataFrame | None = None
     market_codes: pd.DataFrame | None = None
@@ -51,6 +52,7 @@ class MarketData:
             "terminal_returns": self.terminal_returns,
             "dividends": self.dividends,
             "stock_splits": self.stock_splits,
+            "cash_in_lieu_prices": self.cash_in_lieu_prices,
             "fx_to_base": self.fx_to_base,
             "fx_age_days": self.fx_age_days,
             "market_codes": self.market_codes,
@@ -87,6 +89,14 @@ class MarketData:
                 "stock_splits",
                 pd.DataFrame(0.0, index=self.close.index, columns=self.close.columns, dtype=float),
             )
+        if self.cash_in_lieu_prices is not None:
+            invalid_cil = self.cash_in_lieu_prices.notna() & (
+                (self.cash_in_lieu_prices <= 0.0) | ~np.isfinite(self.cash_in_lieu_prices)
+            )
+            if bool(invalid_cil.any().any()):
+                raise ValueError(
+                    "cash_in_lieu_prices must contain positive finite settlement prices"
+                )
         code_fields = {
             "market_codes": (self.market_codes, {"US", "TW"}),
             "currency_codes": (self.currency_codes, {"USD", "TWD"}),
@@ -135,6 +145,11 @@ class MarketData:
             ),
             dividends=self.dividends.loc[start:end] if self.dividends is not None else None,
             stock_splits=self.stock_splits.loc[start:end] if self.stock_splits is not None else None,
+            cash_in_lieu_prices=(
+                self.cash_in_lieu_prices.loc[start:end]
+                if self.cash_in_lieu_prices is not None
+                else None
+            ),
             fx_to_base=self.fx_to_base.loc[start:end] if self.fx_to_base is not None else None,
             fx_age_days=self.fx_age_days.loc[start:end] if self.fx_age_days is not None else None,
             market_codes=self.market_codes.loc[start:end] if self.market_codes is not None else None,

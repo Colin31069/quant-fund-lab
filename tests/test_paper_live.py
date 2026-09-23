@@ -296,6 +296,54 @@ def test_m9_1_ledger_infers_existing_us_withholding_before_locking_metadata(tmp_
             ledger.ensure_dividend_withholding(DividendWithholdingConfig(us_rate=0.0))
 
 
+def test_paper_ledger_uses_explicit_cash_in_lieu_settlement_price(tmp_path):
+    config = BacktestConfig(
+        initial_cash=10_000.0,
+        base_currency="USD",
+        execution_price_basis="raw",
+        strategy=StrategyConfig(warmup_days=20),
+        us_costs=MarketCostConfig(
+            commission_bps=0.0,
+            sec_fee_per_million=0.0,
+            slippage_bps=0.0,
+            impact_coefficient=0.0,
+            max_participation=1.0,
+            lot_size=1,
+        ),
+    )
+    path = tmp_path / "cash-in-lieu.sqlite"
+    with PaperLedger(path, 10_000.0, "USD", reset=True) as ledger:
+        ledger.ensure_execution_price_basis("raw")
+        ledger.submit_target_orders(
+            pd.Timestamp("2026-01-02"),
+            pd.Series({"AAA": 0.11}),
+            pd.Series({"AAA": 100.0}),
+            config,
+        )
+        ledger.process_open(
+            pd.Timestamp("2026-01-05"),
+            pd.Series({"AAA": 100.0}),
+            pd.Series({"AAA": 100_000.0}),
+            pd.Series({"AAA": 100.0}),
+            config,
+        )
+        assert int(ledger.positions().loc["AAA", "quantity"]) == 11
+
+        ledger.process_corporate_actions(
+            pd.Timestamp("2026-01-06"),
+            pd.Series({"AAA": 0.5}),
+            pd.Series({"AAA": 0.0}),
+            pd.Series({"AAA": 20.0}),
+            cash_in_lieu_prices=pd.Series({"AAA": 18.0}),
+        )
+        event = ledger.corporate_actions().iloc[-1]
+        assert int(ledger.positions().loc["AAA", "quantity"]) == 5
+        assert event["cash_in_lieu_price"] == pytest.approx(18.0)
+        assert event["cash_in_lieu_price_source"] == "provider_settlement"
+        assert event["cash_value"] == pytest.approx(9.0)
+        assert event["realized_pnl_delta"] == pytest.approx(-91.0)
+
+
 def test_split_rebases_persistent_open_order_quantity(tmp_path):
     config = _low_participation_config()
     path = tmp_path / "orders.sqlite"

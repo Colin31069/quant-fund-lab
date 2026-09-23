@@ -32,7 +32,16 @@ def _ticker_change_data():
     )
     close_px = open_px.copy()
     volume = open_px.notna().astype(float) * 1_000.0
-    data = MarketData(open=open_px, close=close_px, volume=volume, exchange="US")
+    settlements = pd.DataFrame(float("nan"), index=dates, columns=["AAA", "BBB"])
+    settlements.loc[dates[1], "AAA"] = 11.25
+    settlements.loc[dates[4], "BBB"] = 14.25
+    data = MarketData(
+        open=open_px,
+        close=close_px,
+        volume=volume,
+        cash_in_lieu_prices=settlements,
+        exchange="US",
+    )
     lifecycle = SecurityMasterEventDataset(
         pd.DataFrame(
             [
@@ -93,6 +102,8 @@ def test_stitch_ticker_change_preserves_continuous_identity_and_terminal_event()
     assert currency_for_symbol(asset) == "USD"
     assert set(result.data.market_codes[asset].dropna()) == {"US"}
     assert set(result.data.currency_codes[asset].dropna()) == {"USD"}
+    assert result.data.cash_in_lieu_prices.loc[dates[1], asset] == pytest.approx(11.25)
+    assert result.data.cash_in_lieu_prices.loc[dates[4], asset] == pytest.approx(14.25)
 
 
 def test_ticker_reuse_creates_two_stable_assets_without_prelisting_price_leakage():

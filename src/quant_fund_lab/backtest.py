@@ -184,6 +184,11 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                 pd.Timestamp(execution_date),
                 fx_next,
                 currency_next,
+                (
+                    data.cash_in_lieu_prices.loc[execution_date]
+                    if data.cash_in_lieu_prices is not None
+                    else None
+                ),
             )
             dividend_events = apply_cash_dividend_events(
                 state,

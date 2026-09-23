@@ -122,6 +122,8 @@ class PaperLedger:
                 withholding_tax REAL NOT NULL DEFAULT 0,
                 withholding_tax_local REAL NOT NULL DEFAULT 0,
                 withholding_rate REAL NOT NULL DEFAULT 0,
+                cash_in_lieu_price REAL NOT NULL DEFAULT 0,
+                cash_in_lieu_price_source TEXT NOT NULL DEFAULT '',
                 realized_pnl_delta REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS terminal_events (
@@ -180,6 +182,8 @@ class PaperLedger:
             "withholding_tax": "REAL NOT NULL DEFAULT 0",
             "withholding_tax_local": "REAL NOT NULL DEFAULT 0",
             "withholding_rate": "REAL NOT NULL DEFAULT 0",
+            "cash_in_lieu_price": "REAL NOT NULL DEFAULT 0",
+            "cash_in_lieu_price_source": "TEXT NOT NULL DEFAULT ''",
         }
         added: set[str] = set()
         for column, declaration in additions.items():
@@ -485,8 +489,8 @@ class PaperLedger:
             "INSERT INTO corporate_actions(timestamp, symbol, action, quantity_before, quantity_after, "
             "ratio_or_amount, cash_value, cash_value_local, local_currency, fx_to_base, "
             "gross_cash_value, gross_cash_value_local, withholding_tax, withholding_tax_local, "
-            "withholding_rate, realized_pnl_delta) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "withholding_rate, cash_in_lieu_price, cash_in_lieu_price_source, "
+            "realized_pnl_delta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 pd.Timestamp(event.timestamp).isoformat(),
                 event.symbol,
@@ -503,6 +507,8 @@ class PaperLedger:
                 event.withholding_tax,
                 event.withholding_tax_local,
                 event.withholding_rate,
+                event.cash_in_lieu_price,
+                event.cash_in_lieu_price_source,
                 realized_pnl_delta,
             ),
         )
@@ -532,6 +538,7 @@ class PaperLedger:
         currency_codes: pd.Series | None = None,
         market_codes: pd.Series | None = None,
         dividend_withholding: DividendWithholdingConfig | None = None,
+        cash_in_lieu_prices: pd.Series | None = None,
     ) -> int:
         """Apply raw-basis corporate actions before terminal events and open-order execution."""
 
@@ -546,6 +553,7 @@ class PaperLedger:
             pd.Timestamp(timestamp),
             fx_to_base,
             currency_codes,
+            cash_in_lieu_prices,
         )
         for symbol, ratio_value in stock_splits.astype(float).items():
             ratio = float(ratio_value)
@@ -855,6 +863,11 @@ def replay_targets_persistently(
                 currency_codes,
                 market_codes,
                 config.dividend_withholding,
+                (
+                    data.cash_in_lieu_prices.loc[timestamp]
+                    if data.cash_in_lieu_prices is not None
+                    else None
+                ),
             )
         ledger.process_terminal_returns(
             timestamp,

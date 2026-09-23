@@ -28,6 +28,8 @@ class CorporateActionEvent:
     withholding_tax: float
     withholding_tax_local: float
     withholding_rate: float
+    cash_in_lieu_price: float
+    cash_in_lieu_price_source: str
 
 
 def _fx(symbol: str, fx_to_base: pd.Series | None) -> float:
@@ -44,11 +46,12 @@ def apply_stock_split_events(
     timestamp: pd.Timestamp,
     fx_to_base: pd.Series | None = None,
     currency_codes: pd.Series | None = None,
+    cash_in_lieu_prices: pd.Series | None = None,
 ) -> list[CorporateActionEvent]:
     """Apply observed split ratios to actual share quantities before ex-date trading.
 
-    Fractional shares created by reverse/non-integer splits are converted to cash-in-lieu using the
-    ex-date raw open as a transparent approximation; this is recorded explicitly in the event.
+    Fractional shares created by reverse/non-integer splits use an explicit provider settlement
+    price when available. Otherwise ex-date raw open remains a transparent fallback approximation.
     """
 
     events: list[CorporateActionEvent] = []
@@ -63,10 +66,27 @@ def apply_stock_split_events(
         whole_after = floor(exact_after + 1e-12)
         fractional = max(exact_after - whole_after, 0.0)
         factor = _fx(symbol, fx_to_base)
-        raw_open = float(raw_open_prices.get(symbol, float("nan")))
-        if fractional > 1e-12 and (not np.isfinite(raw_open) or raw_open <= 0.0):
-            raise ValueError(f"raw open is required for split cash-in-lieu on {symbol}")
-        cash_local = fractional * raw_open if fractional > 0.0 else 0.0
+        settlement_price = 0.0
+        settlement_source = ""
+        if fractional > 1e-12:
+            explicit_value = (
+                float("nan")
+                if cash_in_lieu_prices is None
+                else cash_in_lieu_prices.get(symbol, float("nan"))
+            )
+            if pd.notna(explicit_value):
+                settlement_price = float(explicit_value)
+                if not np.isfinite(settlement_price) or settlement_price <= 0.0:
+                    raise ValueError(
+                        f"invalid explicit cash-in-lieu settlement price for {symbol}"
+                    )
+                settlement_source = "provider_settlement"
+            else:
+                settlement_price = float(raw_open_prices.get(symbol, float("nan")))
+                if not np.isfinite(settlement_price) or settlement_price <= 0.0:
+                    raise ValueError(f"raw open is required for split cash-in-lieu on {symbol}")
+                settlement_source = "raw_open_fallback"
+        cash_local = fractional * settlement_price if fractional > 0.0 else 0.0
         cash_base = cash_local * factor
         state.shares[symbol] = whole_after
         state.cash += cash_base
@@ -90,6 +110,8 @@ def apply_stock_split_events(
                 withholding_tax=0.0,
                 withholding_tax_local=0.0,
                 withholding_rate=0.0,
+                cash_in_lieu_price=float(settlement_price),
+                cash_in_lieu_price_source=settlement_source,
             )
         )
     return events
@@ -146,6 +168,8 @@ def apply_cash_dividend_events(
                 withholding_tax=float(withholding_base),
                 withholding_tax_local=float(withholding_local),
                 withholding_rate=float(rate),
+                cash_in_lieu_price=0.0,
+                cash_in_lieu_price_source="",
             )
         )
     return events

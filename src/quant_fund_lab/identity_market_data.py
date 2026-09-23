@@ -79,6 +79,7 @@ def stitch_market_data_by_identity(
         "raw_close": data.raw_close,
         "dividends": data.dividends,
         "stock_splits": data.stock_splits,
+        "cash_in_lieu_prices": data.cash_in_lieu_prices,
         "fx_to_base": None if has_currency_transition else data.fx_to_base,
         "fx_age_days": None if has_currency_transition else data.fx_age_days,
     }
@@ -90,6 +91,9 @@ def stitch_market_data_by_identity(
         "raw_close": pd.DataFrame(index=index),
         "dividends": pd.DataFrame(index=index),
         "stock_splits": pd.DataFrame(index=index),
+        "cash_in_lieu_prices": (
+            pd.DataFrame(index=index) if data.cash_in_lieu_prices is not None else None
+        ),
         "fx_to_base": (
             pd.DataFrame(index=index)
             if data.fx_to_base is not None and not has_currency_transition
@@ -209,6 +213,11 @@ def stitch_market_data_by_identity(
         frame = output[field]
         if frame is not None:
             output[field] = frame.reindex(columns=[row["asset_key"] for row in asset_rows])
+    cash_in_lieu_prices = output["cash_in_lieu_prices"]
+    if cash_in_lieu_prices is not None:
+        output["cash_in_lieu_prices"] = cash_in_lieu_prices.reindex(
+            columns=[row["asset_key"] for row in asset_rows]
+        )
 
     close = output["close"]
     if close is None:
@@ -226,6 +235,7 @@ def stitch_market_data_by_identity(
         terminal_returns=terminal_returns.reindex(columns=close.columns),
         dividends=output["dividends"],
         stock_splits=output["stock_splits"],
+        cash_in_lieu_prices=output["cash_in_lieu_prices"],
         fx_to_base=output["fx_to_base"],
         fx_age_days=output["fx_age_days"],
         market_codes=market_codes.reindex(columns=close.columns),

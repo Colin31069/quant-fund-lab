@@ -40,6 +40,7 @@ def _subset_assets(data: MarketData, symbols: list[str]) -> MarketData:
         terminal_returns=subset(data.terminal_returns),
         dividends=subset(data.dividends),
         stock_splits=subset(data.stock_splits),
+        cash_in_lieu_prices=subset(data.cash_in_lieu_prices),
         fx_to_base=subset(data.fx_to_base),
         fx_age_days=subset(data.fx_age_days),
         market_codes=subset(data.market_codes),

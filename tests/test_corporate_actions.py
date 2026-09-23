@@ -70,9 +70,32 @@ def test_reverse_split_fractional_share_becomes_cash_in_lieu():
     assert state.shares["AAA"] == 5
     assert state.cash == pytest.approx(10.0)
     assert events[0].cash_value_local == pytest.approx(10.0)
+    assert events[0].cash_in_lieu_price == pytest.approx(20.0)
+    assert events[0].cash_in_lieu_price_source == "raw_open_fallback"
 
 
-def _raw_split_market_data() -> MarketData:
+def test_reverse_split_prefers_explicit_cash_in_lieu_settlement_price():
+    state = PortfolioState(cash=0.0, shares={"AAA": 11})
+    events = apply_stock_split_events(
+        state,
+        pd.Series({"AAA": 0.5}),
+        pd.Series({"AAA": 20.0}),
+        pd.Timestamp("2026-01-05"),
+        cash_in_lieu_prices=pd.Series({"AAA": 18.0}),
+    )
+
+    assert state.shares["AAA"] == 5
+    assert state.cash == pytest.approx(9.0)
+    event = events[0]
+    assert event.cash_in_lieu_price == pytest.approx(18.0)
+    assert event.cash_in_lieu_price_source == "provider_settlement"
+    assert event.cash_value_local == pytest.approx(9.0)
+
+
+def _raw_split_market_data(
+    split_ratio: float = 2.0,
+    cash_in_lieu_price=None,
+) -> MarketData:
     dates = pd.bdate_range("2025-01-02", periods=80)
     adjusted_aaa = pd.Series(50.0 + 0.2 * pd.RangeIndex(len(dates)), index=dates, dtype=float)
     adjusted_bbb = pd.Series(50.0, index=dates, dtype=float)
@@ -81,10 +104,14 @@ def _raw_split_market_data() -> MarketData:
     raw_close = adjusted_close.copy()
     raw_open = adjusted_open.copy()
     split_date = dates[50]
-    raw_close.loc[: dates[49], "AAA"] *= 2.0
-    raw_open.loc[: dates[49], "AAA"] *= 2.0
+    raw_close.loc[: dates[49], "AAA"] *= split_ratio
+    raw_open.loc[: dates[49], "AAA"] *= split_ratio
     splits = pd.DataFrame(0.0, index=dates, columns=["AAA", "BBB"])
-    splits.loc[split_date, "AAA"] = 2.0
+    splits.loc[split_date, "AAA"] = split_ratio
+    settlements = None
+    if cash_in_lieu_price is not None:
+        settlements = pd.DataFrame(float("nan"), index=dates, columns=["AAA", "BBB"])
+        settlements.loc[split_date, "AAA"] = cash_in_lieu_price
     dividends = pd.DataFrame(0.0, index=dates, columns=["AAA", "BBB"])
     dividends.loc[dates[60], "AAA"] = 1.0
     return MarketData(
@@ -94,6 +121,7 @@ def _raw_split_market_data() -> MarketData:
         raw_close=raw_close,
         volume=pd.DataFrame(2_000_000.0, index=dates, columns=["AAA", "BBB"]),
         stock_splits=splits,
+        cash_in_lieu_prices=settlements,
         dividends=dividends,
         membership=pd.DataFrame(True, index=dates, columns=["AAA", "BBB"]),
     )
@@ -117,6 +145,27 @@ def test_raw_execution_backtest_records_corporate_actions_when_position_is_held(
     assert not result.corporate_actions.empty
     assert "stock_split" in set(result.corporate_actions["action"])
     assert result.equity_curve["equity"].gt(0.0).all()
+
+
+def test_raw_backtest_uses_explicit_cash_in_lieu_settlement_price():
+    data = _raw_split_market_data(split_ratio=0.4, cash_in_lieu_price=61.25)
+    config = BacktestConfig(
+        initial_cash=100_000.0,
+        execution_price_basis="raw",
+        strategy=StrategyConfig(
+            warmup_days=30,
+            rebalance_every=5,
+            max_weight=0.8,
+            regime_enabled=False,
+            factor_neutralization=False,
+            risk_aversion=0.2,
+        ),
+    )
+    result = run_backtest(data, config)
+    split = result.corporate_actions[result.corporate_actions["action"].eq("stock_split")].iloc[0]
+    assert split["cash_in_lieu_price"] == pytest.approx(61.25)
+    assert split["cash_in_lieu_price_source"] == "provider_settlement"
+    assert split["cash_value_local"] > 0.0
 
 
 def test_raw_backtest_applies_configured_dividend_withholding():
