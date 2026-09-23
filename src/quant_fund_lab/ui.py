@@ -306,7 +306,10 @@ if run:
                 f"M4 report 已匯出：{report_path}；run_id={report_run_id}；"
                 f"integrity={'PASS' if report_verified else 'FAIL'}。"
             )
-        session_report = comparison.paper_replay.session_validation
+        session_reports = comparison.paper_replay.session_validations
+        if not session_reports and comparison.paper_replay.session_validation is not None:
+            legacy_report = comparison.paper_replay.session_validation
+            session_reports = {legacy_report.market: legacy_report}
         if not action_report.is_valid:
             st.warning(
                 "企業行動資料有可疑項目："
@@ -314,13 +317,15 @@ if run:
                 f"無效拆股 {len(action_report.invalid_split_events)}、"
                 f"拆股後調整報酬異常 {len(action_report.suspicious_split_adjustments)}。"
             )
-        if session_report is not None and (
-            session_report.missing_sessions or session_report.off_calendar_sessions
-        ):
+        for market, session_report in session_reports.items():
+            if not (session_report.missing_sessions or session_report.off_calendar_sessions):
+                continue
             missing_preview = ", ".join(str(x.date()) for x in session_report.missing_sessions[:3])
-            extra_preview = ", ".join(str(x.date()) for x in session_report.off_calendar_sessions[:3])
+            extra_preview = ", ".join(
+                str(x.date()) for x in session_report.off_calendar_sessions[:3]
+            )
             st.warning(
-                "市場資料與第三方交易日曆存在差異。"
+                f"{market} 市場資料與第三方交易日曆存在差異。"
                 f" 日曆有、資料無：{len(session_report.missing_sessions)} 日（{missing_preview or '無'}）；"
                 f" 資料有、日曆無：{len(session_report.off_calendar_sessions)} 日（{extra_preview or '無'}）。"
                 "可能是臨時休市、日曆版本落差或資料缺口；不自動補造價格。"

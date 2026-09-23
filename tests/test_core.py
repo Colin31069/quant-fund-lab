@@ -1,5 +1,6 @@
 from dataclasses import replace
 
+import exchange_calendars as xcals
 import numpy as np
 import pandas as pd
 import pytest
@@ -10,7 +11,11 @@ from quant_fund_lab.data import MarketData, synthetic_market_data
 from quant_fund_lab.data_quality import validate_corporate_actions
 from quant_fund_lab.execution import PortfolioState, apply_terminal_returns, rebalance_at_open
 from quant_fund_lab.fx import attach_fx_rates, validate_fx
-from quant_fund_lab.market_calendar import require_valid_daily_sessions, validate_daily_sessions
+from quant_fund_lab.market_calendar import (
+    require_valid_daily_sessions,
+    validate_daily_sessions,
+    validate_point_in_time_market_sessions,
+)
 from quant_fund_lab.models import ensemble_alpha
 from quant_fund_lab.portfolio import optimize_weights
 from quant_fund_lab.snapshot import load_market_data_snapshot, save_market_data_snapshot
@@ -54,6 +59,8 @@ def test_fx_direction_and_mixed_currency_backtest():
     assert result.base_currency == "USD"
     assert not result.fills.empty
     assert result.equity_curve["equity"].gt(0).all()
+    assert result.session_validation is None
+    assert set(result.session_validations) == {"US", "TW"}
 
 
 def test_fx_uses_point_in_time_currency_metadata_for_same_stable_asset():
@@ -240,6 +247,72 @@ def test_calendar_rejects_off_session_bar():
     assert pd.Timestamp("2026-01-03") in report.off_calendar_sessions
     with pytest.raises(ValueError, match="weekend"):
         require_valid_daily_sessions(observed, "US")
+
+
+def test_point_in_time_calendar_ignores_other_market_union_session_but_flags_real_bad_bar():
+    start = pd.Timestamp("2026-01-01")
+    end = pd.Timestamp("2026-12-31")
+    us_sessions = (
+        xcals.get_calendar("XNYS").sessions_in_range(start, end).tz_localize(None).normalize()
+    )
+    tw_sessions = (
+        xcals.get_calendar("XTAI").sessions_in_range(start, end).tz_localize(None).normalize()
+    )
+    common = us_sessions.intersection(tw_sessions)
+    candidates = tw_sessions.difference(us_sessions)
+    tw_only = next(
+        date
+        for date in candidates
+        if bool((common < date).any()) and bool((common > date).any())
+    )
+    before = common[common < tw_only][-1]
+    after = common[common > tw_only][0]
+    dates = pd.DatetimeIndex([before, tw_only, after])
+    open_px = pd.DataFrame(
+        {
+            "US_ASSET": [100.0, np.nan, 101.0],
+            "TW_ASSET.TW": [200.0, 201.0, 202.0],
+        },
+        index=dates,
+    )
+    close_px = pd.DataFrame(
+        {
+            "US_ASSET": [100.0, 100.0, 101.0],
+            "TW_ASSET.TW": [200.0, 201.0, 202.0],
+        },
+        index=dates,
+    )
+    volume = pd.DataFrame(
+        {
+            "US_ASSET": [1_000.0, 0.0, 1_000.0],
+            "TW_ASSET.TW": [1_000.0, 1_000.0, 1_000.0],
+        },
+        index=dates,
+    )
+    market_codes = pd.DataFrame(
+        {
+            "US_ASSET": ["US", "US", "US"],
+            "TW_ASSET.TW": ["TW", "TW", "TW"],
+        },
+        index=dates,
+    )
+    data = MarketData(
+        open=open_px,
+        close=close_px,
+        volume=volume,
+        market_codes=market_codes,
+    )
+    reports = validate_point_in_time_market_sessions(data)
+    assert tw_only not in reports["US"].off_calendar_sessions
+    assert tw_only not in reports["US"].missing_sessions
+
+    dirty = replace(
+        data,
+        open=data.open.assign(US_ASSET=[100.0, 100.0, 101.0]),
+        volume=data.volume.assign(US_ASSET=[1_000.0, 1_000.0, 1_000.0]),
+    )
+    dirty_reports = validate_point_in_time_market_sessions(dirty)
+    assert tw_only in dirty_reports["US"].off_calendar_sessions
 
 
 def test_point_in_time_membership_forces_ineligible_weight_to_zero():

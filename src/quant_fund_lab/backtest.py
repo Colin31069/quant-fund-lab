@@ -22,7 +22,11 @@ from .factors import (
     orthogonalize_factor_panel,
 )
 from .fx import currency_for_symbol, validate_fx
-from .market_calendar import SessionValidation, require_valid_daily_sessions
+from .market_calendar import (
+    SessionValidation,
+    require_point_in_time_market_sessions,
+    require_valid_daily_sessions,
+)
 from .models import ensemble_alpha
 from .portfolio import optimize_weights
 from .research import detect_market_regime, neutralize_alpha, regime_adjusted_alpha
@@ -37,6 +41,7 @@ class BacktestResult:
     alphas: pd.DataFrame
     cost_attribution: pd.DataFrame
     session_validation: SessionValidation | None
+    session_validations: dict[str, SessionValidation]
     terminal_events: pd.DataFrame
     base_currency: str
     max_fx_age_days: float
@@ -63,11 +68,21 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
     else:
         currencies = {currency_for_symbol(symbol) for symbol in data.symbols}
     session_validation: SessionValidation | None = None
-    if len(markets) == 1 and data.exchange is not None:
+    session_validations: dict[str, SessionValidation] = {}
+    if data.market_codes is not None:
+        session_validations = require_point_in_time_market_sessions(data)
+        if len(session_validations) == 1:
+            session_validation = next(iter(session_validations.values()))
+        if len(markets) == 1 and data.exchange is not None:
+            market = next(iter(markets))
+            if data.exchange != market:
+                raise ValueError("market-data exchange metadata does not match symbols")
+    elif len(markets) == 1 and data.exchange is not None:
         market = next(iter(markets))
         if data.exchange != market:
             raise ValueError("market-data exchange metadata does not match symbols")
         session_validation = require_valid_daily_sessions(data.close.index, market)
+        session_validations = {market: session_validation}
 
     requested_base = config.base_currency.upper() if config.base_currency else None
     if data.fx_to_base is None:
@@ -360,6 +375,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         alphas=alphas_df,
         cost_attribution=costs_df,
         session_validation=session_validation,
+        session_validations=session_validations,
         terminal_events=terminal_df,
         base_currency=base_currency,
         max_fx_age_days=float(fx_age_days.max().max()),
