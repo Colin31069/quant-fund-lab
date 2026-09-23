@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,12 +36,21 @@ _EVENT_PRIORITY = {
 }
 _TWSE_ALIASES = {"TWSE", "TSE", "TW"}
 _TPEX_ALIASES = {"TPEX", "OTC", "TWO"}
+_LIFECYCLE_SCHEMA_VERSION = 1
 
 
 def _text(value: object) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _normalize_exchange(value: object, market: str) -> str:
@@ -338,6 +349,95 @@ class SecurityMasterEventDataset:
         if len(active) != 1:
             raise KeyError(f"no unique identity for {security_id} at {timestamp.date()}")
         return active.iloc[0]
+
+
+@dataclass(frozen=True)
+class SecurityLifecycleManifest:
+    schema_version: int
+    dataset_id: str
+    row_count: int
+    security_ids: tuple[str, ...]
+    file_sha256: str
+
+
+def save_security_lifecycle_dataset(
+    dataset: SecurityMasterEventDataset,
+    directory: str | Path,
+) -> SecurityLifecycleManifest:
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    data_path = root / "security_lifecycle.parquet"
+    dataset.events.to_parquet(data_path, engine="pyarrow", compression="zstd", index=False)
+    file_hash = _sha256(data_path)
+    payload = {
+        "schema_version": _LIFECYCLE_SCHEMA_VERSION,
+        "row_count": len(dataset.events),
+        "security_ids": dataset.security_ids,
+        "file_sha256": file_hash,
+    }
+    dataset_id = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    manifest = SecurityLifecycleManifest(
+        schema_version=_LIFECYCLE_SCHEMA_VERSION,
+        dataset_id=dataset_id,
+        row_count=len(dataset.events),
+        security_ids=tuple(dataset.security_ids),
+        file_sha256=file_hash,
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": manifest.schema_version,
+                "dataset_id": manifest.dataset_id,
+                "row_count": manifest.row_count,
+                "security_ids": list(manifest.security_ids),
+                "file_sha256": manifest.file_sha256,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return manifest
+
+
+def load_security_lifecycle_dataset(
+    directory: str | Path,
+) -> tuple[SecurityMasterEventDataset, SecurityLifecycleManifest]:
+    root = Path(directory)
+    manifest_raw = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if int(manifest_raw.get("schema_version", -1)) != _LIFECYCLE_SCHEMA_VERSION:
+        raise ValueError("unsupported security-lifecycle schema version")
+    data_path = root / "security_lifecycle.parquet"
+    observed_hash = _sha256(data_path)
+    expected_hash = str(manifest_raw["file_sha256"])
+    if observed_hash != expected_hash:
+        raise ValueError("security-lifecycle file hash mismatch")
+    payload = {
+        "schema_version": int(manifest_raw["schema_version"]),
+        "row_count": int(manifest_raw["row_count"]),
+        "security_ids": list(manifest_raw["security_ids"]),
+        "file_sha256": expected_hash,
+    }
+    dataset_id = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if dataset_id != manifest_raw["dataset_id"]:
+        raise ValueError("security-lifecycle dataset ID mismatch")
+    dataset = SecurityMasterEventDataset(pd.read_parquet(data_path))
+    manifest = SecurityLifecycleManifest(
+        schema_version=_LIFECYCLE_SCHEMA_VERSION,
+        dataset_id=dataset_id,
+        row_count=int(manifest_raw["row_count"]),
+        security_ids=tuple(manifest_raw["security_ids"]),
+        file_sha256=expected_hash,
+    )
+    if len(dataset.events) != manifest.row_count:
+        raise ValueError("security-lifecycle manifest row-count mismatch")
+    if tuple(dataset.security_ids) != manifest.security_ids:
+        raise ValueError("security-lifecycle manifest identity mismatch")
+    return dataset, manifest
 
 
 @dataclass(frozen=True)

@@ -235,8 +235,14 @@ if run:
                     "train_fraction": float(train_fraction),
                     "split_date": str(comparison.split_date.date()),
                 }
+                data_provenance = {
+                    "market_data_dataset_id": input_snapshot.dataset_id,
+                }
                 run_manifest = build_run_manifest(
-                    config, input_snapshot.dataset_id, run_context=run_context
+                    config,
+                    input_snapshot.dataset_id,
+                    run_context=run_context,
+                    data_provenance=data_provenance,
                 )
                 report_directory = f"artifacts/reports/{run_manifest.run_id}"
                 exported_run, _ = export_research_report(
@@ -245,6 +251,7 @@ if run:
                     input_snapshot.dataset_id,
                     report_directory,
                     run_context=run_context,
+                    data_provenance=data_provenance,
                 )
                 report_verified = verify_research_report(report_directory)
                 audit.append(
@@ -252,6 +259,7 @@ if run:
                     {
                         "run_id": exported_run.run_id,
                         "dataset_id": input_snapshot.dataset_id,
+                        "data_provenance": data_provenance,
                         "path": report_directory,
                         "verified": report_verified,
                     },

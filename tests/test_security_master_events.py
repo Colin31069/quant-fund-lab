@@ -1,11 +1,15 @@
+import json
+
 import pandas as pd
 import pytest
 
 from quant_fund_lab.security_master_events import (
     SecurityEventCSVProvider,
     SecurityMasterEventDataset,
+    load_security_lifecycle_dataset,
     merge_security_event_datasets,
     normalize_security_event_frame,
+    save_security_lifecycle_dataset,
 )
 
 
@@ -221,3 +225,39 @@ def test_csv_provider_and_multi_market_merge(tmp_path):
     merged = merge_security_event_datasets(us_dataset, tw)
     assert set(merged.security_ids) == {"us:1", "tw:1"}
     assert set(merged.materialize().symbols) == {"AAA", "2330.TW"}
+
+def test_security_lifecycle_snapshot_round_trip_is_deterministic(tmp_path):
+    dataset = _events()
+    root = tmp_path / "lifecycle"
+    first = save_security_lifecycle_dataset(dataset, root)
+    loaded, observed = load_security_lifecycle_dataset(root)
+    second = save_security_lifecycle_dataset(loaded, tmp_path / "copy")
+
+    assert observed == first
+    assert second.dataset_id == first.dataset_id
+    pd.testing.assert_frame_equal(dataset.events, loaded.events, check_dtype=False)
+
+
+def test_security_lifecycle_snapshot_detects_file_tampering(tmp_path):
+    root = tmp_path / "lifecycle"
+    save_security_lifecycle_dataset(_events(), root)
+    path = root / "security_lifecycle.parquet"
+    content = bytearray(path.read_bytes())
+    content[-1] ^= 1
+    path.write_bytes(bytes(content))
+
+    with pytest.raises(ValueError, match="file hash mismatch"):
+        load_security_lifecycle_dataset(root)
+
+
+def test_security_lifecycle_snapshot_detects_manifest_identity_tampering(tmp_path):
+    root = tmp_path / "lifecycle"
+    manifest = save_security_lifecycle_dataset(_events(), root)
+    path = root / "manifest.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["security_ids"] = ["us:tampered"]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dataset ID mismatch"):
+        load_security_lifecycle_dataset(root)
+    assert manifest.dataset_id != ""

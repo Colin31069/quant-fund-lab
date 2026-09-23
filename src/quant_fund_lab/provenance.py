@@ -29,12 +29,14 @@ def deterministic_run_id(
     dataset_id: str,
     package_version: str = __version__,
     run_context: dict[str, object] | None = None,
+    data_provenance: dict[str, str] | None = None,
 ) -> str:
     payload = {
         "config": serialized_config(config),
         "dataset_id": dataset_id,
         "package_version": package_version,
         "run_context": run_context or {},
+        "data_provenance": data_provenance or {},
     }
     return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()[:20]
 
@@ -47,6 +49,7 @@ class RunManifest:
     config_schema_version: int
     config: dict[str, object]
     run_context: dict[str, object]
+    data_provenance: dict[str, str]
 
 
 def build_run_manifest(
@@ -54,14 +57,22 @@ def build_run_manifest(
     dataset_id: str,
     package_version: str = __version__,
     run_context: dict[str, object] | None = None,
+    data_provenance: dict[str, str] | None = None,
 ) -> RunManifest:
     return RunManifest(
-        run_id=deterministic_run_id(config, dataset_id, package_version, run_context),
+        run_id=deterministic_run_id(
+            config,
+            dataset_id,
+            package_version,
+            run_context,
+            data_provenance,
+        ),
         dataset_id=dataset_id,
         package_version=package_version,
         config_schema_version=CONFIG_SCHEMA_VERSION,
         config=serialized_config(config),
         run_context=run_context or {},
+        data_provenance=data_provenance or {},
     )
 
 

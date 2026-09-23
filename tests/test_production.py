@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -77,6 +78,25 @@ def test_run_id_is_deterministic_and_config_sensitive():
     manifest = build_run_manifest(config, "dataset-123")
     assert manifest.run_id == same
     assert manifest.config_schema_version == 1
+    lifecycle_run = deterministic_run_id(
+        config,
+        "dataset-123",
+        data_provenance={"security_lifecycle_dataset_id": "life-001"},
+    )
+    assert lifecycle_run != deterministic_run_id(
+        config,
+        "dataset-123",
+        data_provenance={"security_lifecycle_dataset_id": "life-002"},
+    )
+    provenance_manifest = build_run_manifest(
+        config,
+        "dataset-123",
+        data_provenance={"security_lifecycle_dataset_id": "life-001"},
+    )
+    assert provenance_manifest.run_id == lifecycle_run
+    assert provenance_manifest.data_provenance == {
+        "security_lifecycle_dataset_id": "life-001"
+    }
 
 
 def test_audit_log_detects_tampering(tmp_path):
@@ -111,9 +131,33 @@ def test_report_export_is_hash_verifiable(tmp_path):
     )
     result = run_backtest(data, config)
     root = tmp_path / "report"
-    run, hashes = export_research_report(result, config, "dataset-test", root)
+    run, hashes = export_research_report(
+        result,
+        config,
+        "dataset-test",
+        root,
+        data_provenance={"security_lifecycle_dataset_id": "life-test"},
+    )
     assert run.run_id
+    assert run.data_provenance["security_lifecycle_dataset_id"] == "life-test"
     assert "report.html" in hashes
+    assert "session_validations.json" in hashes
+    assert "data_provenance.json" in hashes
+    sessions = json.loads((root / "session_validations.json").read_text(encoding="utf-8"))
+    assert "US" in sessions
+    assert {
+        "observed_sessions",
+        "expected_sessions",
+        "missing_sessions",
+        "off_calendar_sessions",
+    }.issubset(sessions["US"])
+    assert json.loads((root / "data_provenance.json").read_text(encoding="utf-8")) == {
+        "security_lifecycle_dataset_id": "life-test"
+    }
+    report_manifest = json.loads((root / "report_manifest.json").read_text(encoding="utf-8"))
+    assert report_manifest["schema_version"] == 2
+    manifest_payload = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest_payload["data_provenance"]["security_lifecycle_dataset_id"] == "life-test"
     assert verify_research_report(root)
     weights_path = root / "weights.csv"
     weights_path.write_text(weights_path.read_text(encoding="utf-8") + "tamper", encoding="utf-8")

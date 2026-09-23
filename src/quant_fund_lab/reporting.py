@@ -26,17 +26,43 @@ def _write_frame(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=True)
 
 
+def _session_validation_payload(result: BacktestResult) -> dict[str, dict[str, object]]:
+    reports = result.session_validations
+    if not reports and result.session_validation is not None:
+        reports = {result.session_validation.market: result.session_validation}
+    return {
+        market: {
+            "market": report.market,
+            "observed_sessions": report.observed_sessions,
+            "expected_sessions": report.expected_sessions,
+            "missing_sessions": [str(value.date()) for value in report.missing_sessions],
+            "off_calendar_sessions": [
+                str(value.date()) for value in report.off_calendar_sessions
+            ],
+            "is_valid": report.is_valid,
+        }
+        for market, report in sorted(reports.items())
+    }
+
+
 def export_research_report(
     result: BacktestResult,
     config: BacktestConfig,
     dataset_id: str,
     directory: str | Path,
     run_context: dict[str, object] | None = None,
+    data_provenance: dict[str, str] | None = None,
 ) -> tuple[RunManifest, dict[str, str]]:
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
-    run = build_run_manifest(config, dataset_id, run_context=run_context)
+    run = build_run_manifest(
+        config,
+        dataset_id,
+        run_context=run_context,
+        data_provenance=data_provenance,
+    )
     metrics = performance_metrics(result.equity_curve["equity"])
+    session_validations = _session_validation_payload(result)
 
     files: dict[str, Path] = {
         "equity_curve.csv": root / "equity_curve.csv",
@@ -67,9 +93,37 @@ def export_research_report(
     run_path.write_text(json.dumps(asdict(run), indent=2, sort_keys=True), encoding="utf-8")
     files[run_path.name] = run_path
 
+    sessions_path = root / "session_validations.json"
+    sessions_path.write_text(
+        json.dumps(session_validations, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    files[sessions_path.name] = sessions_path
+
+    provenance_path = root / "data_provenance.json"
+    provenance_path.write_text(
+        json.dumps(run.data_provenance, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    files[provenance_path.name] = provenance_path
+
     html_path = root / "report.html"
     summary_rows = "".join(
         f"<tr><th>{html.escape(key)}</th><td>{value:.6f}</td></tr>" for key, value in metrics.items()
+    )
+    provenance_rows = "".join(
+        f"<tr><th>{html.escape(key)}</th><td><code>{html.escape(value)}</code></td></tr>"
+        for key, value in sorted(run.data_provenance.items())
+    )
+    session_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(market)}</td>"
+        f"<td>{payload['observed_sessions']}</td>"
+        f"<td>{payload['expected_sessions']}</td>"
+        f"<td>{len(payload['missing_sessions'])}</td>"
+        f"<td>{len(payload['off_calendar_sessions'])}</td>"
+        "</tr>"
+        for market, payload in session_validations.items()
     )
     html_path.write_text(
         "<!doctype html><html><head><meta charset='utf-8'><title>Quant Fund Lab Report</title>"
@@ -80,6 +134,11 @@ def export_research_report(
         f"<h1>Quant Fund Lab Research Report</h1><p>Run ID: <code>{run.run_id}</code></p>"
         f"<p>Dataset ID: <code>{html.escape(dataset_id)}</code></p>"
         f"<h2>Performance</h2><table>{summary_rows}</table>"
+        f"<h2>Data Provenance</h2><table>{provenance_rows}</table>"
+        "<h2>Market Session Validation</h2><table>"
+        "<tr><th>Market</th><th>Observed</th><th>Expected</th>"
+        "<th>Missing</th><th>Off-calendar</th></tr>"
+        f"{session_rows}</table>"
         f"<h2>Latest Regimes</h2>{result.regimes.tail(20).to_html()}"
         f"<h2>Latest Weights</h2>{result.weights.tail(20).to_html()}"
         "</body></html>",
@@ -94,7 +153,7 @@ def export_research_report(
         ).encode("utf-8")
     ).hexdigest()
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "report_id": report_id,
         "run_id": run.run_id,
         "dataset_id": dataset_id,
