@@ -36,6 +36,8 @@ def historical_vs_paper_replay(
         open=data.open.iloc[:split],
         close=data.close.iloc[:split],
         volume=data.volume.iloc[:split],
+        raw_open=data.raw_open.iloc[:split] if data.raw_open is not None else None,
+        raw_close=data.raw_close.iloc[:split] if data.raw_close is not None else None,
         reference=data.reference.iloc[:split] if data.reference is not None else None,
         membership=data.membership.iloc[:split] if data.membership is not None else None,
         terminal_returns=(
@@ -53,6 +55,8 @@ def historical_vs_paper_replay(
         open=data.open.iloc[paper_start:],
         close=data.close.iloc[paper_start:],
         volume=data.volume.iloc[paper_start:],
+        raw_open=data.raw_open.iloc[paper_start:] if data.raw_open is not None else None,
+        raw_close=data.raw_close.iloc[paper_start:] if data.raw_close is not None else None,
         reference=data.reference.iloc[paper_start:] if data.reference is not None else None,
         membership=data.membership.iloc[paper_start:] if data.membership is not None else None,
         terminal_returns=(

@@ -137,6 +137,8 @@ if run:
                 open=raw.open[trade_symbols],
                 close=raw.close[trade_symbols],
                 volume=raw.volume[trade_symbols],
+                raw_open=raw.raw_open[trade_symbols] if raw.raw_open is not None else None,
+                raw_close=raw.raw_close[trade_symbols] if raw.raw_close is not None else None,
                 reference=raw.reference[trade_symbols] if raw.reference is not None else None,
                 membership=raw.membership[trade_symbols] if raw.membership is not None else None,
                 terminal_returns=(

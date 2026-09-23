@@ -56,6 +56,8 @@ def save_market_data_snapshot(
         "open": data.open,
         "close": data.close,
         "volume": data.volume,
+        "raw_open": data.raw_open,
+        "raw_close": data.raw_close,
         "reference": data.reference,
         "membership": data.membership,
         "terminal_returns": data.terminal_returns,
@@ -73,7 +75,7 @@ def save_market_data_snapshot(
         file_hashes[path.name] = _sha256(path)
 
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "exchange": data.exchange,
         "base_currency": data.base_currency,
         "symbols": data.symbols,
@@ -100,7 +102,8 @@ def save_market_data_snapshot(
 def load_market_data_snapshot(directory: str | Path) -> MarketData:
     root = Path(directory)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != 2:
+    schema_version = manifest.get("schema_version")
+    if schema_version not in {2, 3}:
         raise ValueError("unsupported snapshot schema version")
     files: dict[str, str] = manifest["files"]
     required = {"open.parquet", "close.parquet", "volume.parquet"}
@@ -123,6 +126,8 @@ def load_market_data_snapshot(directory: str | Path) -> MarketData:
         open=read("open"),
         close=read("close"),
         volume=read("volume"),
+        raw_open=read("raw_open") if schema_version >= 3 else None,
+        raw_close=read("raw_close") if schema_version >= 3 else None,
         reference=read("reference"),
         membership=read("membership"),
         terminal_returns=read("terminal_returns"),

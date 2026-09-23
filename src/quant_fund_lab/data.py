@@ -12,6 +12,8 @@ class MarketData:
     open: pd.DataFrame
     close: pd.DataFrame
     volume: pd.DataFrame
+    raw_open: pd.DataFrame | None = None
+    raw_close: pd.DataFrame | None = None
     reference: pd.DataFrame | None = None
     membership: pd.DataFrame | None = None
     terminal_returns: pd.DataFrame | None = None
@@ -31,6 +33,13 @@ class MarketData:
             raise ValueError("open and close symbols must align")
         if not self.volume.index.equals(self.close.index) or list(self.volume.columns) != list(self.close.columns):
             raise ValueError("volume must align with close")
+        if self.raw_open is None:
+            object.__setattr__(self, "raw_open", self.open.copy())
+        if self.raw_close is None:
+            object.__setattr__(self, "raw_close", self.close.copy())
+        for name, frame in {"raw_open": self.raw_open, "raw_close": self.raw_close}.items():
+            if frame is None or not frame.index.equals(self.close.index) or list(frame.columns) != list(self.close.columns):
+                raise ValueError(f"{name} must align with close")
         if self.reference is None:
             object.__setattr__(self, "reference", self.close.shift(1))
         elif not self.reference.index.equals(self.close.index) or list(self.reference.columns) != list(self.close.columns):
@@ -96,6 +105,8 @@ class MarketData:
             open=self.open.loc[start:end],
             close=self.close.loc[start:end],
             volume=self.volume.loc[start:end],
+            raw_open=self.raw_open.loc[start:end] if self.raw_open is not None else None,
+            raw_close=self.raw_close.loc[start:end] if self.raw_close is not None else None,
             reference=self.reference.loc[start:end] if self.reference is not None else None,
             membership=self.membership.loc[start:end] if self.membership is not None else None,
             terminal_returns=(
@@ -200,6 +211,8 @@ def download_yahoo(
         open=open_px,
         close=close_px,
         volume=volume,
+        raw_open=raw_open.loc[valid],
+        raw_close=raw_close.loc[valid].ffill(),
         reference=reference,
         membership=membership,
         dividends=dividends,
@@ -238,6 +251,8 @@ def synthetic_market_data(
         open=pd.DataFrame(open_px, index=dates),
         close=pd.DataFrame(close, index=dates),
         volume=pd.DataFrame(volume, index=dates),
+        raw_open=pd.DataFrame(open_px, index=dates),
+        raw_close=pd.DataFrame(close, index=dates),
         reference=pd.DataFrame(close, index=dates).shift(1),
         membership=pd.DataFrame(True, index=dates, columns=symbols, dtype=bool),
         exchange=None,

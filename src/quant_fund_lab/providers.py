@@ -57,6 +57,8 @@ def _subset_market_data(data: MarketData, symbols: list[str], start: str, end: s
         open=data.open.loc[index, symbols],
         close=data.close.loc[index, symbols],
         volume=data.volume.loc[index, symbols],
+        raw_open=subset(data.raw_open),
+        raw_close=subset(data.raw_close),
         reference=subset(data.reference),
         membership=subset(data.membership),
         terminal_returns=subset(data.terminal_returns),
