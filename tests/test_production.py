@@ -147,6 +147,8 @@ def test_report_export_is_hash_verifiable(tmp_path):
     assert "data_provenance.json" in hashes
     assert "dividend_tax_summary.json" in hashes
     assert "dividend_tax_by_currency.csv" in hashes
+    assert "cash_in_lieu_summary.json" in hashes
+    assert "cash_in_lieu_by_source.csv" in hashes
     sessions = json.loads((root / "session_validations.json").read_text(encoding="utf-8"))
     assert "US" in sessions
     assert {
@@ -168,8 +170,13 @@ def test_report_export_is_hash_verifiable(tmp_path):
         "net_dividend_cash": 0.0,
         "withholding_tax": 0.0,
     }
+    cash_in_lieu_summary = json.loads(
+        (root / "cash_in_lieu_summary.json").read_text(encoding="utf-8")
+    )
+    assert cash_in_lieu_summary["fractional_split_event_count"] == 0
+    assert cash_in_lieu_summary["cash_in_lieu_cash"] == 0.0
     report_manifest = json.loads((root / "report_manifest.json").read_text(encoding="utf-8"))
-    assert report_manifest["schema_version"] == 3
+    assert report_manifest["schema_version"] == 4
     manifest_payload = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest_payload["data_provenance"]["security_lifecycle_dataset_id"] == "life-test"
     assert verify_research_report(root)

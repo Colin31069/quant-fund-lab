@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from quant_fund_lab.analytics import buy_and_hold_equity, metric_frame
+from quant_fund_lab.cash_in_lieu_analytics import cash_in_lieu_by_source, summarize_cash_in_lieu
 from quant_fund_lab.config import (
     BacktestConfig,
     DividendWithholdingConfig,
@@ -480,6 +481,23 @@ if run:
         tax_currency = dividend_tax_by_currency(comparison.paper_replay.corporate_actions)
         if not tax_currency.empty:
             st.dataframe(tax_currency, use_container_width=True)
+
+        cil_summary = summarize_cash_in_lieu(comparison.paper_replay.corporate_actions)
+        st.subheader("M10-6 Cash-in-Lieu Settlement")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Fractional splits", str(int(cil_summary["fractional_split_event_count"])))
+        c2.metric("Delayed", str(int(cil_summary["delayed_receivable_count"])))
+        c3.metric("Fallback", str(int(cil_summary["raw_open_fallback_count"])))
+        c4.metric("Settled cash", f"{float(cil_summary['cash_in_lieu_cash']):,.2f}")
+        st.caption(
+            "Settlement lag：avg "
+            f"{float(cil_summary['average_settlement_lag_days']):.1f} days；max "
+            f"{float(cil_summary['max_settlement_lag_days']):.1f} days；"
+            f"unresolved {int(cil_summary['unresolved_receivable_count'])}。"
+        )
+        cil_sources = cash_in_lieu_by_source(comparison.paper_replay.corporate_actions)
+        if not cil_sources.empty:
+            st.dataframe(cil_sources, use_container_width=True)
 
         fig = go.Figure()
         bt = comparison.backtest.equity_curve["equity"]
