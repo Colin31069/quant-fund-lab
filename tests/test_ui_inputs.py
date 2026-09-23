@@ -1,5 +1,10 @@
 import pandas as pd
+import pytest
 
+from quant_fund_lab.cash_in_lieu_data import (
+    CashInLieuSettlementDataset,
+    save_cash_in_lieu_settlement_dataset,
+)
 from quant_fund_lab.data import MarketData
 from quant_fund_lab.security_master_events import (
     SecurityMasterEventDataset,
@@ -30,10 +35,13 @@ def _fixture(tmp_path):
         "SPY": [100.0 + i for i in range(8)],
     }
     close = pd.DataFrame(values, index=dates)
+    splits = pd.DataFrame(0.0, index=dates, columns=symbols)
+    splits.loc[dates[2], "AAA"] = 0.5
     market = MarketData(
         open=close.copy(),
         close=close,
         volume=pd.DataFrame(1_000.0, index=dates, columns=symbols),
+        stock_splits=splits,
         exchange="US",
     )
     market_root = tmp_path / "market"
@@ -81,4 +89,50 @@ def test_verified_ui_inputs_maps_security_ids_and_preserves_provenance(tmp_path)
     assert result.data_provenance == {
         "market_data_dataset_id": market_manifest.dataset_id,
         "security_lifecycle_dataset_id": lifecycle_manifest.dataset_id,
+    }
+
+
+def test_verified_ui_inputs_pass_through_cash_in_lieu_snapshot(tmp_path):
+    dates, market_root, lifecycle_root, market_manifest, lifecycle_manifest = _fixture(tmp_path)
+    settlements = CashInLieuSettlementDataset(
+        pd.DataFrame(
+            [
+                {
+                    "security_id": "us:a",
+                    "split_date": dates[2],
+                    "settlement_date": dates[4],
+                    "settlement_price": 12.5,
+                    "settlement_date_available_at": dates[2],
+                    "settlement_price_available_at": dates[4],
+                    "local_currency": "USD",
+                    "source": "broker-export",
+                }
+            ]
+        )
+    )
+    settlement_root = tmp_path / "settlements"
+    settlement_manifest = save_cash_in_lieu_settlement_dataset(
+        settlements,
+        settlement_root,
+    )
+
+    result = load_verified_ui_inputs(
+        market_root,
+        lifecycle_root,
+        ["us:a", "us:b"],
+        "us:spy",
+        start=dates[1],
+        end=dates[6],
+        base_currency="USD",
+        cash_in_lieu_snapshot_directory=settlement_root,
+    )
+    asset = result.trade_assets[0]
+    assert pd.Timestamp(
+        result.trade_data.cash_in_lieu_settlement_dates.loc[dates[2], asset]
+    ) == dates[4]
+    assert result.trade_data.cash_in_lieu_prices.loc[dates[4], asset] == pytest.approx(12.5)
+    assert result.data_provenance == {
+        "market_data_dataset_id": market_manifest.dataset_id,
+        "security_lifecycle_dataset_id": lifecycle_manifest.dataset_id,
+        "cash_in_lieu_settlement_dataset_id": settlement_manifest.dataset_id,
     }

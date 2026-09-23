@@ -56,7 +56,7 @@ with st.sidebar:
             "Cash-in-lieu settlement snapshot 目錄（選填）", ""
         )
         st.caption(
-            "此模式只接受 stable security_id；兩份 snapshot 都會先做 hash / dataset-ID 驗證。"
+            "此模式只接受 stable security_id；market/lifecycle 與選填 settlement snapshot 都會先做 hash / dataset-ID 驗證。"
         )
     else:
         symbols_text = st.text_input("交易標的", "AAPL,MSFT,NVDA,GOOGL")

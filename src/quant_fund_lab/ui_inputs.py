@@ -60,6 +60,7 @@ def load_verified_ui_inputs(
     start: object,
     end: object,
     base_currency: str,
+    cash_in_lieu_snapshot_directory: str | Path | None = None,
     usd_twd: pd.Series | None = None,
     max_fx_staleness_days: int = 5,
 ) -> VerifiedUIInputs:
@@ -77,6 +78,7 @@ def load_verified_ui_inputs(
         market_snapshot_directory,
         lifecycle_snapshot_directory,
         requested,
+        cash_in_lieu_snapshot_directory=cash_in_lieu_snapshot_directory,
         base_currency=base_currency,
         usd_twd=usd_twd,
         max_fx_staleness_days=max_fx_staleness_days,
