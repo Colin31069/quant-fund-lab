@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from .config import BacktestConfig
+from .corporate_actions import apply_cash_dividend_events, apply_stock_split_events
 from .data import MarketData
 from .execution import (
     Fill,
@@ -102,6 +103,19 @@ class PaperLedger:
                 slippage_cost_local REAL NOT NULL,
                 FOREIGN KEY(order_id) REFERENCES orders(order_id)
             );
+            CREATE TABLE IF NOT EXISTS corporate_actions (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                action TEXT NOT NULL,
+                quantity_before INTEGER NOT NULL,
+                quantity_after INTEGER NOT NULL,
+                ratio_or_amount REAL NOT NULL,
+                cash_value REAL NOT NULL,
+                cash_value_local REAL NOT NULL,
+                fx_to_base REAL NOT NULL,
+                realized_pnl_delta REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS terminal_events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
@@ -191,6 +205,11 @@ class PaperLedger:
 
     def fills(self) -> pd.DataFrame:
         return pd.read_sql_query("SELECT * FROM fills ORDER BY fill_id", self.connection)
+
+    def corporate_actions(self) -> pd.DataFrame:
+        return pd.read_sql_query(
+            "SELECT * FROM corporate_actions ORDER BY event_id", self.connection
+        )
 
     def nav_history(self) -> pd.DataFrame:
         frame = pd.read_sql_query("SELECT * FROM nav ORDER BY timestamp", self.connection)
@@ -350,6 +369,124 @@ class PaperLedger:
         self._set_meta("cash", float(state.cash))
         self.connection.commit()
         return fills
+
+    def ensure_execution_price_basis(self, basis: str) -> None:
+        if basis not in {"adjusted", "raw"}:
+            raise ValueError("execution_price_basis must be 'adjusted' or 'raw'")
+        existing = self._meta_value("execution_price_basis")
+        if existing is None:
+            self._set_meta("execution_price_basis", basis)
+            self.connection.commit()
+        elif str(existing) != basis:
+            raise ValueError("execution_price_basis does not match the existing paper ledger")
+
+    def _record_corporate_action(self, event: object, realized_pnl_delta: float) -> None:
+        self.connection.execute(
+            "INSERT INTO corporate_actions(timestamp, symbol, action, quantity_before, quantity_after, "
+            "ratio_or_amount, cash_value, cash_value_local, fx_to_base, realized_pnl_delta) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                pd.Timestamp(event.timestamp).isoformat(),
+                event.symbol,
+                event.action,
+                event.quantity_before,
+                event.quantity_after,
+                event.ratio_or_amount,
+                event.cash_value,
+                event.cash_value_local,
+                event.fx_to_base,
+                realized_pnl_delta,
+            ),
+        )
+
+    def _rebase_open_orders_for_split(self, symbol: str, ratio: float) -> None:
+        orders = self.connection.execute(
+            "SELECT order_id, requested_qty, remaining_qty FROM orders "
+            "WHERE symbol=? AND status IN ('NEW','PARTIAL')",
+            (symbol,),
+        ).fetchall()
+        for order in orders:
+            requested = max(int(order["requested_qty"] * ratio), 0)
+            remaining = max(int(order["remaining_qty"] * ratio), 0)
+            status = "FILLED" if remaining == 0 else ("PARTIAL" if requested != remaining else "NEW")
+            self.connection.execute(
+                "UPDATE orders SET requested_qty=?, remaining_qty=?, status=? WHERE order_id=?",
+                (requested, remaining, status, int(order["order_id"])),
+            )
+
+    def process_corporate_actions(
+        self,
+        timestamp: pd.Timestamp,
+        stock_splits: pd.Series,
+        dividends: pd.Series,
+        raw_open_prices: pd.Series,
+        fx_to_base: pd.Series | None = None,
+    ) -> int:
+        """Apply raw-basis corporate actions before terminal events and open-order execution."""
+
+        state = self.portfolio_state()
+        processed = 0
+        split_events = apply_stock_split_events(
+            state,
+            stock_splits,
+            raw_open_prices,
+            pd.Timestamp(timestamp),
+            fx_to_base,
+        )
+        for symbol, ratio_value in stock_splits.astype(float).items():
+            ratio = float(ratio_value)
+            if pd.notna(ratio) and ratio > 0.0 and abs(ratio - 1.0) > 1e-12:
+                self._rebase_open_orders_for_split(symbol, ratio)
+        for event in split_events:
+            row = self._position_row(event.symbol)
+            prior_avg = float(row["avg_cost_base"]) if row is not None else 0.0
+            prior_realized = float(row["realized_pnl_base"]) if row is not None else 0.0
+            new_avg = prior_avg / event.ratio_or_amount if event.quantity_after > 0 else 0.0
+            exact_after = event.quantity_before * event.ratio_or_amount
+            fractional = max(exact_after - event.quantity_after, 0.0)
+            realized_delta = event.cash_value - fractional * new_avg
+            self.connection.execute(
+                "INSERT INTO positions(symbol, quantity, avg_cost_base, realized_pnl_base) "
+                "VALUES(?, ?, ?, ?) ON CONFLICT(symbol) DO UPDATE SET "
+                "quantity=excluded.quantity, avg_cost_base=excluded.avg_cost_base, "
+                "realized_pnl_base=excluded.realized_pnl_base",
+                (
+                    event.symbol,
+                    event.quantity_after,
+                    float(new_avg),
+                    float(prior_realized + realized_delta),
+                ),
+            )
+            self._record_corporate_action(event, realized_delta)
+            processed += 1
+
+        dividend_events = apply_cash_dividend_events(
+            state,
+            dividends,
+            pd.Timestamp(timestamp),
+            fx_to_base,
+        )
+        for event in dividend_events:
+            row = self._position_row(event.symbol)
+            prior_avg = float(row["avg_cost_base"]) if row is not None else 0.0
+            prior_realized = float(row["realized_pnl_base"]) if row is not None else 0.0
+            self.connection.execute(
+                "INSERT INTO positions(symbol, quantity, avg_cost_base, realized_pnl_base) "
+                "VALUES(?, ?, ?, ?) ON CONFLICT(symbol) DO UPDATE SET "
+                "quantity=excluded.quantity, avg_cost_base=excluded.avg_cost_base, "
+                "realized_pnl_base=excluded.realized_pnl_base",
+                (
+                    event.symbol,
+                    event.quantity_after,
+                    prior_avg,
+                    float(prior_realized + event.cash_value),
+                ),
+            )
+            self._record_corporate_action(event, event.cash_value)
+            processed += 1
+        self._set_meta("cash", float(state.cash))
+        self.connection.commit()
+        return processed
 
     def process_terminal_returns(
         self,
@@ -535,35 +672,58 @@ def replay_targets_persistently(
         base_currency=base_currency,
         reset=reset,
     )
+    ledger.ensure_execution_price_basis(config.execution_price_basis)
+    if config.execution_price_basis == "raw":
+        if data.raw_open is None or data.raw_close is None:
+            ledger.close()
+            raise ValueError("raw persistent replay requires raw_open/raw_close")
+        execution_open = data.raw_open
+        valuation_close = data.raw_close
+        execution_reference = valuation_close.shift(1)
+    elif config.execution_price_basis == "adjusted":
+        execution_open = data.open
+        valuation_close = data.close
+        execution_reference = data.reference
+    else:
+        ledger.close()
+        raise ValueError("execution_price_basis must be 'adjusted' or 'raw'")
     first_signal = pd.Timestamp(target_weights.index.min())
     dates = data.close.index[data.close.index >= first_signal]
     for timestamp in dates:
         fx = data.fx_to_base.loc[timestamp] if data.fx_to_base is not None else None
+        if config.execution_price_basis == "raw":
+            ledger.process_corporate_actions(
+                timestamp,
+                data.stock_splits.loc[timestamp],
+                data.dividends.loc[timestamp],
+                execution_open.loc[timestamp],
+                fx,
+            )
         ledger.process_terminal_returns(
             timestamp,
             data.terminal_returns.loc[timestamp],
-            data.reference.loc[timestamp],
+            execution_reference.loc[timestamp],
             fx,
         )
         ledger.process_open(
             timestamp,
-            data.open.loc[timestamp],
+            execution_open.loc[timestamp],
             data.volume.loc[timestamp],
-            data.reference.loc[timestamp],
+            execution_reference.loc[timestamp],
             config,
             fx,
         )
         benchmark_value = None
         if benchmark_close_base is not None and timestamp in benchmark_close_base.index:
             benchmark_value = float(benchmark_close_base.loc[timestamp])
-        ledger.mark_close(timestamp, data.close.loc[timestamp], fx, benchmark_value)
+        ledger.mark_close(timestamp, valuation_close.loc[timestamp], fx, benchmark_value)
         if snapshot_root is not None:
             ledger.record_snapshot(timestamp, data, snapshot_root)
         if timestamp in target_weights.index:
             ledger.submit_target_orders(
                 timestamp,
                 target_weights.loc[timestamp].reindex(data.symbols).fillna(0.0),
-                data.close.loc[timestamp],
+                valuation_close.loc[timestamp],
                 config,
                 fx,
             )

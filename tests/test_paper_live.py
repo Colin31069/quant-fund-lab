@@ -2,7 +2,7 @@ import pandas as pd
 import pytest
 
 from quant_fund_lab.config import BacktestConfig, MarketCostConfig, StrategyConfig
-from quant_fund_lab.data import synthetic_market_data
+from quant_fund_lab.data import MarketData, synthetic_market_data
 from quant_fund_lab.paper_live import PaperLedger, replay_targets_persistently
 
 
@@ -88,6 +88,77 @@ def test_mark_close_persists_pnl_benchmark_and_reconciles(tmp_path):
         assert history.iloc[-1]["benchmark_equity"] == pytest.approx(100_000.0)
 
 
+def test_paper_ledger_raw_corporate_actions_adjust_cost_basis_and_realized_pnl(tmp_path):
+    config = BacktestConfig(
+        initial_cash=10_000.0,
+        base_currency="USD",
+        execution_price_basis="raw",
+        strategy=StrategyConfig(warmup_days=20),
+        us_costs=MarketCostConfig(
+            commission_bps=0.0,
+            sec_fee_per_million=0.0,
+            slippage_bps=0.0,
+            impact_coefficient=0.0,
+            max_participation=1.0,
+            lot_size=1,
+        ),
+    )
+    path = tmp_path / "raw.sqlite"
+    with PaperLedger(path, 10_000.0, "USD", reset=True) as ledger:
+        ledger.ensure_execution_price_basis("raw")
+        ledger.submit_target_orders(
+            pd.Timestamp("2026-01-02"),
+            pd.Series({"AAA": 0.10}),
+            pd.Series({"AAA": 100.0}),
+            config,
+        )
+        ledger.process_open(
+            pd.Timestamp("2026-01-05"),
+            pd.Series({"AAA": 100.0}),
+            pd.Series({"AAA": 100_000.0}),
+            pd.Series({"AAA": 100.0}),
+            config,
+        )
+        before = ledger.positions().loc["AAA"]
+        assert int(before["quantity"]) == 10
+        assert before["avg_cost_base"] == pytest.approx(100.0)
+        ledger.process_corporate_actions(
+            pd.Timestamp("2026-01-06"),
+            pd.Series({"AAA": 2.0}),
+            pd.Series({"AAA": 1.0}),
+            pd.Series({"AAA": 50.0}),
+        )
+        after = ledger.positions().loc["AAA"]
+        assert int(after["quantity"]) == 20
+        assert after["avg_cost_base"] == pytest.approx(50.0)
+        assert after["realized_pnl_base"] == pytest.approx(20.0)
+        assert ledger.cash == pytest.approx(9_020.0)
+        actions = ledger.corporate_actions()
+        assert list(actions["action"]) == ["stock_split", "cash_dividend"]
+
+
+def test_split_rebases_persistent_open_order_quantity(tmp_path):
+    config = _low_participation_config()
+    path = tmp_path / "orders.sqlite"
+    with PaperLedger(path, 100_000.0, "USD", reset=True) as ledger:
+        ledger.ensure_execution_price_basis("raw")
+        ledger.submit_target_orders(
+            pd.Timestamp("2026-01-02"),
+            pd.Series({"AAA": 0.5}),
+            pd.Series({"AAA": 100.0}),
+            config,
+        )
+        before = ledger.orders().iloc[0]
+        ledger.process_corporate_actions(
+            pd.Timestamp("2026-01-05"),
+            pd.Series({"AAA": 2.0}),
+            pd.Series({"AAA": 0.0}),
+            pd.Series({"AAA": 50.0}),
+        )
+        after = ledger.orders().iloc[0]
+        assert int(after["remaining_qty"]) == int(before["remaining_qty"]) * 2
+
+
 def test_persistent_replay_records_daily_snapshots_and_nav(tmp_path):
     data = synthetic_market_data(symbols=("AAA", "BBB"), periods=90, seed=14)
     config = BacktestConfig(
@@ -115,5 +186,50 @@ def test_persistent_replay_records_daily_snapshots_and_nav(tmp_path):
         assert nav["equity"].gt(0.0).all()
         assert nav["reconciliation_error"].abs().max() < 1e-8
         assert not ledger.fills().empty
+    finally:
+        ledger.close()
+
+
+def test_raw_persistent_replay_records_corporate_action_events(tmp_path):
+    data = synthetic_market_data(symbols=("AAA", "BBB"), periods=90, seed=24)
+    dates = data.close.index
+    raw_open = data.open.copy()
+    raw_close = data.close.copy()
+    split_date = dates[55]
+    raw_open.loc[: dates[54], "AAA"] *= 2.0
+    raw_close.loc[: dates[54], "AAA"] *= 2.0
+    splits = data.stock_splits.copy()
+    splits.loc[split_date, "AAA"] = 2.0
+    dividends = data.dividends.copy()
+    dividends.loc[dates[65], "AAA"] = 0.5
+    raw_data = MarketData(
+        open=data.open,
+        close=data.close,
+        raw_open=raw_open,
+        raw_close=raw_close,
+        volume=data.volume,
+        membership=data.membership,
+        stock_splits=splits,
+        dividends=dividends,
+    )
+    config = BacktestConfig(
+        initial_cash=250_000.0,
+        execution_price_basis="raw",
+        strategy=StrategyConfig(warmup_days=20, rebalance_every=5, max_weight=0.6),
+    )
+    signals = dates[30:75:10]
+    targets = pd.DataFrame([{"AAA": 0.5, "BBB": 0.4} for _ in signals], index=signals)
+    ledger = replay_targets_persistently(
+        raw_data,
+        targets,
+        config,
+        tmp_path / "raw-replay.sqlite",
+        reset=True,
+    )
+    try:
+        actions = ledger.corporate_actions()
+        assert not actions.empty
+        assert "stock_split" in set(actions["action"])
+        assert ledger.nav_history()["reconciliation_error"].abs().max() < 1e-8
     finally:
         ledger.close()

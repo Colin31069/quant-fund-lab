@@ -44,6 +44,12 @@ with st.sidebar:
         value=1_000_000.0,
         step=100_000.0,
     )
+    execution_price_basis = st.selectbox(
+        "成交/持倉價格基準",
+        ["adjusted", "raw"],
+        index=0,
+        help="adjusted 維持總報酬價格；raw 會另行入帳 split/dividend corporate actions。",
+    )
     max_weight = st.slider("單一標的最大權重", 0.05, 0.50, 0.25, 0.05)
     rebalance_every = st.slider("再平衡頻率（交易日）", 1, 20, 5)
     train_fraction = st.slider("回測 / paper replay 切分", 0.55, 0.90, 0.70, 0.05)
@@ -172,6 +178,7 @@ if run:
             config = BacktestConfig(
                 initial_cash=initial_cash,
                 base_currency=base_currency,
+                execution_price_basis=execution_price_basis,
                 strategy=strategy,
             )
             comparison = historical_vs_paper_replay(trade_data, config, train_fraction=train_fraction)
@@ -253,6 +260,7 @@ if run:
             persistent_fills = None
             persistent_positions = None
             persistent_snapshots = None
+            persistent_actions = None
             if persist_paper_ledger:
                 ledger = replay_targets_persistently(
                     trade_data,
@@ -269,6 +277,7 @@ if run:
                     persistent_fills = ledger.fills()
                     persistent_positions = ledger.positions()
                     persistent_snapshots = ledger.snapshots()
+                    persistent_actions = ledger.corporate_actions()
                 finally:
                     ledger.close()
 
@@ -461,8 +470,14 @@ if run:
                 "SQLite: artifacts/paper_trading.sqlite；每日可重現 market snapshots: "
                 "artifacts/paper_snapshots/。未成交數量會保持 NEW/PARTIAL 並在後續交易日重試。"
             )
-            pt1, pt2, pt3, pt4 = st.tabs(
-                ["Persistent Orders", "Persistent Fills", "Positions", "Daily Snapshots"]
+            pt1, pt2, pt3, pt4, pt5 = st.tabs(
+                [
+                    "Persistent Orders",
+                    "Persistent Fills",
+                    "Positions",
+                    "Corporate Actions",
+                    "Daily Snapshots",
+                ]
             )
             with pt1:
                 st.dataframe(persistent_orders, use_container_width=True, height=300)
@@ -471,6 +486,8 @@ if run:
             with pt3:
                 st.dataframe(persistent_positions, use_container_width=True, height=300)
             with pt4:
+                st.dataframe(persistent_actions, use_container_width=True, height=300)
+            with pt5:
                 st.dataframe(persistent_snapshots, use_container_width=True, height=300)
 
         if robustness is not None:
