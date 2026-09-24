@@ -280,6 +280,33 @@ def test_raw_backtest_marks_delayed_cash_in_lieu_receivable_until_settlement():
     assert result.equity_curve.loc[settlement_date, "receivable_value"] == pytest.approx(0.0)
 
 
+def test_raw_backtest_cash_yield_does_not_accrue_on_pending_receivable():
+    data = _raw_split_market_data(
+        split_ratio=0.4,
+        cash_in_lieu_price=61.25,
+        settlement_delay=2,
+    )
+    config = BacktestConfig(
+        initial_cash=100_000.0,
+        cash_annual_yield=0.08,
+        execution_price_basis="raw",
+        strategy=StrategyConfig(
+            warmup_days=30,
+            rebalance_every=5,
+            max_weight=0.8,
+            regime_enabled=False,
+            factor_neutralization=False,
+            risk_aversion=0.2,
+        ),
+    )
+    result = run_backtest(data, config)
+    equity = result.equity_curve
+    assert equity["receivable_value"].gt(0.0).any()
+    for previous, current in zip(equity.index[:-1], equity.index[1:]):
+        expected = equity.at[previous, "cash"] * 0.08 * (current - previous).days / 365.0
+        assert equity.at[current, "cash_interest"] == pytest.approx(expected)
+
+
 def test_raw_backtest_applies_configured_dividend_withholding():
     data = _raw_split_market_data()
     config = BacktestConfig(

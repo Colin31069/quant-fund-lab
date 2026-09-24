@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 import numpy as np
 import pandas as pd
 
+from .cash_carry import accrue_base_cash_interest
 from .config import BacktestConfig
 from .corporate_actions import (
     CashInLieuReceivable,
@@ -167,6 +168,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
             "equity": config.initial_cash,
             "cash": state.cash,
             "receivable_value": 0.0,
+            "cash_interest": 0.0,
         }
     )
 
@@ -203,6 +205,12 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         signal_equity = state.equity(close_now, fx_signal)
         running_peak = max(running_peak, signal_equity)
         current_drawdown = max(0.0, 1.0 - signal_equity / max(running_peak, 1e-12))
+        cash_interest = accrue_base_cash_interest(
+            state,
+            pd.Timestamp(signal_date),
+            pd.Timestamp(execution_date),
+            config.cash_annual_yield,
+        )
         if config.execution_price_basis == "raw":
             settlement_events = settle_cash_in_lieu_receivables(
                 state,
@@ -408,6 +416,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                 "equity": state.equity(close_next, fx_next),
                 "cash": state.cash,
                 "receivable_value": state.receivable_value,
+                "cash_interest": cash_interest,
             }
         )
 

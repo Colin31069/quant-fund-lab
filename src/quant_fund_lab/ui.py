@@ -74,6 +74,17 @@ with st.sidebar:
         value=1_000_000.0,
         step=100_000.0,
     )
+    cash_annual_yield_pct = st.number_input(
+        "閒置現金年收益假設（%）",
+        min_value=0.0,
+        max_value=100.0,
+        value=0.0,
+        step=0.5,
+    )
+    st.caption(
+        "M11-1：僅對基準幣別可支用現金以 ACT/365 計息；"
+        "非零收益率尚不支援 persistent SQLite ledger。"
+    )
     execution_price_basis = st.selectbox(
         "成交/持倉價格基準",
         ["adjusted", "raw"],
@@ -142,6 +153,9 @@ def load_data(
 
 
 if run:
+    if persist_paper_ledger and cash_annual_yield_pct > 0.0:
+        st.error("非零現金收益率尚不支援 persistent SQLite ledger；請先取消該選項。")
+        st.stop()
     requested_trade_assets = [
         s.strip() if verified_mode else s.strip().upper()
         for s in symbols_text.split(",")
@@ -269,6 +283,7 @@ if run:
             )
             config = BacktestConfig(
                 initial_cash=initial_cash,
+                cash_annual_yield=float(cash_annual_yield_pct) / 100.0,
                 base_currency=base_currency,
                 execution_price_basis=execution_price_basis,
                 dividend_withholding=DividendWithholdingConfig(
@@ -469,6 +484,12 @@ if run:
             st.dataframe(comparison_frame, use_container_width=True)
 
         tax_summary = summarize_dividend_tax(comparison.paper_replay.corporate_actions)
+        st.caption(
+            "M11-1 現金收益（paper replay）："
+            f"{float(comparison.paper_replay.equity_curve['cash_interest'].sum()):,.2f} "
+            f"{comparison.paper_replay.base_currency}；"
+            f"設定年收益率 {float(config.cash_annual_yield):.2%}。"
+        )
         st.subheader("M9-3 Dividend Tax Drag")
         t1, t2, t3, t4 = st.columns(4)
         t1.metric("Gross dividend", f"{float(tax_summary['gross_dividend_cash']):,.2f}")

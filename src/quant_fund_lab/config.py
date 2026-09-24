@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 
@@ -94,3 +95,9 @@ class BacktestConfig:
             price_limit_pct=0.10,
         )
     )
+    cash_annual_yield: float = 0.0
+
+    def __post_init__(self) -> None:
+        rate = float(self.cash_annual_yield)
+        if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+            raise ValueError("cash_annual_yield must be finite and between 0 and 1")

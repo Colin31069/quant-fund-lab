@@ -67,6 +67,12 @@ def export_research_report(
     session_validations = _session_validation_payload(result)
     dividend_tax = summarize_dividend_tax(result.corporate_actions)
     dividend_tax_currency = dividend_tax_by_currency(result.corporate_actions)
+    interest_series = result.equity_curve.get("cash_interest", pd.Series(dtype=float))
+    cash_carry = {
+        "annual_yield_assumption": float(config.cash_annual_yield),
+        "interest_credited_base": float(interest_series.sum()),
+        "interest_credit_sessions": int(interest_series.gt(0.0).sum()),
+    }
     cash_in_lieu = summarize_cash_in_lieu(result.corporate_actions)
     cash_in_lieu_sources = cash_in_lieu_by_source(result.corporate_actions)
 
@@ -106,6 +112,13 @@ def export_research_report(
     )
     files[dividend_tax_path.name] = dividend_tax_path
 
+    cash_carry_path = root / "cash_carry_summary.json"
+    cash_carry_path.write_text(
+        json.dumps(cash_carry, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    files[cash_carry_path.name] = cash_carry_path
+
     cash_in_lieu_path = root / "cash_in_lieu_summary.json"
     cash_in_lieu_path.write_text(
         json.dumps(cash_in_lieu, indent=2, sort_keys=True),
@@ -143,6 +156,10 @@ def export_research_report(
         f"<tr><th>{html.escape(key)}</th><td>{float(value):.6f}</td></tr>"
         for key, value in cash_in_lieu.items()
     )
+    cash_carry_rows = "".join(
+        f"<tr><th>{html.escape(key)}</th><td>{float(value):.6f}</td></tr>"
+        for key, value in cash_carry.items()
+    )
     provenance_rows = "".join(
         f"<tr><th>{html.escape(key)}</th><td><code>{html.escape(value)}</code></td></tr>"
         for key, value in sorted(run.data_provenance.items())
@@ -168,6 +185,7 @@ def export_research_report(
         f"<h2>Performance</h2><table>{summary_rows}</table>"
         f"<h2>Dividend Tax Drag</h2><table>{dividend_tax_rows}</table>"
         f"<h2>Cash-in-Lieu Settlement</h2><table>{cash_in_lieu_rows}</table>"
+        f"<h2>Cash Carry ({html.escape(result.base_currency)})</h2><table>{cash_carry_rows}</table>"
         f"<h2>Data Provenance</h2><table>{provenance_rows}</table>"
         "<h2>Market Session Validation</h2><table>"
         "<tr><th>Market</th><th>Observed</th><th>Expected</th>"
@@ -187,7 +205,7 @@ def export_research_report(
         ).encode("utf-8")
     ).hexdigest()
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "report_id": report_id,
         "run_id": run.run_id,
         "dataset_id": dataset_id,

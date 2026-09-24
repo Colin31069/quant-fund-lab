@@ -985,6 +985,10 @@ def replay_targets_persistently(
 
     if target_weights.empty:
         raise ValueError("target_weights cannot be empty")
+    if config.cash_annual_yield != 0.0:
+        raise ValueError(
+            "nonzero cash_annual_yield is not supported by persistent replay until M11-2"
+        )
     required_metadata = data.membership.fillna(False) | data.terminal_returns.notna()
     if data.market_codes is not None and bool(
         (required_metadata & data.market_codes.isna()).any().any()

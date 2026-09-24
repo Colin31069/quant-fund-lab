@@ -74,6 +74,14 @@ def test_run_id_is_deterministic_and_config_sensitive():
         BacktestConfig(strategy=StrategyConfig(risk_aversion=8.0)), "dataset-123"
     )
     assert same != changed
+    cash_sensitive = deterministic_run_id(
+        BacktestConfig(
+            strategy=StrategyConfig(risk_aversion=4.0),
+            cash_annual_yield=0.05,
+        ),
+        "dataset-123",
+    )
+    assert cash_sensitive != same
     contextual = deterministic_run_id(config, "dataset-123", run_context={"split": 0.7})
     assert contextual != deterministic_run_id(config, "dataset-123", run_context={"split": 0.8})
     manifest = build_run_manifest(config, "dataset-123")
@@ -149,6 +157,7 @@ def test_report_export_is_hash_verifiable(tmp_path):
     assert "dividend_tax_by_currency.csv" in hashes
     assert "cash_in_lieu_summary.json" in hashes
     assert "cash_in_lieu_by_source.csv" in hashes
+    assert "cash_carry_summary.json" in hashes
     sessions = json.loads((root / "session_validations.json").read_text(encoding="utf-8"))
     assert "US" in sessions
     assert {
@@ -175,8 +184,16 @@ def test_report_export_is_hash_verifiable(tmp_path):
     )
     assert cash_in_lieu_summary["fractional_split_event_count"] == 0
     assert cash_in_lieu_summary["cash_in_lieu_cash"] == 0.0
+    cash_carry = json.loads(
+        (root / "cash_carry_summary.json").read_text(encoding="utf-8")
+    )
+    assert cash_carry == {
+        "annual_yield_assumption": 0.0,
+        "interest_credited_base": 0.0,
+        "interest_credit_sessions": 0,
+    }
     report_manifest = json.loads((root / "report_manifest.json").read_text(encoding="utf-8"))
-    assert report_manifest["schema_version"] == 4
+    assert report_manifest["schema_version"] == 5
     manifest_payload = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest_payload["data_provenance"]["security_lifecycle_dataset_id"] == "life-test"
     assert verify_research_report(root)
