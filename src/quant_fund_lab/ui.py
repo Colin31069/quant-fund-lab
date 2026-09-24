@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -20,6 +21,7 @@ from quant_fund_lab.factors import research_factors
 from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
 from quant_fund_lab.paper import historical_vs_paper_replay
 from quant_fund_lab.paper_live import replay_targets_persistently
+from quant_fund_lab.paper_workflow import plan_persistent_paper_run
 from quant_fund_lab.provenance import AuditLog, build_run_manifest
 from quant_fund_lab.providers import SnapshotProvider, YahooProvider, load_with_failover
 from quant_fund_lab.reporting import export_research_report, verify_research_report
@@ -114,7 +116,38 @@ with st.sidebar:
         "Risk-budget penalty", 0.0, 0.010, 0.001, 0.001, format="%.3f"
     )
     st.markdown("**M3 Persistent Paper Trading**")
-    persist_paper_ledger = st.checkbox("建立本機 persistent paper ledger", value=False)
+    persist_paper_ledger = st.checkbox("啟用本機 persistent paper ledger", value=False)
+    paper_ledger_path = Path("artifacts/paper_trading.sqlite")
+    paper_snapshot_root = Path("artifacts/paper_snapshots")
+    paper_ledger_mode = "continue"
+    paper_confirm_rebuild = False
+    if persist_paper_ledger:
+        existing_paper_ledger = paper_ledger_path.is_file()
+        paper_ledger_mode = st.radio(
+            "虛擬帳本操作",
+            ["continue", "rebuild"],
+            index=0 if existing_paper_ledger else 1,
+            format_func=lambda mode: (
+                "安全續跑現有帳本（不得覆寫）"
+                if mode == "continue"
+                else "建立新帳本（可能覆寫原始交易紀錄）"
+            ),
+        )
+        if paper_ledger_mode == "continue":
+            st.caption(
+                "續跑前核對舊交易日的價格、FX、目標權重、成交設定和 snapshot；"
+                "不一致時停止，不會自動清除 SQLite。"
+            )
+        else:
+            st.caption(
+                "新建模式會重設 SQLite 並覆寫相同日期的 snapshots。"
+                "若已有帳本，請先備份整個 artifacts/paper_trading.sqlite "
+                "及 artifacts/paper_snapshots/。"
+            )
+            if existing_paper_ledger:
+                paper_confirm_rebuild = st.checkbox(
+                    "我已備份或明確接受既有虛擬交易紀錄被覆寫"
+                )
     st.markdown("**M4 Production Hardening**")
     export_verifiable_report = st.checkbox("匯出可驗證研究報告", value=False)
     st.markdown("**M5 Factor Laboratory**")
@@ -163,6 +196,17 @@ if run:
     if len(requested_trade_assets) < 2:
         st.error("至少提供兩個交易標的，橫斷面模型才有意義。")
         st.stop()
+    paper_ledger_reset = True
+    if persist_paper_ledger:
+        try:
+            paper_ledger_reset = plan_persistent_paper_run(
+                paper_ledger_path,
+                paper_ledger_mode,
+                confirmed_rebuild=paper_confirm_rebuild,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            st.error(f"虛擬帳本操作已取消：{exc}")
+            st.stop()
 
     try:
         with st.spinner("載入資料並執行 walk-forward paper replay..."):
@@ -383,15 +427,22 @@ if run:
             persistent_session_commits = None
             persistent_replay_execution_config = None
             if persist_paper_ledger:
-                ledger = replay_targets_persistently(
-                    trade_data,
-                    comparison.paper_replay.weights,
-                    config,
-                    "artifacts/paper_trading.sqlite",
-                    snapshot_root="artifacts/paper_snapshots",
-                    benchmark_close_base=benchmark_close_base,
-                    reset=True,
-                )
+                try:
+                    ledger = replay_targets_persistently(
+                        trade_data,
+                        comparison.paper_replay.weights,
+                        config,
+                        paper_ledger_path,
+                        snapshot_root=paper_snapshot_root,
+                        benchmark_close_base=benchmark_close_base,
+                        reset=paper_ledger_reset,
+                    )
+                except (FileNotFoundError, ValueError) as exc:
+                    st.error(
+                        f"虛擬帳本未變更：{exc}。安全續跑需要完整且相同的既有"
+                        "市場資料、訊號、交易參數與快照；如需重建請先備份，再明確選擇新建。"
+                    )
+                    st.stop()
                 try:
                     persistent_nav = ledger.nav_history()
                     persistent_orders = ledger.orders()
@@ -618,6 +669,11 @@ if run:
 
         if persistent_nav is not None and not persistent_nav.empty:
             st.subheader("M3 Persistent Paper Ledger")
+            st.success(
+                "M11-6 虛擬帳本："
+                + ("已建立新帳本" if paper_ledger_reset else "已核對並安全續跑既有帳本")
+                + f"；目前共 {len(persistent_nav)} 個已完成交易日。"
+            )
             latest_nav = persistent_nav.iloc[-1]
             open_order_count = int(
                 persistent_orders["status"].isin(["NEW", "PARTIAL"]).sum()
