@@ -29,6 +29,7 @@ from .execution import (
     transition_safe_reference,
 )
 from .fx import currency_for_symbol, validate_fx
+from .ledger_audit import LedgerAuditReport, audit_paper_ledger
 from .replay_provenance import replay_session_data_fingerprint
 from .snapshot import SnapshotManifest, load_market_data_snapshot, save_market_data_snapshot
 
@@ -382,6 +383,11 @@ class PaperLedger:
             frame["timestamp"] = pd.to_datetime(frame["timestamp"])
             frame = frame.set_index("timestamp")
         return frame
+
+    def audit_integrity(self) -> LedgerAuditReport:
+        """Read-only independent reconciliation of the persisted SQL accounting."""
+
+        return audit_paper_ledger(self.connection)
 
     def replay_execution_config(self) -> dict[str, object] | None:
         locked = self._meta_value("replay_execution_config")
@@ -1522,10 +1528,16 @@ def replay_targets_persistently(
             execution_reference=execution_reference,
             benchmark_close_base=benchmark_close_base,
         )
-        ledger.ensure_replay_execution_config(config, base_currency)
         ledger.verify_committed_snapshots(
             data, execution_reference, benchmark_close_base, snapshot_root
         )
+        accounting_audit = ledger.audit_integrity()
+        if not accounting_audit.is_valid:
+            raise ValueError(
+                "paper ledger accounting integrity audit failed before replay: "
+                + accounting_audit.issues[0]
+            )
+        ledger.ensure_replay_execution_config(config, base_currency)
         if completed_at is None:
             dates = data.close.index[data.close.index >= replay_start]
         else:
@@ -1627,6 +1639,12 @@ def replay_targets_persistently(
                 ledger.record_session_commit(
                     timestamp, target_weights_today, data_fingerprint=data_fingerprint
                 )
+        accounting_audit = ledger.audit_integrity()
+        if not accounting_audit.is_valid:
+            raise ValueError(
+                "paper ledger accounting integrity audit failed after replay: "
+                + accounting_audit.issues[0]
+            )
         return ledger
     except BaseException:
         ledger.close()

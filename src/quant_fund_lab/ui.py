@@ -426,6 +426,7 @@ if run:
             persistent_interest_credits = None
             persistent_session_commits = None
             persistent_replay_execution_config = None
+            persistent_ledger_audit = None
             if persist_paper_ledger:
                 try:
                     ledger = replay_targets_persistently(
@@ -454,6 +455,7 @@ if run:
                     persistent_interest_credits = ledger.cash_interest_credits()
                     persistent_session_commits = ledger.session_commits()
                     persistent_replay_execution_config = ledger.replay_execution_config()
+                    persistent_ledger_audit = ledger.audit_integrity()
                 finally:
                     ledger.close()
 
@@ -719,6 +721,18 @@ if run:
                 "續跑前校驗已提交 snapshot 的 SQLite 連結、manifest、檔案 hash "
                 "及每日重播輸入指紋。"
             )
+            if persistent_ledger_audit.is_valid:
+                st.success(
+                    "M11-7 Independent ledger audit：PASS；"
+                    f"已核對 {persistent_ledger_audit.nav_sessions} 個 NAV、"
+                    f"{persistent_ledger_audit.fills} 筆成交及 "
+                    f"{persistent_ledger_audit.cash_credits} 筆現金入息。"
+                )
+            else:
+                st.error(
+                    "M11-7 Independent ledger audit：FAIL；"
+                    + persistent_ledger_audit.issues[0]
+                )
             persistent_tax = summarize_dividend_tax(persistent_actions)
             st.caption(
                 "Dividend cashflow：gross "
@@ -749,7 +763,7 @@ if run:
                 "SQLite: artifacts/paper_trading.sqlite；每日可重現 market snapshots: "
                 "artifacts/paper_snapshots/。未成交數量會保持 NEW/PARTIAL 並在後續交易日重試。"
             )
-            pt1, pt2, pt3, pt4, pt5, pt6, pt7, pt8, pt9 = st.tabs(
+            pt1, pt2, pt3, pt4, pt5, pt6, pt7, pt8, pt9, pt10 = st.tabs(
                 [
                     "Persistent Orders",
                     "Persistent Fills",
@@ -760,6 +774,7 @@ if run:
                     "Session Commits",
                     "Daily Snapshots",
                     "Execution Assumptions",
+                    "Ledger Accounting Audit",
                 ]
             )
             with pt1:
@@ -780,6 +795,17 @@ if run:
                 st.dataframe(persistent_snapshots, use_container_width=True, height=300)
             with pt9:
                 st.json(persistent_replay_execution_config)
+            with pt10:
+                st.json(
+                    {
+                        "passed": persistent_ledger_audit.is_valid,
+                        "nav_sessions": persistent_ledger_audit.nav_sessions,
+                        "fills": persistent_ledger_audit.fills,
+                        "position_marks": persistent_ledger_audit.position_marks,
+                        "cash_credits": persistent_ledger_audit.cash_credits,
+                        "issues": list(persistent_ledger_audit.issues),
+                    }
+                )
 
         if robustness is not None:
             st.subheader("M5-4 Robustness Lab")
