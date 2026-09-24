@@ -380,6 +380,7 @@ if run:
             persistent_actions = None
             persistent_receivables = None
             persistent_interest_credits = None
+            persistent_session_commits = None
             if persist_paper_ledger:
                 ledger = replay_targets_persistently(
                     trade_data,
@@ -399,6 +400,7 @@ if run:
                     persistent_actions = ledger.corporate_actions()
                     persistent_receivables = ledger.cash_in_lieu_receivables()
                     persistent_interest_credits = ledger.cash_interest_credits()
+                    persistent_session_commits = ledger.session_commits()
                 finally:
                     ledger.close()
 
@@ -644,6 +646,11 @@ if run:
                 f"{float(latest_nav['cumulative_cash_interest']):,.2f} "
                 f"{base_currency}；locked annual yield {config.cash_annual_yield:.2%}。"
             )
+            st.caption(
+                "M11-3 Atomic sessions：committed "
+                f"{len(persistent_session_commits)} / {len(persistent_nav)} NAV sessions；"
+                "每日利息、成交、企業行動、NAV 與收盤目標訂單同筆 SQLite 交易提交。"
+            )
             persistent_tax = summarize_dividend_tax(persistent_actions)
             st.caption(
                 "Dividend cashflow：gross "
@@ -674,7 +681,7 @@ if run:
                 "SQLite: artifacts/paper_trading.sqlite；每日可重現 market snapshots: "
                 "artifacts/paper_snapshots/。未成交數量會保持 NEW/PARTIAL 並在後續交易日重試。"
             )
-            pt1, pt2, pt3, pt4, pt5, pt6, pt7 = st.tabs(
+            pt1, pt2, pt3, pt4, pt5, pt6, pt7, pt8 = st.tabs(
                 [
                     "Persistent Orders",
                     "Persistent Fills",
@@ -682,6 +689,7 @@ if run:
                     "Corporate Actions",
                     "Cash-in-Lieu Receivables",
                     "Cash Interest Credits",
+                    "Session Commits",
                     "Daily Snapshots",
                 ]
             )
@@ -698,6 +706,8 @@ if run:
             with pt6:
                 st.dataframe(persistent_interest_credits, use_container_width=True, height=300)
             with pt7:
+                st.dataframe(persistent_session_commits, use_container_width=True, height=300)
+            with pt8:
                 st.dataframe(persistent_snapshots, use_container_width=True, height=300)
 
         if robustness is not None:

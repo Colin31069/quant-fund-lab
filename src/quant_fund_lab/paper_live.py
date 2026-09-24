@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import sqlite3
+from contextlib import nullcontext
 from pathlib import Path
 
 import pandas as pd
@@ -29,6 +31,14 @@ from .fx import currency_for_symbol, validate_fx
 from .snapshot import SnapshotManifest, save_market_data_snapshot
 
 _OPEN_ORDER_STATUSES = ("NEW", "PARTIAL")
+
+
+def _signal_fingerprint(weights: pd.Series) -> str:
+    """Stable hash of close-signal weights, including zero-order target sessions."""
+
+    payload = {str(symbol): float(weight) for symbol, weight in weights.items()}
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 class PaperLedger:
@@ -200,6 +210,12 @@ class PaperLedger:
                 dataset_id TEXT NOT NULL,
                 path TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS session_commits (
+                timestamp TEXT PRIMARY KEY REFERENCES nav(timestamp),
+                had_signal INTEGER NOT NULL CHECK(had_signal IN (0, 1)),
+                signal_fingerprint TEXT NOT NULL,
+                snapshot_dataset_id TEXT
+            );
             """
         )
         self._migrate_corporate_action_schema()
@@ -344,11 +360,85 @@ class PaperLedger:
     def snapshots(self) -> pd.DataFrame:
         return pd.read_sql_query("SELECT * FROM snapshots ORDER BY timestamp", self.connection)
 
-    def cancel_open_orders(self, status: str = "CANCELLED") -> int:
+    def session_commits(self) -> pd.DataFrame:
+        frame = pd.read_sql_query(
+            "SELECT * FROM session_commits ORDER BY timestamp", self.connection
+        )
+        if not frame.empty:
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+            frame = frame.set_index("timestamp")
+        return frame
+
+    def verify_completed_sessions(
+        self, data: MarketData, target_weights: pd.DataFrame
+    ) -> pd.Timestamp | None:
+        """Require a durable completion marker for every NAV before continuing."""
+
+        rows = self.connection.execute(
+            "SELECT timestamp, had_signal, signal_fingerprint "
+            "FROM session_commits ORDER BY timestamp"
+        ).fetchall()
+        nav_rows = self.connection.execute(
+            "SELECT timestamp FROM nav ORDER BY timestamp"
+        ).fetchall()
+        nav_dates = [pd.Timestamp(row["timestamp"]) for row in nav_rows]
+        commit_dates = [pd.Timestamp(row["timestamp"]) for row in rows]
+        if nav_dates != commit_dates:
+            raise ValueError(
+                "paper ledger NAV is missing session completion markers; "
+                "legacy or incomplete sessions require manual recovery"
+            )
+        for row in rows:
+            timestamp = pd.Timestamp(row["timestamp"])
+            if timestamp not in data.close.index:
+                continue
+            had_signal = bool(row["had_signal"])
+            supplied_signal = timestamp in target_weights.index
+            if had_signal != supplied_signal:
+                raise ValueError(
+                    "completed session target schedule conflicts with replay inputs"
+                )
+            if supplied_signal:
+                weights = target_weights.loc[timestamp].reindex(data.symbols).fillna(0.0)
+                if _signal_fingerprint(weights) != str(row["signal_fingerprint"]):
+                    raise ValueError(
+                        "completed session target weights conflict with replay inputs"
+                    )
+        return None if not nav_dates else nav_dates[-1]
+
+    def record_session_commit(
+        self,
+        timestamp: pd.Timestamp,
+        target_weights: pd.Series | None,
+    ) -> None:
+        """Record the close signal in the same transaction as NAV and all daily events."""
+
+        stamp = pd.Timestamp(timestamp).isoformat()
+        if self.connection.execute(
+            "SELECT 1 FROM nav WHERE timestamp=?", (stamp,)
+        ).fetchone() is None:
+            raise ValueError("session cannot commit without a daily NAV")
+        snapshot = self.connection.execute(
+            "SELECT dataset_id FROM snapshots WHERE timestamp=?", (stamp,)
+        ).fetchone()
+        self.connection.execute(
+            "INSERT INTO session_commits("
+            "timestamp, had_signal, signal_fingerprint, snapshot_dataset_id"
+            ") VALUES(?, ?, ?, ?)",
+            (
+                stamp,
+                int(target_weights is not None),
+                "" if target_weights is None else _signal_fingerprint(target_weights),
+                None if snapshot is None else str(snapshot["dataset_id"]),
+            ),
+        )
+
+    def cancel_open_orders(self, status: str = "CANCELLED", *, commit: bool = True) -> int:
         cursor = self.connection.execute(
             "UPDATE orders SET status = ? WHERE status IN ('NEW', 'PARTIAL')", (status,)
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return int(cursor.rowcount)
 
     def submit_target_orders(
@@ -360,10 +450,12 @@ class PaperLedger:
         fx_to_base: pd.Series | None = None,
         market_codes: pd.Series | None = None,
         currency_codes: pd.Series | None = None,
+        *,
+        commit: bool = True,
     ) -> list[int]:
         """Replace outstanding target orders after the signal-date close."""
 
-        self.cancel_open_orders("CANCELLED_REPLACED")
+        self.cancel_open_orders("CANCELLED_REPLACED", commit=False)
         state = self.portfolio_state()
         state.receivable_value = self._mark_open_receivables(
             mark_prices,
@@ -404,7 +496,8 @@ class PaperLedger:
                 ),
             )
             created.append(int(cursor.lastrowid))
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return created
 
     def _position_row(self, symbol: str) -> sqlite3.Row | None:
@@ -477,6 +570,8 @@ class PaperLedger:
         fx_to_base: pd.Series | None = None,
         market_codes: pd.Series | None = None,
         currency_codes: pd.Series | None = None,
+        *,
+        commit: bool = True,
     ) -> list[Fill]:
         """Retry all NEW/PARTIAL orders; unfilled quantities remain persistent."""
 
@@ -508,7 +603,8 @@ class PaperLedger:
             self._record_fill(int(order["order_id"]), fill)
             fills.append(fill)
         self._set_meta("cash", float(state.cash))
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return fills
 
     def ensure_execution_price_basis(self, basis: str) -> None:
@@ -577,7 +673,7 @@ class PaperLedger:
                     "corporate-action events; manual recovery is required"
                 )
 
-    def accrue_cash_interest(self, timestamp: pd.Timestamp) -> float:
+    def accrue_cash_interest(self, timestamp: pd.Timestamp, *, commit: bool = True) -> float:
         """Post a single durable ACT/365 credit before the session's open events.
 
         The credit and updated spendable cash commit atomically. An existing credit
@@ -622,7 +718,7 @@ class PaperLedger:
         state = PortfolioState(cash=prior_cash)
         interest = accrue_base_cash_interest(state, last_mark, stamp, rate)
         days = (stamp.date() - last_mark.date()).days
-        with self.connection:
+        with self.connection if commit else nullcontext():
             self.connection.execute(
                 "INSERT INTO cash_interest_credits("
                 "timestamp, previous_close, eligible_cash_base, annual_yield, "
@@ -641,7 +737,9 @@ class PaperLedger:
             self._set_meta("cash", float(state.cash))
         return interest
 
-    def ensure_dividend_withholding(self, config: DividendWithholdingConfig) -> None:
+    def ensure_dividend_withholding(
+        self, config: DividendWithholdingConfig, *, commit: bool = True
+    ) -> None:
         expected = {"US": float(config.us_rate), "TW": float(config.tw_rate)}
         existing = self._meta_value("dividend_withholding")
         if existing is not None:
@@ -683,7 +781,8 @@ class PaperLedger:
                 )
 
         self._set_meta("dividend_withholding", expected)
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
 
     def _record_corporate_action(self, event: object, realized_pnl_delta: float) -> None:
         self.connection.execute(
@@ -754,6 +853,8 @@ class PaperLedger:
         settlement_prices: pd.Series | None,
         fx_to_base: pd.Series | None = None,
         currency_codes: pd.Series | None = None,
+        *,
+        commit: bool = True,
     ) -> int:
         timestamp = pd.Timestamp(timestamp)
         rows = self._open_receivable_rows()
@@ -823,7 +924,8 @@ class PaperLedger:
             processed += 1
 
         self._set_meta("cash", float(state.cash))
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return processed
 
     def _rebase_open_orders_for_split(self, symbol: str, ratio: float) -> None:
@@ -853,11 +955,13 @@ class PaperLedger:
         dividend_withholding: DividendWithholdingConfig | None = None,
         cash_in_lieu_prices: pd.Series | None = None,
         cash_in_lieu_settlement_dates: pd.Series | None = None,
+        *,
+        commit: bool = True,
     ) -> int:
         """Apply raw-basis corporate actions before terminal events and open-order execution."""
 
         tax_config = dividend_withholding or DividendWithholdingConfig()
-        self.ensure_dividend_withholding(tax_config)
+        self.ensure_dividend_withholding(tax_config, commit=commit)
         state = self.portfolio_state()
         processed = 0
         new_receivables: list[CashInLieuReceivable] = []
@@ -944,7 +1048,8 @@ class PaperLedger:
             self._record_corporate_action(event, event.cash_value)
             processed += 1
         self._set_meta("cash", float(state.cash))
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return processed
 
     def process_terminal_returns(
@@ -954,6 +1059,8 @@ class PaperLedger:
         reference_prices: pd.Series,
         fx_to_base: pd.Series | None = None,
         currency_codes: pd.Series | None = None,
+        *,
+        commit: bool = True,
     ) -> int:
         state = self.portfolio_state()
         events = apply_terminal_returns(
@@ -994,7 +1101,8 @@ class PaperLedger:
                 ),
             )
         self._set_meta("cash", float(state.cash))
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return len(events)
 
     def mark_close(
@@ -1004,6 +1112,8 @@ class PaperLedger:
         fx_to_base: pd.Series | None = None,
         benchmark_close_base: float | None = None,
         currency_codes: pd.Series | None = None,
+        *,
+        commit: bool = True,
     ) -> dict[str, float]:
         state = self.portfolio_state()
         positions = self.connection.execute(
@@ -1109,7 +1219,8 @@ class PaperLedger:
                 reconciliation_error,
             ),
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return {
             "cash": self.cash,
             "market_value": market_value,
@@ -1128,6 +1239,8 @@ class PaperLedger:
         timestamp: pd.Timestamp,
         data: MarketData,
         snapshot_root: str | Path,
+        *,
+        commit: bool = True,
     ) -> SnapshotManifest:
         day = pd.Timestamp(timestamp)
         directory = Path(snapshot_root) / day.strftime("%Y-%m-%d")
@@ -1136,7 +1249,8 @@ class PaperLedger:
             "INSERT OR REPLACE INTO snapshots(timestamp, dataset_id, path) VALUES(?, ?, ?)",
             (day.isoformat(), manifest.dataset_id, str(directory)),
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         return manifest
 
 
@@ -1153,6 +1267,8 @@ def replay_targets_persistently(
 
     if target_weights.empty:
         raise ValueError("target_weights cannot be empty")
+    if not target_weights.index.is_unique or not data.close.index.is_unique:
+        raise ValueError("persistent replay requires unique session and target timestamps")
     required_metadata = data.membership.fillna(False) | data.terminal_returns.notna()
     if data.market_codes is not None and bool(
         (required_metadata & data.market_codes.isna()).any().any()
@@ -1185,6 +1301,10 @@ def replay_targets_persistently(
         reset=reset,
     )
     try:
+        if not math.isclose(
+            ledger.initial_cash, config.initial_cash, rel_tol=0.0, abs_tol=1e-8
+        ):
+            raise ValueError("initial_cash does not match the existing paper ledger")
         ledger.ensure_cash_annual_yield(config.cash_annual_yield)
         ledger.ensure_execution_price_basis(config.execution_price_basis)
         if config.execution_price_basis == "raw":
@@ -1211,101 +1331,114 @@ def replay_targets_persistently(
         data.market_codes,
         data.currency_codes,
     )
-    first_signal = pd.Timestamp(target_weights.index.min())
-    pending_row = ledger.connection.execute(
-        "SELECT MIN(settlement_date) AS value FROM cash_in_lieu_receivables "
-        "WHERE status='OPEN'"
-    ).fetchone()
-    pending_date = (
-        None
-        if pending_row is None or pending_row["value"] is None
-        else pd.Timestamp(pending_row["value"])
-    )
-    replay_start = first_signal if pending_date is None else min(first_signal, pending_date)
-    latest_nav = ledger.connection.execute(
-        "SELECT timestamp FROM nav ORDER BY timestamp DESC LIMIT 1"
-    ).fetchone()
-    if latest_nav is None:
-        dates = data.close.index[data.close.index >= replay_start]
-    else:
-        # Completed sessions must never replay fills, corporate actions, or interest.
-        completed_at = pd.Timestamp(latest_nav["timestamp"])
-        dates = data.close.index[data.close.index > completed_at]
-    for timestamp in dates:
-        ledger.ensure_replay_session_is_restartable(timestamp)
-        ledger.accrue_cash_interest(timestamp)
-        fx = data.fx_to_base.loc[timestamp] if data.fx_to_base is not None else None
-        market_codes = (
-            data.market_codes.loc[timestamp] if data.market_codes is not None else None
+    try:
+        first_signal = pd.Timestamp(target_weights.index.min())
+        pending_row = ledger.connection.execute(
+            "SELECT MIN(settlement_date) AS value FROM cash_in_lieu_receivables "
+            "WHERE status='OPEN'"
+        ).fetchone()
+        pending_date = (
+            None
+            if pending_row is None or pending_row["value"] is None
+            else pd.Timestamp(pending_row["value"])
         )
-        currency_codes = (
-            data.currency_codes.loc[timestamp] if data.currency_codes is not None else None
-        )
-        if config.execution_price_basis == "raw":
-            settlement_prices = (
-                data.cash_in_lieu_prices.loc[timestamp]
-                if data.cash_in_lieu_prices is not None
+        replay_start = first_signal if pending_date is None else min(first_signal, pending_date)
+        completed_at = ledger.verify_completed_sessions(data, target_weights)
+        if completed_at is None:
+            dates = data.close.index[data.close.index >= replay_start]
+        else:
+            dates = data.close.index[data.close.index > completed_at]
+        for timestamp in dates:
+            ledger.ensure_replay_session_is_restartable(timestamp)
+            target_weights_today = (
+                target_weights.loc[timestamp].reindex(data.symbols).fillna(0.0)
+                if timestamp in target_weights.index
                 else None
             )
-            ledger.process_cash_in_lieu_settlements(
-                timestamp,
-                settlement_prices,
-                fx,
-                currency_codes,
-            )
-            ledger.process_corporate_actions(
-                timestamp,
-                data.stock_splits.loc[timestamp],
-                data.dividends.loc[timestamp],
-                execution_open.loc[timestamp],
-                fx,
-                currency_codes,
-                market_codes,
-                config.dividend_withholding,
-                settlement_prices,
-                (
-                    data.cash_in_lieu_settlement_dates.loc[timestamp]
-                    if data.cash_in_lieu_settlement_dates is not None
-                    else None
-                ),
-            )
-        ledger.process_terminal_returns(
-            timestamp,
-            data.terminal_returns.loc[timestamp],
-            execution_reference.loc[timestamp],
-            fx,
-            currency_codes,
-        )
-        ledger.process_open(
-            timestamp,
-            execution_open.loc[timestamp],
-            data.volume.loc[timestamp],
-            execution_reference.loc[timestamp],
-            config,
-            fx,
-            market_codes,
-            currency_codes,
-        )
-        benchmark_value = None
-        if benchmark_close_base is not None and timestamp in benchmark_close_base.index:
-            benchmark_value = float(benchmark_close_base.loc[timestamp])
-        ledger.mark_close(
-            timestamp,
-            valuation_close.loc[timestamp],
-            fx,
-            benchmark_value,
-            currency_codes,
-        )
-        if snapshot_root is not None:
-            ledger.record_snapshot(timestamp, data, snapshot_root)
-        if timestamp in target_weights.index:
-            ledger.submit_target_orders(
-                timestamp,
-                target_weights.loc[timestamp].reindex(data.symbols).fillna(0.0),
-                valuation_close.loc[timestamp],
-                config,
-                fx,
-                market_codes,
-                currency_codes,
-            )
-    return ledger
+            with ledger.connection:
+                ledger.accrue_cash_interest(timestamp, commit=False)
+                fx = data.fx_to_base.loc[timestamp] if data.fx_to_base is not None else None
+                market_codes = (
+                    data.market_codes.loc[timestamp] if data.market_codes is not None else None
+                )
+                currency_codes = (
+                    data.currency_codes.loc[timestamp] if data.currency_codes is not None else None
+                )
+                if config.execution_price_basis == "raw":
+                    settlement_prices = (
+                        data.cash_in_lieu_prices.loc[timestamp]
+                        if data.cash_in_lieu_prices is not None
+                        else None
+                    )
+                    ledger.process_cash_in_lieu_settlements(
+                        timestamp,
+                        settlement_prices,
+                        fx,
+                        currency_codes,
+                        commit=False,
+                    )
+                    ledger.process_corporate_actions(
+                        timestamp,
+                        data.stock_splits.loc[timestamp],
+                        data.dividends.loc[timestamp],
+                        execution_open.loc[timestamp],
+                        fx,
+                        currency_codes,
+                        market_codes,
+                        config.dividend_withholding,
+                        settlement_prices,
+                        (
+                            data.cash_in_lieu_settlement_dates.loc[timestamp]
+                            if data.cash_in_lieu_settlement_dates is not None
+                            else None
+                        ),
+                        commit=False,
+                    )
+                ledger.process_terminal_returns(
+                    timestamp,
+                    data.terminal_returns.loc[timestamp],
+                    execution_reference.loc[timestamp],
+                    fx,
+                    currency_codes,
+                    commit=False,
+                )
+                ledger.process_open(
+                    timestamp,
+                    execution_open.loc[timestamp],
+                    data.volume.loc[timestamp],
+                    execution_reference.loc[timestamp],
+                    config,
+                    fx,
+                    market_codes,
+                    currency_codes,
+                    commit=False,
+                )
+                benchmark_value = None
+                if benchmark_close_base is not None and timestamp in benchmark_close_base.index:
+                    benchmark_value = float(benchmark_close_base.loc[timestamp])
+                ledger.mark_close(
+                    timestamp,
+                    valuation_close.loc[timestamp],
+                    fx,
+                    benchmark_value,
+                    currency_codes,
+                    commit=False,
+                )
+                if snapshot_root is not None:
+                    ledger.record_snapshot(timestamp, data, snapshot_root, commit=False)
+                if target_weights_today is not None:
+                    ledger.submit_target_orders(
+                        timestamp,
+                        target_weights_today,
+                        valuation_close.loc[timestamp],
+                        config,
+                        fx,
+                        market_codes,
+                        currency_codes,
+                        commit=False,
+                    )
+                ledger.record_session_commit(timestamp, target_weights_today)
+        return ledger
+    except BaseException:
+        ledger.close()
+        raise
