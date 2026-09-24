@@ -129,13 +129,16 @@ def test_cash_yield_rejects_invalid_assumptions_and_nonadvancing_sessions():
         )
 
 
-def test_persistent_replay_fails_closed_for_nonzero_cash_yield(tmp_path):
+def test_persistent_replay_supports_nonzero_cash_yield(tmp_path):
     data = _all_cash_data()
     config = BacktestConfig(cash_annual_yield=0.05)
     signals = pd.DataFrame(
         0.0, index=data.close.index[80:81], columns=data.symbols
     )
     path = tmp_path / "cash-interest.sqlite"
-    with pytest.raises(ValueError, match="nonzero cash_annual_yield"):
-        replay_targets_persistently(data, signals, config, path)
-    assert not path.exists()
+    ledger = replay_targets_persistently(data, signals, config, path)
+    try:
+        assert ledger.nav_history()["cumulative_cash_interest"].iloc[-1] > 0.0
+        assert not ledger.cash_interest_credits().empty
+    finally:
+        ledger.close()

@@ -82,8 +82,8 @@ with st.sidebar:
         step=0.5,
     )
     st.caption(
-        "M11-1：僅對基準幣別可支用現金以 ACT/365 計息；"
-        "非零收益率尚不支援 persistent SQLite ledger。"
+        "M11-2：基準幣別可支用現金以 ACT/365 計息；persistent SQLite ledger "
+        "鎖定收益率並按結算日防重複入帳。"
     )
     execution_price_basis = st.selectbox(
         "成交/持倉價格基準",
@@ -153,9 +153,6 @@ def load_data(
 
 
 if run:
-    if persist_paper_ledger and cash_annual_yield_pct > 0.0:
-        st.error("非零現金收益率尚不支援 persistent SQLite ledger；請先取消該選項。")
-        st.stop()
     requested_trade_assets = [
         s.strip() if verified_mode else s.strip().upper()
         for s in symbols_text.split(",")
@@ -382,6 +379,7 @@ if run:
             persistent_snapshots = None
             persistent_actions = None
             persistent_receivables = None
+            persistent_interest_credits = None
             if persist_paper_ledger:
                 ledger = replay_targets_persistently(
                     trade_data,
@@ -400,6 +398,7 @@ if run:
                     persistent_snapshots = ledger.snapshots()
                     persistent_actions = ledger.corporate_actions()
                     persistent_receivables = ledger.cash_in_lieu_receivables()
+                    persistent_interest_credits = ledger.cash_interest_credits()
                 finally:
                     ledger.close()
 
@@ -639,6 +638,12 @@ if run:
                 f"{open_receivable_count}；current NAV mark "
                 f"{float(latest_nav.get('receivable_value', 0.0)):,.2f} {base_currency}。"
             )
+            st.caption(
+                "M11-2 Cash carry：today "
+                f"{float(latest_nav['cash_interest']):,.2f}；cumulative "
+                f"{float(latest_nav['cumulative_cash_interest']):,.2f} "
+                f"{base_currency}；locked annual yield {config.cash_annual_yield:.2%}。"
+            )
             persistent_tax = summarize_dividend_tax(persistent_actions)
             st.caption(
                 "Dividend cashflow：gross "
@@ -669,13 +674,14 @@ if run:
                 "SQLite: artifacts/paper_trading.sqlite；每日可重現 market snapshots: "
                 "artifacts/paper_snapshots/。未成交數量會保持 NEW/PARTIAL 並在後續交易日重試。"
             )
-            pt1, pt2, pt3, pt4, pt5, pt6 = st.tabs(
+            pt1, pt2, pt3, pt4, pt5, pt6, pt7 = st.tabs(
                 [
                     "Persistent Orders",
                     "Persistent Fills",
                     "Positions",
                     "Corporate Actions",
                     "Cash-in-Lieu Receivables",
+                    "Cash Interest Credits",
                     "Daily Snapshots",
                 ]
             )
@@ -690,6 +696,8 @@ if run:
             with pt5:
                 st.dataframe(persistent_receivables, use_container_width=True, height=300)
             with pt6:
+                st.dataframe(persistent_interest_credits, use_container_width=True, height=300)
+            with pt7:
                 st.dataframe(persistent_snapshots, use_container_width=True, height=300)
 
         if robustness is not None:

@@ -286,6 +286,13 @@ def test_existing_paper_ledger_migrates_nav_receivable_value(tmp_path):
         nav = ledger.nav_history()
         assert "receivable_value" in nav.columns
         assert nav.iloc[0]["receivable_value"] == pytest.approx(0.0)
+        assert nav.iloc[0]["cash_interest"] == pytest.approx(0.0)
+        assert nav.iloc[0]["cumulative_cash_interest"] == pytest.approx(0.0)
+        with pytest.raises(ValueError, match="legacy paper ledger"):
+            ledger.ensure_cash_annual_yield(0.05)
+        ledger.ensure_cash_annual_yield(0.0)
+        with pytest.raises(ValueError, match="does not match"):
+            ledger.ensure_cash_annual_yield(0.05)
 
 
 
@@ -656,6 +663,7 @@ def test_persistent_replay_settles_delayed_cash_in_lieu_and_reconciles(tmp_path)
     config = BacktestConfig(
         initial_cash=10_000.0,
         execution_price_basis="raw",
+        cash_annual_yield=0.05,
         strategy=StrategyConfig(warmup_days=20, rebalance_every=5, max_weight=0.6),
     )
     targets = pd.DataFrame(
@@ -682,6 +690,13 @@ def test_persistent_replay_settles_delayed_cash_in_lieu_and_reconciles(tmp_path)
         assert nav.loc[dates[21], "receivable_value"] > 0.0
         assert nav.loc[dates[22], "receivable_value"] == pytest.approx(0.0)
         assert nav["reconciliation_error"].abs().max() < 1e-8
+        for previous, current in zip(nav.index[:-1], nav.index[1:]):
+            prior_spendable_cash = float(nav.loc[previous, "cash"])
+            expected = prior_spendable_cash * 0.05 * (current - previous).days / 365.0
+            assert nav.loc[current, "cash_interest"] == pytest.approx(expected)
+        assert nav["cumulative_cash_interest"].iloc[-1] == pytest.approx(
+            nav["cash_interest"].sum()
+        )
     finally:
         ledger.close()
 

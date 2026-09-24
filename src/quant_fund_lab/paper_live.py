@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from pathlib import Path
 
 import pandas as pd
 
+from .cash_carry import accrue_base_cash_interest
 from .config import BacktestConfig, DividendWithholdingConfig
 from .corporate_actions import (
     CashInLieuReceivable,
@@ -173,6 +175,8 @@ class PaperLedger:
                 cash REAL NOT NULL,
                 market_value REAL NOT NULL,
                 receivable_value REAL NOT NULL DEFAULT 0,
+                cash_interest REAL NOT NULL DEFAULT 0,
+                cumulative_cash_interest REAL NOT NULL DEFAULT 0,
                 equity REAL NOT NULL,
                 realized_pnl REAL NOT NULL,
                 unrealized_pnl REAL NOT NULL,
@@ -181,6 +185,15 @@ class PaperLedger:
                 benchmark_close_base REAL,
                 benchmark_equity REAL,
                 reconciliation_error REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cash_interest_credits (
+                timestamp TEXT PRIMARY KEY,
+                previous_close TEXT NOT NULL,
+                eligible_cash_base REAL NOT NULL,
+                annual_yield REAL NOT NULL,
+                accrual_days INTEGER NOT NULL,
+                interest_base REAL NOT NULL,
+                cash_after_base REAL NOT NULL
             );
             CREATE TABLE IF NOT EXISTS snapshots (
                 timestamp TEXT PRIMARY KEY,
@@ -241,6 +254,14 @@ class PaperLedger:
             self.connection.execute(
                 "ALTER TABLE nav ADD COLUMN receivable_value REAL NOT NULL DEFAULT 0"
             )
+        if "cash_interest" not in columns:
+            self.connection.execute(
+                "ALTER TABLE nav ADD COLUMN cash_interest REAL NOT NULL DEFAULT 0"
+            )
+        if "cumulative_cash_interest" not in columns:
+            self.connection.execute(
+                "ALTER TABLE nav ADD COLUMN cumulative_cash_interest REAL NOT NULL DEFAULT 0"
+            )
 
     def _get_meta(self, key: str) -> str | None:
         row = self.connection.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
@@ -300,6 +321,15 @@ class PaperLedger:
             self.connection,
         )
         for column in ("created_at", "settlement_date", "settled_at"):
+            if column in frame.columns:
+                frame[column] = pd.to_datetime(frame[column], errors="coerce")
+        return frame
+
+    def cash_interest_credits(self) -> pd.DataFrame:
+        frame = pd.read_sql_query(
+            "SELECT * FROM cash_interest_credits ORDER BY timestamp", self.connection
+        )
+        for column in ("timestamp", "previous_close"):
             if column in frame.columns:
                 frame[column] = pd.to_datetime(frame[column], errors="coerce")
         return frame
@@ -490,6 +520,126 @@ class PaperLedger:
             self.connection.commit()
         elif str(existing) != basis:
             raise ValueError("execution_price_basis does not match the existing paper ledger")
+
+    def ensure_cash_annual_yield(self, annual_yield: float) -> None:
+        """Lock a reproducible cash-carry assumption before replaying ledger sessions."""
+
+        rate = float(annual_yield)
+        if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+            raise ValueError("cash_annual_yield must be finite and between 0 and 1")
+        existing = self._meta_value("cash_annual_yield")
+        if existing is not None:
+            if float(existing) != rate:
+                raise ValueError(
+                    "cash_annual_yield does not match the existing paper ledger"
+                )
+            return
+
+        if self.connection.execute(
+            "SELECT 1 FROM cash_interest_credits LIMIT 1"
+        ).fetchone() is not None:
+            raise ValueError("paper ledger cash-interest metadata is missing")
+        activity = any(
+            self.connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+            is not None
+            for table in (
+                "nav",
+                "orders",
+                "fills",
+                "corporate_actions",
+                "terminal_events",
+                "cash_in_lieu_receivables",
+            )
+        )
+        if activity and rate != 0.0:
+            raise ValueError(
+                "legacy paper ledger cannot adopt nonzero cash_annual_yield "
+                "after trading or NAV history exists"
+            )
+        self._set_meta("cash_annual_yield", rate)
+        self.connection.commit()
+
+    def ensure_replay_session_is_restartable(self, timestamp: pd.Timestamp) -> None:
+        """Fail closed if a previous attempt posted non-interest activity without NAV."""
+
+        stamp = pd.Timestamp(timestamp).isoformat()
+        already_marked = self.connection.execute(
+            "SELECT 1 FROM nav WHERE timestamp=?", (stamp,)
+        ).fetchone()
+        if already_marked is not None:
+            return
+        for table in ("fills", "corporate_actions", "terminal_events"):
+            if self.connection.execute(
+                f"SELECT 1 FROM {table} WHERE timestamp=? LIMIT 1", (stamp,)
+            ).fetchone() is not None:
+                raise ValueError(
+                    "incomplete persistent session contains posted trading or "
+                    "corporate-action events; manual recovery is required"
+                )
+
+    def accrue_cash_interest(self, timestamp: pd.Timestamp) -> float:
+        """Post a single durable ACT/365 credit before the session's open events.
+
+        The credit and updated spendable cash commit atomically. An existing credit
+        is returned without modifying cash, including after an interrupted replay.
+        """
+
+        locked = self._meta_value("cash_annual_yield")
+        if locked is None:
+            raise ValueError("cash_annual_yield must be locked before accrual")
+        rate = float(locked)
+        stamp = pd.Timestamp(timestamp)
+        latest = self.connection.execute(
+            "SELECT timestamp, cash FROM nav ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        last_mark = None if latest is None else pd.Timestamp(latest["timestamp"])
+        if last_mark is not None and last_mark > stamp:
+            raise ValueError("cash interest cannot be credited before the last NAV")
+
+        existing = self.connection.execute(
+            "SELECT * FROM cash_interest_credits WHERE timestamp=?",
+            (stamp.isoformat(),),
+        ).fetchone()
+        if existing is not None:
+            if float(existing["annual_yield"]) != rate:
+                raise ValueError("cash-interest credit rate conflicts with ledger assumptions")
+            if (
+                last_mark is not None
+                and last_mark < stamp
+                and pd.Timestamp(existing["previous_close"]) != last_mark
+            ):
+                raise ValueError("cash-interest credit interval conflicts with last NAV")
+            return float(existing["interest_base"])
+
+        if last_mark is None or last_mark == stamp:
+            return 0.0
+
+        prior_cash = float(latest["cash"])
+        if not math.isclose(self.cash, prior_cash, rel_tol=1e-12, abs_tol=1e-8):
+            raise ValueError(
+                "cash balance changed after last NAV before cash-interest accrual"
+            )
+        state = PortfolioState(cash=prior_cash)
+        interest = accrue_base_cash_interest(state, last_mark, stamp, rate)
+        days = (stamp.date() - last_mark.date()).days
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO cash_interest_credits("
+                "timestamp, previous_close, eligible_cash_base, annual_yield, "
+                "accrual_days, interest_base, cash_after_base"
+                ") VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (
+                    stamp.isoformat(),
+                    last_mark.isoformat(),
+                    prior_cash,
+                    rate,
+                    days,
+                    interest,
+                    float(state.cash),
+                ),
+            )
+            self._set_meta("cash", float(state.cash))
+        return interest
 
     def ensure_dividend_withholding(self, config: DividendWithholdingConfig) -> None:
         expected = {"US": float(config.us_rate), "TW": float(config.tw_rate)}
@@ -900,6 +1050,19 @@ class PaperLedger:
         unrealized += receivable_unrealized
         state.receivable_value = receivable_value
         equity = self.cash + market_value + receivable_value
+        interest_row = self.connection.execute(
+            "SELECT interest_base FROM cash_interest_credits WHERE timestamp=?",
+            (pd.Timestamp(timestamp).isoformat(),),
+        ).fetchone()
+        cash_interest = 0.0 if interest_row is None else float(interest_row["interest_base"])
+        cumulative_cash_interest = float(
+            self.connection.execute(
+                "SELECT COALESCE(SUM(interest_base), 0) AS value "
+                "FROM cash_interest_credits WHERE timestamp<=?",
+                (pd.Timestamp(timestamp).isoformat(),),
+            ).fetchone()["value"]
+        )
+        realized += cumulative_cash_interest
         fees = float(
             self.connection.execute("SELECT COALESCE(SUM(fees), 0) AS value FROM fills").fetchone()["value"]
         )
@@ -925,15 +1088,18 @@ class PaperLedger:
         reconciliation_error = state_equity - equity
         self.connection.execute(
             "INSERT OR REPLACE INTO nav(timestamp, cash, market_value, receivable_value, equity, "
-            "realized_pnl, unrealized_pnl, cumulative_fees, cumulative_slippage, "
-            "benchmark_close_base, benchmark_equity, reconciliation_error) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "cash_interest, cumulative_cash_interest, realized_pnl, unrealized_pnl, "
+            "cumulative_fees, cumulative_slippage, benchmark_close_base, "
+            "benchmark_equity, reconciliation_error) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 pd.Timestamp(timestamp).isoformat(),
                 self.cash,
                 market_value,
                 receivable_value,
                 equity,
+                cash_interest,
+                cumulative_cash_interest,
                 realized,
                 unrealized,
                 fees,
@@ -949,6 +1115,8 @@ class PaperLedger:
             "market_value": market_value,
             "receivable_value": receivable_value,
             "equity": equity,
+            "cash_interest": cash_interest,
+            "cumulative_cash_interest": cumulative_cash_interest,
             "realized_pnl": realized,
             "unrealized_pnl": unrealized,
             "benchmark_equity": float("nan") if benchmark_equity is None else benchmark_equity,
@@ -985,10 +1153,6 @@ def replay_targets_persistently(
 
     if target_weights.empty:
         raise ValueError("target_weights cannot be empty")
-    if config.cash_annual_yield != 0.0:
-        raise ValueError(
-            "nonzero cash_annual_yield is not supported by persistent replay until M11-2"
-        )
     required_metadata = data.membership.fillna(False) | data.terminal_returns.notna()
     if data.market_codes is not None and bool(
         (required_metadata & data.market_codes.isna()).any().any()
@@ -1020,9 +1184,14 @@ def replay_targets_persistently(
         base_currency=base_currency,
         reset=reset,
     )
-    ledger.ensure_execution_price_basis(config.execution_price_basis)
-    if config.execution_price_basis == "raw":
-        ledger.ensure_dividend_withholding(config.dividend_withholding)
+    try:
+        ledger.ensure_cash_annual_yield(config.cash_annual_yield)
+        ledger.ensure_execution_price_basis(config.execution_price_basis)
+        if config.execution_price_basis == "raw":
+            ledger.ensure_dividend_withholding(config.dividend_withholding)
+    except Exception:
+        ledger.close()
+        raise
     if config.execution_price_basis == "raw":
         if data.raw_open is None or data.raw_close is None:
             ledger.close()
@@ -1053,8 +1222,18 @@ def replay_targets_persistently(
         else pd.Timestamp(pending_row["value"])
     )
     replay_start = first_signal if pending_date is None else min(first_signal, pending_date)
-    dates = data.close.index[data.close.index >= replay_start]
+    latest_nav = ledger.connection.execute(
+        "SELECT timestamp FROM nav ORDER BY timestamp DESC LIMIT 1"
+    ).fetchone()
+    if latest_nav is None:
+        dates = data.close.index[data.close.index >= replay_start]
+    else:
+        # Completed sessions must never replay fills, corporate actions, or interest.
+        completed_at = pd.Timestamp(latest_nav["timestamp"])
+        dates = data.close.index[data.close.index > completed_at]
     for timestamp in dates:
+        ledger.ensure_replay_session_is_restartable(timestamp)
+        ledger.accrue_cash_interest(timestamp)
         fx = data.fx_to_base.loc[timestamp] if data.fx_to_base is not None else None
         market_codes = (
             data.market_codes.loc[timestamp] if data.market_codes is not None else None
