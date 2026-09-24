@@ -78,6 +78,40 @@ def test_cash_in_lieu_summary_rejects_orphan_settlement_event():
         summarize_cash_in_lieu(events)
 
 
+def test_cash_in_lieu_summary_rejects_mismatched_settlement_quantity():
+    events = _events()
+    events.loc[2, "fractional_quantity"] = 0.75
+    with pytest.raises(ValueError, match="quantity does not match"):
+        summarize_cash_in_lieu(events)
+    with pytest.raises(ValueError, match="quantity does not match"):
+        cash_in_lieu_by_source(events)
+
+
+def test_cash_in_lieu_summary_matches_multiple_entitlements_on_one_settlement_date():
+    events = _events()
+    second_split = events.iloc[1].copy()
+    second_split["timestamp"] = pd.Timestamp("2026-01-07")
+    second_split["fractional_quantity"] = 0.25
+    second_settlement = events.iloc[2].copy()
+    second_settlement["fractional_quantity"] = 0.25
+    second_settlement["cash_value"] = 4.5
+    events = pd.concat(
+        [events, pd.DataFrame([second_split, second_settlement])], ignore_index=True
+    )
+    summary = summarize_cash_in_lieu(events)
+    assert summary["delayed_receivable_count"] == 2
+    assert summary["delayed_settlement_count"] == 2
+    assert summary["unresolved_receivable_count"] == 0
+    assert summary["cash_in_lieu_cash"] == pytest.approx(18.5)
+
+
+def test_cash_in_lieu_summary_rejects_premature_cash_credit():
+    events = _events()
+    events.loc[1, "cash_value"] = 9.0
+    with pytest.raises(ValueError, match="cannot credit cash"):
+        summarize_cash_in_lieu(events)
+
+
 def test_cash_in_lieu_summary_is_empty_safe_and_schema_strict():
     summary = summarize_cash_in_lieu(pd.DataFrame())
     assert summary["fractional_split_event_count"] == 0

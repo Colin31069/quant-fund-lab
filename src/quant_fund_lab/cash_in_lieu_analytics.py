@@ -89,6 +89,7 @@ def summarize_cash_in_lieu(corporate_actions: pd.DataFrame) -> dict[str, float |
 
     lag_days: list[float] = []
     pending_keys: Counter[tuple[str, pd.Timestamp]] = Counter()
+    pending_quantities: dict[tuple[str, pd.Timestamp], list[float]] = {}
     for row in split_rows.itertuples(index=False):
         settlement_text = str(row.cash_in_lieu_settlement_date).strip()
         if not settlement_text:
@@ -103,7 +104,11 @@ def summarize_cash_in_lieu(corporate_actions: pd.DataFrame) -> dict[str, float |
             float((settlement_date.normalize() - pd.Timestamp(row.timestamp).normalize()).days)
         )
         if row.cash_in_lieu_price_source == "pending_settlement":
-            pending_keys[(str(row.symbol), settlement_date)] += 1
+            key = (str(row.symbol), settlement_date)
+            pending_keys[key] += 1
+            pending_quantities.setdefault(key, []).append(float(row.fractional_quantity))
+            if not np.isclose(float(row.cash_value), 0.0, rtol=0.0, atol=1e-10):
+                raise ValueError("pending cash-in-lieu receivable cannot credit cash")
 
     settled_keys: Counter[tuple[str, pd.Timestamp]] = Counter(
         (str(row.symbol), pd.Timestamp(row.timestamp))
@@ -112,6 +117,23 @@ def summarize_cash_in_lieu(corporate_actions: pd.DataFrame) -> dict[str, float |
     orphan_settlements = settled_keys - pending_keys
     if orphan_settlements:
         raise ValueError("cash-in-lieu settlement event has no pending receivable")
+    for row in settlement_rows.itertuples(index=False):
+        quantity = float(row.fractional_quantity)
+        if quantity <= 1e-12:
+            raise ValueError("cash-in-lieu settlement must have positive fractional quantity")
+        key = (str(row.symbol), pd.Timestamp(row.timestamp))
+        available = pending_quantities[key]
+        match = next(
+            (
+                index
+                for index, pending_quantity in enumerate(available)
+                if np.isclose(pending_quantity, quantity, rtol=0.0, atol=1e-10)
+            ),
+            None,
+        )
+        if match is None:
+            raise ValueError("cash-in-lieu settlement quantity does not match pending receivable")
+        available.pop(match)
     unresolved = pending_keys - settled_keys
 
     cash_rows = pd.concat(
@@ -155,6 +177,8 @@ def summarize_cash_in_lieu(corporate_actions: pd.DataFrame) -> dict[str, float |
 
 
 def cash_in_lieu_by_source(corporate_actions: pd.DataFrame) -> pd.DataFrame:
+    # Standalone source breakdown must reject the same malformed events as the summary.
+    summarize_cash_in_lieu(corporate_actions)
     rows = _fractional_events(corporate_actions)
     columns = ["settlement_event_count", "cash_value", "fractional_quantity"]
     if rows.empty:
