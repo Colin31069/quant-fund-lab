@@ -5,6 +5,7 @@ import json
 import math
 import sqlite3
 from contextlib import nullcontext
+from dataclasses import asdict
 from pathlib import Path
 
 import pandas as pd
@@ -29,7 +30,7 @@ from .execution import (
 )
 from .fx import currency_for_symbol, validate_fx
 from .replay_provenance import replay_session_data_fingerprint
-from .snapshot import SnapshotManifest, save_market_data_snapshot
+from .snapshot import SnapshotManifest, load_market_data_snapshot, save_market_data_snapshot
 
 _OPEN_ORDER_STATUSES = ("NEW", "PARTIAL")
 
@@ -381,6 +382,130 @@ class PaperLedger:
             frame["timestamp"] = pd.to_datetime(frame["timestamp"])
             frame = frame.set_index("timestamp")
         return frame
+
+    def replay_execution_config(self) -> dict[str, object] | None:
+        locked = self._meta_value("replay_execution_config")
+        if locked is None:
+            return None
+        if not isinstance(locked, dict):
+            raise TypeError("stored replay execution config is not a mapping")
+        return locked
+
+    def ensure_replay_execution_config(
+        self, config: BacktestConfig, base_currency: str
+    ) -> None:
+        """Lock only settings that can affect persistent fills, cashflows or NAV."""
+
+        expected = {
+            "schema_version": 1,
+            "initial_cash": float(config.initial_cash),
+            "base_currency": base_currency,
+            "execution_price_basis": config.execution_price_basis,
+            "max_fx_staleness_days": config.max_fx_staleness_days,
+            "cash_annual_yield": float(config.cash_annual_yield),
+            "dividend_withholding": asdict(config.dividend_withholding),
+            "us_costs": asdict(config.us_costs),
+            "tw_costs": asdict(config.tw_costs),
+        }
+        existing = self.replay_execution_config()
+        if existing is not None:
+            if existing != expected:
+                raise ValueError(
+                    "persistent replay execution config conflicts with locked ledger assumptions"
+                )
+            return
+        activity = any(
+            self.connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+            is not None
+            for table in (
+                "nav",
+                "orders",
+                "fills",
+                "cash_interest_credits",
+                "corporate_actions",
+                "terminal_events",
+                "cash_in_lieu_receivables",
+            )
+        )
+        if activity:
+            raise ValueError(
+                "legacy paper ledger lacks a replay execution config lock; "
+                "manual assumption audit or a fresh ledger is required"
+            )
+        self._set_meta("replay_execution_config", expected)
+        self.connection.commit()
+
+    def verify_committed_snapshots(
+        self,
+        data: MarketData,
+        execution_reference: pd.DataFrame,
+        benchmark_close_base: pd.Series | None,
+        snapshot_root: str | Path | None,
+    ) -> None:
+        """Verify SQLite links, manifest/file hashes and every snapshotted data row."""
+
+        rows = self.connection.execute(
+            "SELECT c.timestamp, c.snapshot_dataset_id, c.data_fingerprint, "
+            "s.dataset_id, s.path FROM session_commits AS c "
+            "LEFT JOIN snapshots AS s ON s.timestamp=c.timestamp "
+            "ORDER BY c.timestamp"
+        ).fetchall()
+        orphan = self.connection.execute(
+            "SELECT timestamp FROM snapshots WHERE timestamp NOT IN "
+            "(SELECT timestamp FROM session_commits) LIMIT 1"
+        ).fetchone()
+        if orphan is not None:
+            raise ValueError(
+                f"snapshot linkage has an uncommitted session: {orphan['timestamp']}"
+            )
+        if not rows:
+            return
+        linked = [row for row in rows if row["snapshot_dataset_id"] is not None]
+        if linked and snapshot_root is None:
+            raise ValueError(
+                "existing session snapshots require the original snapshot_root for replay"
+            )
+        expected_root = None if snapshot_root is None else Path(snapshot_root).resolve()
+        for row in rows:
+            stamp = pd.Timestamp(row["timestamp"])
+            linked_id = row["snapshot_dataset_id"]
+            stored_id = row["dataset_id"]
+            if linked_id != stored_id or (stored_id is not None and row["path"] is None):
+                raise ValueError(f"snapshot linkage mismatch on {stamp.date()}")
+            if linked_id is None:
+                continue
+            directory = Path(str(row["path"]))
+            if expected_root is not None and directory.resolve().parent != expected_root:
+                raise ValueError(f"snapshot root conflicts with committed path on {stamp.date()}")
+            try:
+                manifest_data = load_market_data_snapshot(directory)
+            except Exception as exc:
+                raise ValueError(
+                    f"snapshot integrity verification failed on {stamp.date()}"
+                ) from exc
+            manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+            if str(manifest["dataset_id"]) != linked_id:
+                raise ValueError(f"snapshot dataset ID mismatch on {stamp.date()}")
+            if (
+                list(manifest_data.close.index) != [stamp]
+                or manifest.get("start") != stamp.date().isoformat()
+                or manifest.get("end") != stamp.date().isoformat()
+                or manifest.get("symbols") != manifest_data.symbols
+            ):
+                raise ValueError(f"snapshot manifest metadata mismatch on {stamp.date()}")
+            benchmark_value = (
+                None
+                if benchmark_close_base is None or stamp not in benchmark_close_base.index
+                else float(benchmark_close_base.loc[stamp])
+            )
+            digest = replay_session_data_fingerprint(
+                manifest_data,
+                stamp,
+                execution_reference.loc[stamp],
+                benchmark_value,
+            )
+            if digest != str(row["data_fingerprint"]):
+                raise ValueError(f"snapshot market data mismatch on {stamp.date()}")
 
     def verify_completed_sessions(
         self,
@@ -1396,6 +1521,10 @@ def replay_targets_persistently(
             target_weights,
             execution_reference=execution_reference,
             benchmark_close_base=benchmark_close_base,
+        )
+        ledger.ensure_replay_execution_config(config, base_currency)
+        ledger.verify_committed_snapshots(
+            data, execution_reference, benchmark_close_base, snapshot_root
         )
         if completed_at is None:
             dates = data.close.index[data.close.index >= replay_start]

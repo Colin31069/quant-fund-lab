@@ -381,6 +381,7 @@ if run:
             persistent_receivables = None
             persistent_interest_credits = None
             persistent_session_commits = None
+            persistent_replay_execution_config = None
             if persist_paper_ledger:
                 ledger = replay_targets_persistently(
                     trade_data,
@@ -401,6 +402,7 @@ if run:
                     persistent_receivables = ledger.cash_in_lieu_receivables()
                     persistent_interest_credits = ledger.cash_interest_credits()
                     persistent_session_commits = ledger.session_commits()
+                    persistent_replay_execution_config = ledger.replay_execution_config()
                 finally:
                     ledger.close()
 
@@ -656,6 +658,11 @@ if run:
                 "企業行動、執行參考價及 benchmark 的 SHA-256 指紋；"
                 "續跑前逐日核對，細節請見 Session Commits 分頁。"
             )
+            st.caption(
+                "M11-5 Execution / Snapshot audit：固定交易成本、撮合及 FX 假設；"
+                "續跑前校驗已提交 snapshot 的 SQLite 連結、manifest、檔案 hash "
+                "及每日重播輸入指紋。"
+            )
             persistent_tax = summarize_dividend_tax(persistent_actions)
             st.caption(
                 "Dividend cashflow：gross "
@@ -686,7 +693,7 @@ if run:
                 "SQLite: artifacts/paper_trading.sqlite；每日可重現 market snapshots: "
                 "artifacts/paper_snapshots/。未成交數量會保持 NEW/PARTIAL 並在後續交易日重試。"
             )
-            pt1, pt2, pt3, pt4, pt5, pt6, pt7, pt8 = st.tabs(
+            pt1, pt2, pt3, pt4, pt5, pt6, pt7, pt8, pt9 = st.tabs(
                 [
                     "Persistent Orders",
                     "Persistent Fills",
@@ -696,6 +703,7 @@ if run:
                     "Cash Interest Credits",
                     "Session Commits",
                     "Daily Snapshots",
+                    "Execution Assumptions",
                 ]
             )
             with pt1:
@@ -714,6 +722,8 @@ if run:
                 st.dataframe(persistent_session_commits, use_container_width=True, height=300)
             with pt8:
                 st.dataframe(persistent_snapshots, use_container_width=True, height=300)
+            with pt9:
+                st.json(persistent_replay_execution_config)
 
         if robustness is not None:
             st.subheader("M5-4 Robustness Lab")
