@@ -651,6 +651,11 @@ if run:
                 f"{len(persistent_session_commits)} / {len(persistent_nav)} NAV sessions；"
                 "每日利息、成交、企業行動、NAV 與收盤目標訂單同筆 SQLite 交易提交。"
             )
+            st.caption(
+                "M11-4 Replay data lock：每個完成日保存價格、成交量、FX、"
+                "企業行動、執行參考價及 benchmark 的 SHA-256 指紋；"
+                "續跑前逐日核對，細節請見 Session Commits 分頁。"
+            )
             persistent_tax = summarize_dividend_tax(persistent_actions)
             st.caption(
                 "Dividend cashflow：gross "

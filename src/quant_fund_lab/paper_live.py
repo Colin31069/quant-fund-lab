@@ -28,6 +28,7 @@ from .execution import (
     transition_safe_reference,
 )
 from .fx import currency_for_symbol, validate_fx
+from .replay_provenance import replay_session_data_fingerprint
 from .snapshot import SnapshotManifest, save_market_data_snapshot
 
 _OPEN_ORDER_STATUSES = ("NEW", "PARTIAL")
@@ -214,12 +215,14 @@ class PaperLedger:
                 timestamp TEXT PRIMARY KEY REFERENCES nav(timestamp),
                 had_signal INTEGER NOT NULL CHECK(had_signal IN (0, 1)),
                 signal_fingerprint TEXT NOT NULL,
-                snapshot_dataset_id TEXT
+                snapshot_dataset_id TEXT,
+                data_fingerprint TEXT NOT NULL DEFAULT ''
             );
             """
         )
         self._migrate_corporate_action_schema()
         self._migrate_nav_schema()
+        self._migrate_session_commit_schema()
         self.connection.commit()
 
     def _migrate_corporate_action_schema(self) -> None:
@@ -277,6 +280,16 @@ class PaperLedger:
         if "cumulative_cash_interest" not in columns:
             self.connection.execute(
                 "ALTER TABLE nav ADD COLUMN cumulative_cash_interest REAL NOT NULL DEFAULT 0"
+            )
+
+    def _migrate_session_commit_schema(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(session_commits)").fetchall()
+        }
+        if "data_fingerprint" not in columns:
+            self.connection.execute(
+                "ALTER TABLE session_commits ADD COLUMN data_fingerprint TEXT NOT NULL DEFAULT ''"
             )
 
     def _get_meta(self, key: str) -> str | None:
@@ -370,12 +383,17 @@ class PaperLedger:
         return frame
 
     def verify_completed_sessions(
-        self, data: MarketData, target_weights: pd.DataFrame
+        self,
+        data: MarketData,
+        target_weights: pd.DataFrame,
+        *,
+        execution_reference: pd.DataFrame,
+        benchmark_close_base: pd.Series | None = None,
     ) -> pd.Timestamp | None:
-        """Require a durable completion marker for every NAV before continuing."""
+        """Verify all historical prices, FX, corporate actions and signals before continuation."""
 
         rows = self.connection.execute(
-            "SELECT timestamp, had_signal, signal_fingerprint "
+            "SELECT timestamp, had_signal, signal_fingerprint, data_fingerprint "
             "FROM session_commits ORDER BY timestamp"
         ).fetchall()
         nav_rows = self.connection.execute(
@@ -388,10 +406,33 @@ class PaperLedger:
                 "paper ledger NAV is missing session completion markers; "
                 "legacy or incomplete sessions require manual recovery"
             )
+        missing_history = [stamp for stamp in nav_dates if stamp not in data.close.index]
+        if missing_history:
+            raise ValueError(
+                "replay data is missing completed sessions required for provenance verification: "
+                f"{missing_history[0].date()}"
+            )
         for row in rows:
             timestamp = pd.Timestamp(row["timestamp"])
-            if timestamp not in data.close.index:
-                continue
+            fingerprint = str(row["data_fingerprint"])
+            if not fingerprint:
+                raise ValueError(
+                    "legacy paper ledger has no replay data fingerprint for "
+                    f"{timestamp.date()}; manual provenance audit is required"
+                )
+            benchmark_value = (
+                None
+                if benchmark_close_base is None or timestamp not in benchmark_close_base.index
+                else float(benchmark_close_base.loc[timestamp])
+            )
+            observed = replay_session_data_fingerprint(
+                data, timestamp, execution_reference.loc[timestamp], benchmark_value
+            )
+            if fingerprint != observed:
+                raise ValueError(
+                    f"replay data fingerprint mismatch on {timestamp.date()}; "
+                    "completed session inputs have changed"
+                )
             had_signal = bool(row["had_signal"])
             supplied_signal = timestamp in target_weights.index
             if had_signal != supplied_signal:
@@ -410,9 +451,13 @@ class PaperLedger:
         self,
         timestamp: pd.Timestamp,
         target_weights: pd.Series | None,
+        *,
+        data_fingerprint: str,
     ) -> None:
-        """Record the close signal in the same transaction as NAV and all daily events."""
+        """Commit the close signal and canonical market-data provenance with the daily NAV."""
 
+        if len(data_fingerprint) != 64 or any(c not in "0123456789abcdef" for c in data_fingerprint):
+            raise ValueError("session data_fingerprint must be a SHA-256 hexadecimal digest")
         stamp = pd.Timestamp(timestamp).isoformat()
         if self.connection.execute(
             "SELECT 1 FROM nav WHERE timestamp=?", (stamp,)
@@ -423,13 +468,14 @@ class PaperLedger:
         ).fetchone()
         self.connection.execute(
             "INSERT INTO session_commits("
-            "timestamp, had_signal, signal_fingerprint, snapshot_dataset_id"
-            ") VALUES(?, ?, ?, ?)",
+            "timestamp, had_signal, signal_fingerprint, snapshot_dataset_id, data_fingerprint"
+            ") VALUES(?, ?, ?, ?, ?)",
             (
                 stamp,
                 int(target_weights is not None),
                 "" if target_weights is None else _signal_fingerprint(target_weights),
                 None if snapshot is None else str(snapshot["dataset_id"]),
+                data_fingerprint,
             ),
         )
 
@@ -1269,6 +1315,8 @@ def replay_targets_persistently(
         raise ValueError("target_weights cannot be empty")
     if not target_weights.index.is_unique or not data.close.index.is_unique:
         raise ValueError("persistent replay requires unique session and target timestamps")
+    if not data.close.columns.is_unique:
+        raise ValueError("persistent replay requires unique symbol identifiers")
     required_metadata = data.membership.fillna(False) | data.terminal_returns.notna()
     if data.market_codes is not None and bool(
         (required_metadata & data.market_codes.isna()).any().any()
@@ -1343,7 +1391,12 @@ def replay_targets_persistently(
             else pd.Timestamp(pending_row["value"])
         )
         replay_start = first_signal if pending_date is None else min(first_signal, pending_date)
-        completed_at = ledger.verify_completed_sessions(data, target_weights)
+        completed_at = ledger.verify_completed_sessions(
+            data,
+            target_weights,
+            execution_reference=execution_reference,
+            benchmark_close_base=benchmark_close_base,
+        )
         if completed_at is None:
             dates = data.close.index[data.close.index >= replay_start]
         else:
@@ -1354,6 +1407,14 @@ def replay_targets_persistently(
                 target_weights.loc[timestamp].reindex(data.symbols).fillna(0.0)
                 if timestamp in target_weights.index
                 else None
+            )
+            benchmark_value = (
+                None
+                if benchmark_close_base is None or timestamp not in benchmark_close_base.index
+                else float(benchmark_close_base.loc[timestamp])
+            )
+            data_fingerprint = replay_session_data_fingerprint(
+                data, timestamp, execution_reference.loc[timestamp], benchmark_value
             )
             with ledger.connection:
                 ledger.accrue_cash_interest(timestamp, commit=False)
@@ -1413,9 +1474,6 @@ def replay_targets_persistently(
                     currency_codes,
                     commit=False,
                 )
-                benchmark_value = None
-                if benchmark_close_base is not None and timestamp in benchmark_close_base.index:
-                    benchmark_value = float(benchmark_close_base.loc[timestamp])
                 ledger.mark_close(
                     timestamp,
                     valuation_close.loc[timestamp],
@@ -1437,7 +1495,9 @@ def replay_targets_persistently(
                         currency_codes,
                         commit=False,
                     )
-                ledger.record_session_commit(timestamp, target_weights_today)
+                ledger.record_session_commit(
+                    timestamp, target_weights_today, data_fingerprint=data_fingerprint
+                )
         return ledger
     except BaseException:
         ledger.close()
