@@ -351,19 +351,28 @@ def run_odd_lot_research(
             currency_codes=currencies,
         )
         actions.extend(asdict(event) for event in settlement)
-        # Adjust model stop levels and cancel stale entry orders across split/dividend events.
+        # Cash dividends are declared per pre-event share.  Apply them before a
+        # simultaneous stock dividend/split, and adjust all price levels on the
+        # same pre-event-share basis.
         for symbol in data.symbols:
             ratio = float(data.stock_splits.at[date, symbol])
             dividend = float(data.dividends.at[date, symbol])
-            if np.isfinite(ratio) and ratio > 0 and not np.isclose(ratio, 1.0):
+            has_split = np.isfinite(ratio) and ratio > 0 and not np.isclose(ratio, 1.0)
+            if symbol in stops and np.isfinite(dividend) and dividend > 0:
+                stops[symbol].stop = max(0.0, stops[symbol].stop - dividend)
+                stops[symbol].high_close = max(0.0, stops[symbol].high_close - dividend)
+            if has_split:
                 if symbol in stops:
                     stops[symbol].stop /= ratio
                     stops[symbol].high_close /= ratio
                 if symbol in pending and pending[symbol].side == "BUY":
                     del pending[symbol]
-            if np.isfinite(dividend) and dividend > 0 and symbol in stops:
-                stops[symbol].stop = max(0.0, stops[symbol].stop - dividend)
-                stops[symbol].high_close = max(0.0, stops[symbol].high_close - dividend)
+        dividend_events = apply_cash_dividend_events(
+            state, data.dividends.loc[date], date, withholding=config.dividend_withholding,
+            market_codes=None if data.market_codes is None else data.market_codes.loc[date],
+            currency_codes=currencies,
+        )
+        actions.extend(asdict(event) for event in dividend_events)
         split_events = apply_stock_split_events(
             state, data.stock_splits.loc[date], raw_open.loc[date], date,
             currency_codes=currencies,
@@ -372,20 +381,14 @@ def run_odd_lot_research(
             receivables=receivables,
         )
         actions.extend(asdict(event) for event in split_events)
-        dividend_events = apply_cash_dividend_events(
-            state, data.dividends.loc[date], date, withholding=config.dividend_withholding,
-            market_codes=None if data.market_codes is None else data.market_codes.loc[date],
-            currency_codes=currencies,
-        )
-        actions.extend(asdict(event) for event in dividend_events)
         reference = close_now.copy()
         for symbol in data.symbols:
             ratio = float(data.stock_splits.at[date, symbol])
             dividend = float(data.dividends.at[date, symbol])
-            if np.isfinite(ratio) and ratio > 0 and not np.isclose(ratio, 1.0):
-                reference[symbol] /= ratio
             if np.isfinite(dividend) and dividend > 0:
                 reference[symbol] = max(float(reference[symbol]) - dividend, 0.0)
+            if np.isfinite(ratio) and ratio > 0 and not np.isclose(ratio, 1.0):
+                reference[symbol] /= ratio
         terminal = apply_terminal_returns(
             state, data.terminal_returns.loc[date], reference, date,
             currency_codes=currencies,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,6 +39,12 @@ from quant_fund_lab.reporting import export_research_report, verify_research_rep
 from quant_fund_lab.robustness import build_robustness_report
 from quant_fund_lab.snapshot import save_market_data_snapshot
 from quant_fund_lab.tax_analytics import dividend_tax_by_currency, summarize_dividend_tax
+from quant_fund_lab.twse_odd_lot import (
+    download_twse_bundle,
+    import_twse_file,
+    populate_cash_dividends,
+    prepare_twse_odd_lot,
+)
 from quant_fund_lab.ui_inputs import load_verified_ui_inputs
 from quant_fund_lab.walkforward import (
     WalkForwardSpec,
@@ -52,10 +59,37 @@ st.caption("數學 Alpha → 風險模型 → 組合最佳化 → 模擬成交�
 with st.sidebar:
     st.header("研究設定")
     odd_lot_study = st.checkbox("十萬元台股零股策略研究", value=False)
-    data_mode = st.selectbox(
-        "資料來源",
-        ["Yahoo 公開市場資料", "離線合成資料", "M8 Verified Lifecycle Snapshot"],
-    )
+    data_modes = (["TWSE 官方歷史資料", "離線合成資料"] if odd_lot_study else
+                  ["Yahoo 公開市場資料", "離線合成資料", "M8 Verified Lifecycle Snapshot"])
+    data_mode = st.selectbox("資料來源", data_modes)
+    twse_mode = data_mode == "TWSE 官方歷史資料"
+    twse_directory = ""
+    twse_download = False
+    twse_authorized = False
+    twse_cash_events = False
+    if twse_mode:
+        twse_directory = st.text_input("TWSE 資料包目錄", "artifacts/twse_odd_lot")
+        twse_download = st.checkbox("使用已授權的 TWSE 自動下載", value=False)
+        if twse_download:
+            twse_authorized = st.checkbox("證交所已同意這種自動化存取方式", value=False)
+            st.caption("證交所網站使用條款限制自動化下載；未獲同意時請匯入官方檔案。")
+        twse_cash_events = st.checkbox("從官方索引補入純現金股利", value=True)
+        st.caption("除權息明細、分割及停牌須提供官方佐證；尚未完成的期間不計算績效。")
+        with st.expander("匯入已下載的證交所檔案"):
+            import_path = st.text_input("官方 JSON／CSV 檔案路徑")
+            import_kind = st.selectbox("檔案類型", ["price", "ex_right_index", "etf_split_index", "par_change_index", "reduction_index", "holiday_index"])
+            import_url = st.text_input("證交所來源網址", "https://www.twse.com.tw/")
+            import_symbol = st.text_input("價格股票代碼", "2330.TW")
+            import_month = st.text_input("價格月份（YYYY-MM）", "2025-06")
+            import_year = st.number_input("企業行動索引年度", min_value=2010, max_value=2100, value=2025)
+            if st.button("匯入官方檔案"):
+                try:
+                    imported = import_twse_file(twse_directory, import_path, kind=import_kind,
+                                                source_url=import_url, symbol=import_symbol,
+                                                month=import_month, year=int(import_year))
+                    st.success(f"已匯入：{imported}")
+                except (OSError, ValueError, KeyError) as exc:
+                    st.error(f"匯入失敗：{exc}")
     verified_mode = data_mode == "M8 Verified Lifecycle Snapshot"
     if verified_mode:
         symbols_text = st.text_input("交易 Security IDs", "")
@@ -81,7 +115,11 @@ with st.sidebar:
         lifecycle_snapshot_directory = ""
         cash_in_lieu_snapshot_directory = ""
     base_currency = st.selectbox("投資組合基準幣別", ["TWD", "USD"])
-    end_date = st.date_input("結束日", value=datetime.now(timezone.utc).date())
+    taipei_now = datetime.now(timezone(timedelta(hours=8)))
+    end_default = taipei_now.date()
+    if odd_lot_study and taipei_now.hour < 18:
+        end_default -= timedelta(days=1)
+    end_date = st.date_input("結束日", value=end_default)
     start_date = st.date_input(
         "開始日", value=datetime(2021, 1, 1).date() if odd_lot_study else end_date - timedelta(days=365 * 4)
     )
@@ -275,7 +313,28 @@ if run:
     try:
         with st.spinner("載入資料並執行 walk-forward paper replay..."):
             source_data_provenance: dict[str, str] = {}
-            if verified_mode:
+            twse_inputs = None
+            if twse_mode:
+                warmup_start = start_date - timedelta(days=250)
+                if twse_download:
+                    download_twse_bundle(twse_directory, all_symbols, str(warmup_start), str(end_date),
+                                         authorized=twse_authorized)
+                if twse_cash_events:
+                    populate_cash_dividends(twse_directory, all_symbols)
+                twse_inputs = prepare_twse_odd_lot(twse_directory, all_symbols, str(warmup_start), str(end_date))
+                raw = twse_inputs.data
+                trade_data = raw
+                trade_symbols = requested_trade_assets
+                benchmark_symbol = requested_benchmark
+                source_data_provenance = twse_inputs.provenance
+                data_provider = "twse_official"
+                provider_attempts = ((data_provider, True, None),)
+                if twse_inputs.issues:
+                    st.warning(f"官方資料檢查發現 {len(twse_inputs.issues)} 項問題；受影響期間不計算績效。")
+                    st.dataframe(pd.DataFrame([asdict(issue) for issue in twse_inputs.issues]), use_container_width=True)
+                else:
+                    st.success("資料包檢查通過；歷史發布與修訂時間仍未獨立驗證。")
+            elif verified_mode:
                 verified_inputs = load_verified_ui_inputs(
                     market_snapshot_directory,
                     lifecycle_snapshot_directory,
@@ -398,7 +457,8 @@ if run:
                 strategy=strategy,
             )
             if odd_lot_study:
-                raw = raw.slice(start=start_date, end=end_date)
+                if not twse_mode:
+                    raw = raw.slice(start=start_date, end=end_date)
                 assumptions = OddLotResearchConfig(
                     risk_budget=float(odd_lot_risk),
                     max_weight=float(max_weight),
@@ -410,6 +470,9 @@ if run:
                     benchmark=benchmark_symbol, research=assumptions, base_config=config,
                     source=data_provider, source_provenance=source_data_provenance,
                     holdout_untouched=holdout_untouched,
+                    source_files=twse_inputs.source_files if twse_inputs else None,
+                    source_hashes=twse_inputs.source_hashes if twse_inputs else None,
+                    quality_issues=[asdict(issue) for issue in twse_inputs.issues] if twse_inputs else None,
                 )
                 study = run_frozen_odd_lot_study(frozen)
                 report = export_odd_lot_study_report(frozen, study)
@@ -1005,7 +1068,9 @@ if run:
             st.dataframe(comparison.paper_replay.alphas.tail(50), use_container_width=True, height=420)
 
     except Exception as exc:  # noqa: BLE001 - UI boundary must surface provider/runtime errors.
-        if odd_lot_study and "raw prices appear split-adjusted" in str(exc):
+        if twse_mode:
+            st.error(f"TWSE 資料準備失敗：{exc}。請核對資料包及來源，已下載檔案可供重試。")
+        elif odd_lot_study and "raw prices appear split-adjusted" in str(exc):
             st.error(
                 "資料中的原始價格疑似已調整拆股，繼續計算會重複套用企業行動。"
                 "請使用經確認的未調整價格與拆股資料，或先選合成資料測試流程。"
