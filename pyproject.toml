@@ -34,6 +34,9 @@ version = {attr = "quant_fund_lab.__version__"}
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+filterwarnings = [
+  "ignore:The 'generic' unit for NumPy timedelta is deprecated:DeprecationWarning",
+]
 
 [tool.ruff]
 line-length = 100

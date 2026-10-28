@@ -24,6 +24,8 @@ from .execution import (
     apply_terminal_returns,
     prior_session_liquidity,
 )
+from .market_calendar import require_valid_daily_sessions
+from .models import ensemble_alpha
 from .odd_lot_execution import (
     default_instrument_rules,
     fee_breakdown,
@@ -32,8 +34,6 @@ from .odd_lot_execution import (
     trade_fees,
     validate_instrument_rules,
 )
-from .market_calendar import require_valid_daily_sessions
-from .models import ensemble_alpha
 from .portfolio import optimize_weights
 from .research import detect_market_regime, neutralize_alpha, regime_adjusted_alpha
 from .trade_analytics import position_episodes, summarize_episodes
@@ -85,7 +85,7 @@ class OddLotResearchConfig:
         if self.fee_rounding not in {"fractional", "floor", "nearest"}:
             raise ValueError("invalid fee rounding assumption")
         if not isinstance(self.instrument_rules, dict):
-            raise ValueError("instrument rules must be a mapping")
+            raise TypeError("instrument rules must be a mapping")
         validate_instrument_rules(list(self.instrument_rules), self.instrument_rules)
 
 
