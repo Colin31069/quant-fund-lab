@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,7 @@ from quant_fund_lab.data_quality import validate_corporate_actions
 from quant_fund_lab.diagnostics import diagnose_walk_forward
 from quant_fund_lab.factors import research_factors
 from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
+from quant_fund_lab.odd_lot_execution import default_instrument_rules
 from quant_fund_lab.odd_lot_research import OddLotResearchConfig
 from quant_fund_lab.odd_lot_study import (
     SAMPLE_BENCHMARK,
@@ -226,8 +228,20 @@ with st.sidebar:
         st.markdown("**台股零股研究假設**")
         odd_lot_risk = st.number_input("單筆預估風險預算（TWD）", min_value=1.0, value=2_000.0, step=100.0)
         odd_lot_fee = st.number_input("最低手續費情境（每筆 TWD）", min_value=0.0, value=20.0, step=1.0)
+        odd_lot_commission = st.number_input("手續費率（bps）", min_value=0.0, value=14.25, step=0.25)
+        odd_lot_slippage = st.number_input("滑價情境（bps）", min_value=0.0, value=5.0, step=1.0)
+        odd_lot_limit = st.number_input("限價距權息調整參考價（%）", min_value=0.0, max_value=99.0, value=1.0, step=0.5)
+        odd_lot_fill = st.slider("單筆委託模擬成交比例（%）", 1, 100, 50)
+        odd_lot_participation = st.number_input("歷史普通成交量參與率上限（%）", min_value=0.01, max_value=100.0, value=5.0, step=1.0)
+        odd_lot_impact = st.number_input("市場衝擊係數", min_value=0.0, value=0.10, step=0.01)
+        odd_lot_rounding = st.selectbox("手續費與證交稅進位假設", ["fractional", "floor", "nearest"],
+                                        format_func=lambda x: {"fractional": "保留小數", "floor": "捨去至元", "nearest": "四捨五入至元"}[x])
+        instrument_rules_text = st.text_area(
+            "交易標的規則（JSON）", value=json.dumps(default_instrument_rules(), ensure_ascii=False, indent=2),
+            help="每個交易標的須明確指定 kind（stock/etf）、sell_tax_bps、price_limit_pct；null 表示無漲跌幅限制。這是全研究期間的情境假設，不會自動辨識歷史例外。",
+        )
         holdout_untouched = st.checkbox("確認 2025 年後資料尚未用於此策略調參", value=False)
-        st.caption("整股開盤及歷史成交量僅為零股代理；收盤觸發止損，次交易日嘗試退出。")
+        st.caption("整股開盤及歷史成交量僅為零股代理，成交比例並非真實成交機率；收盤觸發止損，次交易日嘗試退出。T+2 以資料交易日代理，賣款在當日開盤後入帳。")
         st.caption("進階 Factor / CVaR / Walk-forward 設定不套用於此研究；帳本存檔只供稽核，無法續跑。")
     run = st.button("執行模型", type="primary", use_container_width=True)
 
@@ -265,20 +279,25 @@ def render_odd_lot_study(study: OddLotStudyResult, frozen: Path, report: Path, p
     st.caption("供應商價格是否為真實未調整價格、股息實際入帳時間與零股歷史成交價尚未獨立驗證。")
     if study.unavailable:
         st.info("部分期間資料不足：" + "; ".join(f"{key}: {value}" for key, value in study.unavailable.items()))
-    st.subheader("手續費與滑價敏感度（2024 驗證期）")
+    st.subheader("手續費、滑價與成交比例敏感度（2024 驗證期）")
     st.dataframe(study.sensitivity, use_container_width=True)
     keys = list(study.results)
     if keys:
         selected = st.selectbox("研究明細", keys, format_func=lambda item: f"{item[0]} / {item[1]}")
         detail = study.results[selected]
         st.line_chart(detail.equity_curve["equity"])
-        a, b, c = st.tabs(["完整與未平倉交易", "進出場訊號", "成交紀錄"])
+        a, b, c, d, e = st.tabs(["完整與未平倉交易", "進出場訊號", "成交紀錄", "限價委託", "交割明細"])
         with a:
             st.dataframe(detail.episodes, use_container_width=True)
         with b:
             st.dataframe(detail.signals, use_container_width=True)
         with c:
             st.dataframe(detail.fills, use_container_width=True)
+        with d:
+            st.dataframe(detail.orders, use_container_width=True)
+        with e:
+            st.dataframe(detail.settlements, use_container_width=True)
+            st.dataframe(detail.equity_curve[["cash", "settled_cash", "buy_payables", "sale_receivables", "sale_payables"]], use_container_width=True)
 
 
 if run:
@@ -464,6 +483,14 @@ if run:
                     max_weight=float(max_weight),
                     rebalance_every=int(rebalance_every),
                     min_commission=float(odd_lot_fee),
+                    commission_bps=float(odd_lot_commission),
+                    slippage_bps=float(odd_lot_slippage),
+                    limit_offset=float(odd_lot_limit) / 100,
+                    fill_fraction=float(odd_lot_fill) / 100,
+                    max_participation=float(odd_lot_participation) / 100,
+                    impact_coefficient=float(odd_lot_impact),
+                    fee_rounding=odd_lot_rounding,
+                    instrument_rules=json.loads(instrument_rules_text),
                 )
                 frozen = freeze_odd_lot_study(
                     raw, "artifacts/odd_lot_studies", symbols=tuple(trade_symbols),

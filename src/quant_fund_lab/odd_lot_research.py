@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from math import floor, sqrt
 
 import numpy as np
@@ -21,10 +21,16 @@ from .corporate_actions import (
 from .data import MarketData
 from .execution import (
     PortfolioState,
-    _trade_costs,
     apply_terminal_returns,
-    execute_market_order,
     prior_session_liquidity,
+)
+from .odd_lot_execution import (
+    default_instrument_rules,
+    fee_breakdown,
+    round_price,
+    simulate_limit_order,
+    trade_fees,
+    validate_instrument_rules,
 )
 from .market_calendar import require_valid_daily_sessions
 from .models import ensemble_alpha
@@ -47,6 +53,13 @@ class OddLotResearchConfig:
     max_stop_distance: float = 0.12
     min_commission: float = 20.0
     slippage_bps: float = 5.0
+    commission_bps: float = 14.25
+    limit_offset: float = 0.01
+    fill_fraction: float = 0.50
+    fee_rounding: str = "fractional"
+    max_participation: float = 0.05
+    impact_coefficient: float = 0.10
+    instrument_rules: dict[str, dict] = field(default_factory=default_instrument_rules)
 
     def __post_init__(self) -> None:
         if self.strategy not in {"ensemble", "momentum", "equal_weight"}:
@@ -61,12 +74,27 @@ class OddLotResearchConfig:
             raise ValueError("invalid stop distances")
         if self.volatility_multiplier <= 0 or self.min_commission < 0 or self.slippage_bps < 0:
             raise ValueError("invalid volatility or execution assumption")
+        if not all(np.isfinite(x) for x in (self.volatility_multiplier, self.min_commission,
+                   self.slippage_bps, self.commission_bps, self.limit_offset, self.fill_fraction,
+                   self.max_participation, self.impact_coefficient)):
+            raise ValueError("execution assumptions must be finite")
+        if self.commission_bps < 0 or not 0 <= self.limit_offset < 1 or not 0 < self.fill_fraction <= 1:
+            raise ValueError("invalid limit, fill or commission assumption")
+        if not 0 < self.max_participation <= 1 or self.impact_coefficient < 0:
+            raise ValueError("invalid liquidity or impact assumption")
+        if self.fee_rounding not in {"fractional", "floor", "nearest"}:
+            raise ValueError("invalid fee rounding assumption")
+        if not isinstance(self.instrument_rules, dict):
+            raise ValueError("instrument rules must be a mapping")
+        validate_instrument_rules(list(self.instrument_rules), self.instrument_rules)
 
 
 @dataclass(frozen=True)
 class OddLotResearchResult:
     equity_curve: pd.DataFrame
     fills: pd.DataFrame
+    orders: pd.DataFrame
+    settlements: pd.DataFrame
     corporate_actions: pd.DataFrame
     terminal_events: pd.DataFrame
     signals: pd.DataFrame
@@ -142,6 +170,9 @@ def odd_lot_backtest_config(
             max_order_shares=999,
             min_commission=research.min_commission,
             slippage_bps=research.slippage_bps,
+            commission_bps=research.commission_bps,
+            max_participation=research.max_participation,
+            impact_coefficient=research.impact_coefficient,
         ),
         strategy=replace(
             base.strategy,
@@ -152,20 +183,22 @@ def odd_lot_backtest_config(
 
 
 def _estimated_risk(
-    quantity: int, price: float, stop: float, volume: float, costs: MarketCostConfig
+    quantity: int, price: float, stop: float, volume: float, costs: MarketCostConfig,
+    kind: str = "stock", fee_rounding: str = "fractional",
 ) -> float:
     if quantity <= 0:
         return 0.0
     impact = costs.impact_coefficient * sqrt(quantity / max(volume, 1.0)) / 100.0
     slip = costs.slippage_bps / 10_000.0 + impact
-    buy = quantity * price * (1.0 + slip)
-    sell = quantity * stop * max(0.0, 1.0 - slip)
-    return buy + _trade_costs("BUY", buy, costs) - sell + _trade_costs("SELL", sell, costs)
+    buy = quantity * round_price(price * (1.0 + slip), kind, "up")
+    exit_price = stop * max(0.0, 1.0 - slip)
+    sell = quantity * round_price(exit_price, kind, "down") if exit_price >= 0.01 else 0.0
+    return buy + trade_fees("BUY", buy, costs, fee_rounding) - sell + trade_fees("SELL", sell, costs, fee_rounding)
 
 
 def _entry_quantity(
     price: float, stop: float, volume: float, equity: float, weight: float,
-    research: OddLotResearchConfig, costs: MarketCostConfig,
+    research: OddLotResearchConfig, costs: MarketCostConfig, kind: str,
 ) -> int:
     if not np.isfinite(price) or not np.isfinite(stop) or price <= stop or stop <= 0 or volume <= 0:
         return 0
@@ -174,7 +207,7 @@ def _entry_quantity(
     low = 0
     while low < high:
         mid = (low + high + 1) // 2
-        if _estimated_risk(mid, price, stop, volume, costs) <= research.risk_budget:
+        if _estimated_risk(mid, price, stop, volume, costs, kind, research.fee_rounding) <= research.risk_budget:
             low = mid
         else:
             high = mid - 1
@@ -249,6 +282,7 @@ def run_odd_lot_research(
     if not data.close.columns.is_unique:
         raise ValueError("research symbols must be unique")
     validate_raw_split_basis(data)
+    validate_instrument_rules(data.symbols, research.instrument_rules)
     require_valid_daily_sessions(data.close.index, "TW")
     if data.base_currency not in (None, "TWD"):
         raise ValueError("odd-lot research requires TWD market data")
@@ -284,16 +318,28 @@ def run_odd_lot_research(
     terminated: set[str] = set()
     receivables: list[CashInLieuReceivable] = []
     fills: list[dict] = []
+    orders: list[dict] = []
+    settlements: list[dict] = []
     actions: list[dict] = []
     terminal_events: list[dict] = []
     signal_rows: list[dict] = []
-    equity_rows = [{"timestamp": dates[start_index], "equity": state.cash, "cash": state.cash, "receivable_value": 0.0}]
+    equity_rows = [{"timestamp": dates[start_index], "equity": state.cash, "cash": state.cash,
+                    "settled_cash": state.cash, "buy_payables": 0.0,
+                    "sale_receivables": 0.0, "sale_payables": 0.0, "receivable_value": 0.0}]
     passive_submitted = False
+
+    def unsettled(side: str) -> float:
+        return sum(item["amount"] for item in settlements
+                   if item["side"] == side and item["settled_at"] is None and item["amount"] >= 0)
+
+    def sale_payables() -> float:
+        return sum(-item["amount"] for item in settlements if item["side"] == "SELL"
+                   and item["settled_at"] is None and item["amount"] < 0)
 
     for i in range(start_index, end_index):
         signal_date, date = dates[i], dates[i + 1]
         close_now = raw_close.loc[signal_date]
-        equity = state.equity(close_now)
+        equity = state.equity(close_now) + unsettled("SELL")
         # A stop has precedence over every model and is checked daily, not weekly.
         for symbol, stop in list(stops.items()):
             price = float(close_now.get(symbol, np.nan))
@@ -312,7 +358,9 @@ def run_odd_lot_research(
             history = data.close.iloc[: i + 1]
             eligible = data.membership.loc[signal_date].copy()
             eligible.loc[eligible.index.intersection(terminated)] = False
-            previous = state.weights(close_now)
+            previous = pd.Series({symbol: state.shares.get(symbol, 0) * float(close_now[symbol]) / equity
+                                  if equity > 0 and pd.notna(close_now[symbol]) else 0.0
+                                  for symbol in data.symbols}, dtype=float)
             scores, weights = _targets(history, eligible, research, config.strategy, previous)
             for symbol in data.symbols:
                 held = state.shares.get(symbol, 0)
@@ -335,7 +383,9 @@ def run_odd_lot_research(
                     if research.strategy == "equal_weight":
                         qty = min(999, floor(equity * float(weights[symbol]) / price)) if price > 0 else 0
                     else:
-                        qty = _entry_quantity(price, stop_price, known_volume, equity, float(weights[symbol]), research, config.tw_costs)
+                        costs = replace(config.tw_costs, sell_tax_bps=research.instrument_rules[symbol]["sell_tax_bps"])
+                        qty = _entry_quantity(price, stop_price, known_volume, equity, float(weights[symbol]),
+                                              research, costs, research.instrument_rules[symbol]["kind"])
                     if qty:
                         pending[symbol] = _Order("BUY", qty, "entry", stop_price, price, distance, known_volume)
                         signal_rows.append({"timestamp": signal_date, "symbol": symbol, "reason": "entry", "price": price, "stop": stop_price, "score": float(scores[symbol]), "weight": float(weights[symbol])})
@@ -385,6 +435,9 @@ def run_odd_lot_research(
         for symbol in data.symbols:
             ratio = float(data.stock_splits.at[date, symbol])
             dividend = float(data.dividends.at[date, symbol])
+            if not np.isfinite(ratio) or not np.isfinite(dividend):
+                reference[symbol] = np.nan
+                continue
             if np.isfinite(dividend) and dividend > 0:
                 reference[symbol] = max(float(reference[symbol]) - dividend, 0.0)
             if np.isfinite(ratio) and ratio > 0 and not np.isclose(ratio, 1.0):
@@ -413,31 +466,78 @@ def run_odd_lot_research(
                     and research.strategy != "equal_weight"
                     and sum(qty > 0 for qty in state.shares.values()) >= research.max_positions
                 ):
+                    orders.append({"timestamp": date, "symbol": symbol, "side": side,
+                                   "reason": order.reason, "requested_quantity": order.quantity,
+                                   "filled_quantity": 0, "expired_quantity": order.quantity,
+                                   "limit_price": None, "reference_price": float(reference[symbol]),
+                                   "open_proxy": float(raw_open.at[date, symbol]),
+                                   "liquidity_proxy": float(liquidity.at[date, symbol]),
+                                   "status": "expired", "outcome": "position_limit"})
+                    del pending[symbol]
                     continue
-                qty = state.shares.get(symbol, 0) if side == "SELL" else order.quantity
-                fill = execute_market_order(
+                qty = min(state.shares.get(symbol, 0), 999) if side == "SELL" else min(order.quantity, 999)
+                rule = research.instrument_rules[symbol]
+                costs = replace(config.tw_costs, sell_tax_bps=rule["sell_tax_bps"])
+                fill, limit_price, outcome = simulate_limit_order(
                     state, symbol, side, qty, float(raw_open.at[date, symbol]),
-                    float(liquidity.at[date, symbol]), float(reference[symbol]), date, config,
-                    market_code="TW", local_currency="TWD",
+                    float(liquidity.at[date, symbol]), float(reference[symbol]), date, costs,
+                    rule, research.limit_offset, research.fill_fraction, research.fee_rounding,
                 )
+                filled_quantity = 0 if fill is None else fill.quantity
+                orders.append({"timestamp": date, "symbol": symbol, "side": side,
+                               "reason": order.reason, "requested_quantity": qty,
+                               "filled_quantity": filled_quantity, "expired_quantity": qty - filled_quantity,
+                               "limit_price": limit_price, "reference_price": float(reference[symbol]),
+                               "open_proxy": float(raw_open.at[date, symbol]),
+                               "liquidity_proxy": float(liquidity.at[date, symbol]),
+                               "status": "filled" if filled_quantity == qty and qty else
+                                         "partial_expired" if filled_quantity else "expired",
+                               "outcome": outcome})
+                if side == "BUY":
+                    # Exchange orders expire daily; no automatic top-up of a partial entry.
+                    del pending[symbol]
                 if fill is None:
                     continue
+                amount = fill.gross_value + fill.fees if side == "BUY" else fill.gross_value - fill.fees
+                if side == "SELL" and amount >= 0:
+                    # Sell proceeds are an economic receivable until T+2 close.
+                    state.cash -= amount
+                settlements.append({"trade_date": date, "symbol": symbol, "side": side,
+                                    "amount": amount, "settled_at": None,
+                                    "due_session_index": i + 3})
                 record = asdict(fill)
+                record["commission"], record["sell_tax"] = fee_breakdown(
+                    side, fill.gross_value, costs, research.fee_rounding,
+                )
                 record["reason"] = order.reason
                 record["planned_risk"] = 0.0
                 if side == "BUY":
                     if research.strategy != "equal_weight":
-                        record["planned_risk"] = _estimated_risk(fill.quantity, order.signal_price, order.stop, order.signal_volume, config.tw_costs)
+                        record["planned_risk"] = _estimated_risk(
+                            fill.quantity, order.signal_price, order.stop, order.signal_volume,
+                            costs, rule["kind"], research.fee_rounding,
+                        )
                         stops[symbol] = _Stop(order.stop, order.signal_price, order.distance)
-                    del pending[symbol]
                 elif state.shares.get(symbol, 0) <= 0:
                     stops.pop(symbol, None)
                     del pending[symbol]
                 fills.append(record)
+        # The T+2 proceeds are credited after this day's open, so they cannot fund
+        # today's orders. The observed session sequence is the settlement proxy.
+        for item in settlements:
+            if item["settled_at"] is None and item["due_session_index"] == i + 1:
+                item["settled_at"] = date
+                if item["side"] == "SELL" and item["amount"] >= 0:
+                    state.cash += item["amount"]
         state.receivable_value = mark_cash_in_lieu_receivables(
             receivables, raw_close.loc[date], currency_codes=currencies
         )
-        equity_rows.append({"timestamp": date, "equity": state.equity(raw_close.loc[date]), "cash": state.cash, "receivable_value": state.receivable_value})
+        buy_payables, sale_receivables = unsettled("BUY"), unsettled("SELL")
+        equity_rows.append({"timestamp": date, "equity": state.equity(raw_close.loc[date]) + sale_receivables,
+                            "cash": state.cash, "settled_cash": state.cash + buy_payables + sale_payables(),
+                            "buy_payables": buy_payables, "sale_receivables": sale_receivables,
+                            "sale_payables": sale_payables(),
+                            "receivable_value": state.receivable_value})
 
     curve = pd.DataFrame(equity_rows).set_index("timestamp")
     fills_df, actions_df, terminal_df = pd.DataFrame(fills), pd.DataFrame(actions), pd.DataFrame(terminal_events)
@@ -445,6 +545,13 @@ def run_odd_lot_research(
     return OddLotResearchResult(
         equity_curve=curve,
         fills=fills_df,
+        orders=pd.DataFrame(orders),
+        settlements=pd.DataFrame([
+            {**{key: value for key, value in item.items() if key != "due_session_index"},
+             "status": "settled" if item["settled_at"] is not None else "pending_end_of_data",
+             "sessions_remaining": max(0, item["due_session_index"] - end_index)}
+            for item in settlements
+        ]),
         corporate_actions=actions_df,
         terminal_events=terminal_df,
         signals=pd.DataFrame(signal_rows),

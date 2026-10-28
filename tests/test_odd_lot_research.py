@@ -213,9 +213,16 @@ def test_frozen_study_export_and_account_assumptions_are_locked(tmp_path):
     assert "development/momentum" in study.unavailable
     report = export_odd_lot_study_report(root, study)
     assert verify_odd_lot_study_report(report)
+    manifest = json.loads((report / "report_manifest.json").read_text())
+    assert "execution_summary.csv" in manifest["files"]
+    assert "validation_momentum_orders.csv" in manifest["files"]
+    assert "validation_momentum_settlements.csv" in manifest["files"]
     ledger = report / "study_ledger.sqlite"
     result = study.results[("validation", "momentum")]
     assert verify_odd_lot_account_settings(ledger, "validation/momentum", result)
+    with sqlite3.connect(ledger) as db:
+        assert db.execute("SELECT COUNT(*) FROM orders").fetchone()[0] > 0
+        assert db.execute("SELECT COUNT(*) FROM settlements").fetchone()[0] > 0
     different = replace(result, config=replace(result.config, risk_budget=500.0))
     assert not verify_odd_lot_account_settings(ledger, "validation/momentum", different)
     with sqlite3.connect(ledger) as db, pytest.raises(sqlite3.IntegrityError, match="settings are locked"):

@@ -17,6 +17,7 @@ from . import __version__
 from .analytics import buy_and_hold_equity, performance_metrics
 from .config import BacktestConfig, DividendWithholdingConfig, MarketCostConfig, StrategyConfig
 from .data import MarketData
+from .odd_lot_execution import validate_instrument_rules
 from .odd_lot_research import (
     OddLotResearchConfig,
     OddLotResearchResult,
@@ -93,6 +94,7 @@ def freeze_odd_lot_study(
     symbols = tuple(dict.fromkeys(symbols))
     if len(symbols) < 2 or benchmark in symbols:
         raise ValueError("study requires at least two distinct trade assets and a separate benchmark")
+    validate_instrument_rules(list(symbols), research.instrument_rules)
     data = _subset(data, [*symbols, benchmark])
     if data.close.index.has_duplicates or not data.close.index.is_monotonic_increasing:
         raise ValueError("study dates must be unique and chronological")
@@ -117,7 +119,7 @@ def freeze_odd_lot_study(
         if source_hashes is not None and set(source_hashes) != set(archived_sources):
             raise ValueError("source file inventory changed during study preparation")
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "dataset_id": snapshot.dataset_id,
             "package_version": __version__,
             "symbols": list(symbols),
@@ -129,7 +131,8 @@ def freeze_odd_lot_study(
             "source_provenance": dict(source_provenance or {}),
             "holdout_untouched": bool(holdout_untouched),
             "liquidity_model": "prior_20_session_median_v1",
-            "execution_assumption": "ordinary_open_as_odd_lot_proxy",
+            "execution_assumption": "daily_limit_order_ordinary_open_proxy_v2",
+            "settlement_assumption": "observed_market_sessions_as_t_plus_2_proxy_credit_after_open",
             "survivorship_warning": "fixed contemporary sample, not a point-in-time universe",
         }
         if source_files is not None:
@@ -259,13 +262,23 @@ def run_frozen_odd_lot_study(directory: str | Path) -> OddLotStudyResult:
     for strategy in ("ensemble", "momentum"):
         if ("validation", strategy) not in results:
             continue
-        for commission, slippage in ((0.0, 5.0), (20.0, 5.0), (50.0, 5.0), (20.0, 10.0)):
-            scenario = replace(research, strategy=strategy, min_commission=commission, slippage_bps=slippage)
+        scenarios = list(dict.fromkeys((
+            (0.0, 5.0, research.fill_fraction), (20.0, 5.0, research.fill_fraction),
+            (50.0, 5.0, research.fill_fraction), (20.0, 10.0, research.fill_fraction),
+            (research.min_commission, research.slippage_bps, 0.25),
+            (research.min_commission, research.slippage_bps, 0.50),
+            (research.min_commission, research.slippage_bps, 1.00),
+        )))
+        for commission, slippage, fraction in scenarios:
+            scenario = replace(research, strategy=strategy, min_commission=commission,
+                               slippage_bps=slippage, fill_fraction=fraction)
             if scenario == results[("validation", strategy)].config:
                 result = results[("validation", strategy)]
             else:
                 result = run_odd_lot_research(period_data["validation"], scenario, base, start=start, end=end)
-            sensitivity.append({"strategy": strategy, "min_commission": commission, "slippage_bps": slippage, **result.metrics, **result.trade_summary})
+            sensitivity.append({"strategy": strategy, "min_commission": commission,
+                                "slippage_bps": slippage, "fill_fraction": fraction,
+                                **result.metrics, **result.trade_summary})
     return OddLotStudyResult(
         study_id=metadata["study_id"], dataset_id=metadata["dataset_id"],
         comparison=pd.DataFrame(rows), sensitivity=pd.DataFrame(sensitivity),
@@ -285,6 +298,22 @@ def export_odd_lot_study_report(directory: str | Path, study: OddLotStudyResult)
     _write_account_archive(target / "study_ledger.sqlite", study)
     study.comparison.to_csv(target / "comparison.csv", index=False)
     study.sensitivity.to_csv(target / "sensitivity.csv", index=False)
+    execution_rows = []
+    for (period, strategy), result in study.results.items():
+        order_status = result.orders.get("status", pd.Series(dtype=str))
+        last = result.equity_curve.iloc[-1]
+        execution_rows.append({"period": period, "strategy": strategy, "orders": len(order_status),
+                               "filled_orders": int(order_status.eq("filled").sum()),
+                               "partial_expired_orders": int(order_status.eq("partial_expired").sum()),
+                               "expired_orders": int(order_status.eq("expired").sum()),
+                               "commission": float(result.fills.get("commission", pd.Series(dtype=float)).sum()),
+                               "sell_tax": float(result.fills.get("sell_tax", pd.Series(dtype=float)).sum()),
+                               "slippage_cost": float(result.fills.get("slippage_cost", pd.Series(dtype=float)).sum()),
+                               "available_cash": last["cash"], "buy_payables": last["buy_payables"],
+                               "sale_receivables": last["sale_receivables"],
+                               "sale_payables": last["sale_payables"]})
+    execution_summary = pd.DataFrame(execution_rows)
+    execution_summary.to_csv(target / "execution_summary.csv", index=False)
     quality = pd.DataFrame(metadata.get("quality_issues", []), columns=["start", "end", "symbol", "detail"])
     quality.to_csv(target / "quality_issues.csv", index=False)
     (target / "assumptions.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
@@ -294,19 +323,22 @@ def export_odd_lot_study_report(directory: str | Path, study: OddLotStudyResult)
         "<style>body{font-family:system-ui;margin:2em}table{border-collapse:collapse}"
         "th,td{padding:.4em;border:1px solid #ccc}</style></head><body>"
         "<h1>台股零股研究</h1><p>模擬資料、普通交易開盤代理價格與歷史成交量代理；"
-        "不保證實際零股成交或止損。固定現存股票池有存活者偏差；"
+        "成交比例、限價和成本為情境假設，不保證實際零股成交或止損。"
+        "以資料交易日作 T+2 交割日代理，未確認交割日曆或券商可用資金規則；"
+        "固定現存股票池有存活者偏差；"
         "股利與股票股利在除權息日模擬入帳，歷史資料修訂及發布時間未獨立驗證。</p>"
         + ("<p>2025 年後的歷史評估為探索性，未證實為獨立樣本外結果。</p>" if not study.holdout_untouched else "") +
         ("<p>必要資料尚未通過檢查，沒有可報告的績效。</p>" if study.comparison.empty else "") +
         "<h2>分段比較</h2>" + study.comparison.to_html(index=False) +
         "<h2>成本敏感度（驗證期）</h2>" + study.sensitivity.to_html(index=False) +
+        "<h2>委託與交割摘要</h2>" + execution_summary.to_html(index=False) +
         "<h2>不可用區段及原因</h2>" + pd.DataFrame([{"period": k, "reason": v} for k, v in study.unavailable.items()]).to_html(index=False, escape=True) +
         "<h2>資料品質問題明細</h2>" + quality.to_html(index=False, escape=True) +
         "</body></html>", encoding="utf-8"
     )
     for (period, strategy), result in study.results.items():
         prefix = f"{period}_{strategy}"
-        for name in ("equity_curve", "fills", "signals", "episodes", "corporate_actions", "terminal_events"):
+        for name in ("equity_curve", "fills", "orders", "settlements", "signals", "episodes", "corporate_actions", "terminal_events"):
             getattr(result, name).to_csv(target / f"{prefix}_{name}.csv", index=name == "equity_curve")
     hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(target.iterdir()) if path.is_file()}
     manifest = {"study_id": study.study_id, "dataset_id": study.dataset_id, "files": hashes}
@@ -349,7 +381,7 @@ def _write_account_archive(path: Path, study: OddLotStudyResult) -> None:
                 (account_id, study.study_id, study.dataset_id, settings,
                  hashlib.sha256(settings.encode()).hexdigest()),
             )
-            for name in ("equity_curve", "fills", "signals", "episodes", "corporate_actions", "terminal_events"):
+            for name in ("equity_curve", "fills", "orders", "settlements", "signals", "episodes", "corporate_actions", "terminal_events"):
                 frame = getattr(result, name)
                 if frame.empty:
                     continue
