@@ -19,6 +19,7 @@ from .execution import (
     PortfolioState,
     apply_terminal_returns,
     market_for_symbol,
+    prior_session_liquidity,
     rebalance_at_open,
     transition_safe_reference,
 )
@@ -131,6 +132,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         data.currency_codes,
     )
     dates = data.close.index
+    execution_liquidity = prior_session_liquidity(data.volume)
     if len(dates) < strategy.warmup_days + 2:
         raise ValueError(f"need at least {strategy.warmup_days + 2} bars")
 
@@ -178,7 +180,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
         close_now = valuation_close.loc[signal_date]
         open_next = execution_open.loc[execution_date]
         close_next = valuation_close.loc[execution_date]
-        volume_next = data.volume.loc[execution_date]
+        volume_next = execution_liquidity.loc[execution_date]
         reference_next = execution_reference.loc[execution_date]
         fx_signal = fx_to_base.loc[signal_date]
         fx_next = fx_to_base.loc[execution_date]
@@ -201,8 +203,8 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
             )
         else:
             state.receivable_value = 0.0
-        signal_receivable_value = state.receivable_value
         signal_equity = state.equity(close_now, fx_signal)
+        signal_weights = state.weights(close_now, fx_signal).reindex(data.symbols).fillna(0.0)
         running_peak = max(running_peak, signal_equity)
         current_drawdown = max(0.0, 1.0 - signal_equity / max(running_peak, 1e-12))
         cash_interest = accrue_base_cash_interest(
@@ -307,10 +309,7 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                 alpha = raw_alpha.where(eligible, 0.0)
             alpha = alpha.reindex(data.symbols).fillna(0.0)
             returns = history.pct_change(fill_method=None).tail(strategy.covariance_lookback)
-            execution_receivable_value = state.receivable_value
-            state.receivable_value = signal_receivable_value
-            previous = state.weights(close_now, fx_signal).reindex(data.symbols).fillna(0.0)
-            state.receivable_value = execution_receivable_value
+            previous = signal_weights
             gross_limit = regime.gross_exposure_limit if strategy.regime_enabled else 1.0
             target = optimize_weights(
                 alpha,
@@ -329,8 +328,6 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
                     "gross_exposure_limit": gross_limit,
                 }
             )
-            terminal_symbols = terminal_next[terminal_next.notna()].index
-            target.loc[target.index.intersection(terminal_symbols)] = 0.0
             risk_result = apply_portfolio_risk_controls(
                 target,
                 returns,
@@ -387,9 +384,14 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
             weight_row.name = signal_date
             weight_rows.append(weight_row)
 
+            # Terminal status is observed on the execution day; it must not
+            # alter the target recorded for the preceding signal close.
+            execution_target = target.copy()
+            terminal_symbols = terminal_next[terminal_next.notna()].index
+            execution_target.loc[execution_target.index.intersection(terminal_symbols)] = 0.0
             fills = rebalance_at_open(
                 state=state,
-                target_weights=target,
+                target_weights=execution_target,
                 open_prices=open_next,
                 volumes=volume_next,
                 reference_prices=reference_next,

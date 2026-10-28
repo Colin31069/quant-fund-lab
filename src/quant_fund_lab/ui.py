@@ -19,6 +19,16 @@ from quant_fund_lab.data_quality import validate_corporate_actions
 from quant_fund_lab.diagnostics import diagnose_walk_forward
 from quant_fund_lab.factors import research_factors
 from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
+from quant_fund_lab.odd_lot_research import OddLotResearchConfig
+from quant_fund_lab.odd_lot_study import (
+    SAMPLE_BENCHMARK,
+    SAMPLE_SYMBOLS,
+    OddLotStudyResult,
+    export_odd_lot_study_report,
+    freeze_odd_lot_study,
+    run_frozen_odd_lot_study,
+    verify_odd_lot_study_report,
+)
 from quant_fund_lab.paper import historical_vs_paper_replay
 from quant_fund_lab.paper_live import replay_targets_persistently
 from quant_fund_lab.paper_workflow import plan_persistent_paper_run
@@ -41,6 +51,7 @@ st.caption("數學 Alpha → 風險模型 → 組合最佳化 → 模擬成交�
 
 with st.sidebar:
     st.header("研究設定")
+    odd_lot_study = st.checkbox("十萬元台股零股策略研究", value=False)
     data_mode = st.selectbox(
         "資料來源",
         ["Yahoo 公開市場資料", "離線合成資料", "M8 Verified Lifecycle Snapshot"],
@@ -62,19 +73,23 @@ with st.sidebar:
             "此模式只接受 stable security_id；market/lifecycle 與選填 settlement snapshot 都會先做 hash / dataset-ID 驗證。"
         )
     else:
-        symbols_text = st.text_input("交易標的", "AAPL,MSFT,NVDA,GOOGL")
-        benchmark = st.text_input("比較基準", "SPY")
+        symbols_text = st.text_input(
+            "交易標的", ",".join(SAMPLE_SYMBOLS) if odd_lot_study else "AAPL,MSFT,NVDA,GOOGL"
+        )
+        benchmark = st.text_input("比較基準", SAMPLE_BENCHMARK if odd_lot_study else "SPY")
         market_snapshot_directory = ""
         lifecycle_snapshot_directory = ""
         cash_in_lieu_snapshot_directory = ""
     base_currency = st.selectbox("投資組合基準幣別", ["TWD", "USD"])
     end_date = st.date_input("結束日", value=datetime.now(timezone.utc).date())
-    start_date = st.date_input("開始日", value=end_date - timedelta(days=365 * 4))
+    start_date = st.date_input(
+        "開始日", value=datetime(2021, 1, 1).date() if odd_lot_study else end_date - timedelta(days=365 * 4)
+    )
     initial_cash = st.number_input(
         f"虛擬初始資金（{base_currency}）",
         min_value=10_000.0,
-        value=1_000_000.0,
-        step=100_000.0,
+        value=100_000.0 if odd_lot_study else 1_000_000.0,
+        step=10_000.0 if odd_lot_study else 100_000.0,
     )
     cash_annual_yield_pct = st.number_input(
         "閒置現金年收益假設（%）",
@@ -90,7 +105,7 @@ with st.sidebar:
     execution_price_basis = st.selectbox(
         "成交/持倉價格基準",
         ["adjusted", "raw"],
-        index=0,
+        index=1 if odd_lot_study else 0,
         help="adjusted 維持總報酬價格；raw 會另行入帳 split/dividend corporate actions。",
     )
     st.markdown("**M9 股息稅務假設**")
@@ -101,10 +116,10 @@ with st.sidebar:
         "TW 股息預扣率（%）", min_value=0.0, max_value=100.0, value=0.0, step=1.0
     )
     st.caption("僅 raw-price corporate-action 模式套用；預設 0%，不替使用者假定稅務身分。")
-    max_weight = st.slider("單一標的最大權重", 0.05, 0.50, 0.25, 0.05)
+    max_weight = st.slider("單一標的最大權重", 0.05, 0.50, 0.20 if odd_lot_study else 0.25, 0.05)
     rebalance_every = st.slider("再平衡頻率（交易日）", 1, 20, 5)
     train_fraction = st.slider("回測 / paper replay 切分", 0.55, 0.90, 0.70, 0.05)
-    run_walkforward = st.checkbox("執行 M2 Walk-forward OOS", value=False)
+    run_walkforward = st.checkbox("執行 M2 Walk-forward OOS", value=False, disabled=odd_lot_study)
     walkforward_objective = st.selectbox("Walk-forward 選參指標", ["calmar", "sharpe", "annual_return"])
     st.markdown("**M2-3 風險研究**")
     regime_enabled = st.checkbox("Regime detection", value=True)
@@ -116,7 +131,7 @@ with st.sidebar:
         "Risk-budget penalty", 0.0, 0.010, 0.001, 0.001, format="%.3f"
     )
     st.markdown("**M3 Persistent Paper Trading**")
-    persist_paper_ledger = st.checkbox("啟用本機 persistent paper ledger", value=False)
+    persist_paper_ledger = st.checkbox("啟用本機 persistent paper ledger", value=False, disabled=odd_lot_study)
     paper_ledger_path = Path("artifacts/paper_trading.sqlite")
     paper_snapshot_root = Path("artifacts/paper_snapshots")
     paper_ledger_mode = "continue"
@@ -151,21 +166,31 @@ with st.sidebar:
     st.markdown("**M4 Production Hardening**")
     export_verifiable_report = st.checkbox("匯出可驗證研究報告", value=False)
     st.markdown("**M5 Factor Laboratory**")
-    run_factor_research = st.checkbox("執行因子 IC / Decay 研究", value=False)
-    enable_factor_alpha = st.checkbox("啟用 trailing-IC Factor Alpha overlay", value=False)
+    run_factor_research = st.checkbox("執行因子 IC / Decay 研究", value=False, disabled=odd_lot_study)
+    enable_factor_alpha = st.checkbox("啟用 trailing-IC Factor Alpha overlay", value=False, disabled=odd_lot_study)
     factor_alpha_weight = st.slider("Factor Alpha overlay 權重", 0.0, 0.60, 0.30, 0.05)
-    enable_vol_target = st.checkbox("Volatility targeting", value=False)
+    enable_vol_target = st.checkbox("Volatility targeting", value=False, disabled=odd_lot_study)
     target_annual_volatility = st.slider("目標年化波動", 0.05, 0.30, 0.12, 0.01)
-    enable_cvar_control = st.checkbox("CVaR / Expected Shortfall cap", value=False)
+    enable_cvar_control = st.checkbox("CVaR / Expected Shortfall cap", value=False, disabled=odd_lot_study)
     max_daily_cvar = st.slider("最大日 CVaR", 0.005, 0.050, 0.025, 0.005, format="%.3f")
-    enable_drawdown_control = st.checkbox("Drawdown de-risking", value=False)
+    enable_drawdown_control = st.checkbox("Drawdown de-risking", value=False, disabled=odd_lot_study)
     drawdown_soft_limit = st.slider("Drawdown soft limit", 0.05, 0.20, 0.10, 0.01)
     drawdown_hard_min = min(drawdown_soft_limit + 0.05, 0.40)
     drawdown_hard_limit = st.slider(
         "Drawdown hard limit", drawdown_hard_min, 0.50, max(0.20, drawdown_hard_min), 0.01
     )
     drawdown_min_exposure = st.slider("Hard-limit 最低風險曝險", 0.0, 0.75, 0.25, 0.05)
-    run_robustness = st.checkbox("執行 M5-4 Robustness Lab", value=False)
+    run_robustness = st.checkbox("執行 M5-4 Robustness Lab", value=False, disabled=odd_lot_study)
+    odd_lot_risk = 2_000.0
+    odd_lot_fee = 20.0
+    holdout_untouched = False
+    if odd_lot_study:
+        st.markdown("**台股零股研究假設**")
+        odd_lot_risk = st.number_input("單筆預估風險預算（TWD）", min_value=1.0, value=2_000.0, step=100.0)
+        odd_lot_fee = st.number_input("最低手續費情境（每筆 TWD）", min_value=0.0, value=20.0, step=1.0)
+        holdout_untouched = st.checkbox("確認 2025 年後資料尚未用於此策略調參", value=False)
+        st.caption("整股開盤及歷史成交量僅為零股代理；收盤觸發止損，次交易日嘗試退出。")
+        st.caption("進階 Factor / CVaR / Walk-forward 設定不套用於此研究；帳本存檔只供稽核，無法續跑。")
     run = st.button("執行模型", type="primary", use_container_width=True)
 
 
@@ -185,6 +210,39 @@ def load_data(
     return result.data, result.provider, attempts
 
 
+def render_odd_lot_study(study: OddLotStudyResult, frozen: Path, report: Path, provider: str) -> None:
+    st.subheader("台股零股策略研究")
+    st.warning(
+        "價格與成交量是普通交易資料的代理，不能保證零股成交或止損；"
+        "現存股票示例池有存活者偏差。"
+    )
+    if provider == "synthetic":
+        st.warning("目前為合成測試資料，不代表真實市場或策略績效。")
+    if not study.holdout_untouched:
+        st.warning("2025 年後資料是否已用於調參未確認；歷史評估應視為探索性結果。")
+    st.caption(f"研究 ID：{study.study_id}；資料 ID：{study.dataset_id}。")
+    st.caption(f"凍結資料：{frozen}；報告：{report}；報告校驗：{'PASS' if verify_odd_lot_study_report(report) else 'FAIL'}。")
+    st.dataframe(study.comparison, use_container_width=True)
+    st.caption("完整交易少於 30 筆標示樣本不足；30 筆以上也不代表策略已獲證實。市場基準是未扣交易成本的總報酬代理。")
+    st.caption("供應商價格是否為真實未調整價格、股息實際入帳時間與零股歷史成交價尚未獨立驗證。")
+    if study.unavailable:
+        st.info("部分期間資料不足：" + "; ".join(f"{key}: {value}" for key, value in study.unavailable.items()))
+    st.subheader("手續費與滑價敏感度（2024 驗證期）")
+    st.dataframe(study.sensitivity, use_container_width=True)
+    keys = list(study.results)
+    if keys:
+        selected = st.selectbox("研究明細", keys, format_func=lambda item: f"{item[0]} / {item[1]}")
+        detail = study.results[selected]
+        st.line_chart(detail.equity_curve["equity"])
+        a, b, c = st.tabs(["完整與未平倉交易", "進出場訊號", "成交紀錄"])
+        with a:
+            st.dataframe(detail.episodes, use_container_width=True)
+        with b:
+            st.dataframe(detail.signals, use_container_width=True)
+        with c:
+            st.dataframe(detail.fills, use_container_width=True)
+
+
 if run:
     requested_trade_assets = [
         s.strip() if verified_mode else s.strip().upper()
@@ -195,6 +253,12 @@ if run:
     all_symbols = list(dict.fromkeys(requested_trade_assets + [requested_benchmark]))
     if len(requested_trade_assets) < 2:
         st.error("至少提供兩個交易標的，橫斷面模型才有意義。")
+        st.stop()
+    if odd_lot_study and persist_paper_ledger:
+        st.error("零股策略研究使用獨立的凍結研究紀錄；目前不能續跑一般 persistent paper ledger。")
+        st.stop()
+    if odd_lot_study and (base_currency != "TWD" or execution_price_basis != "raw"):
+        st.error("台股零股研究需要 TWD 基準幣別及 raw 成交價格。")
         st.stop()
     paper_ledger_reset = True
     if persist_paper_ledger:
@@ -311,13 +375,13 @@ if run:
                 factor_neutralization=factor_neutralization,
                 factor_neutralization_strength=factor_neutralization_strength,
                 risk_budget_penalty=risk_budget_penalty,
-                factor_alpha_enabled=enable_factor_alpha,
+                factor_alpha_enabled=enable_factor_alpha and not odd_lot_study,
                 factor_alpha_weight=factor_alpha_weight,
-                volatility_target_enabled=enable_vol_target,
+                volatility_target_enabled=enable_vol_target and not odd_lot_study,
                 target_annual_volatility=target_annual_volatility,
-                cvar_control_enabled=enable_cvar_control,
+                cvar_control_enabled=enable_cvar_control and not odd_lot_study,
                 max_daily_cvar=max_daily_cvar,
-                drawdown_control_enabled=enable_drawdown_control,
+                drawdown_control_enabled=enable_drawdown_control and not odd_lot_study,
                 drawdown_soft_limit=drawdown_soft_limit,
                 drawdown_hard_limit=drawdown_hard_limit,
                 drawdown_min_exposure=drawdown_min_exposure,
@@ -333,6 +397,25 @@ if run:
                 ),
                 strategy=strategy,
             )
+            if odd_lot_study:
+                raw = raw.slice(start=start_date, end=end_date)
+                assumptions = OddLotResearchConfig(
+                    risk_budget=float(odd_lot_risk),
+                    max_weight=float(max_weight),
+                    rebalance_every=int(rebalance_every),
+                    min_commission=float(odd_lot_fee),
+                )
+                frozen = freeze_odd_lot_study(
+                    raw, "artifacts/odd_lot_studies", symbols=tuple(trade_symbols),
+                    benchmark=benchmark_symbol, research=assumptions, base_config=config,
+                    source=data_provider, source_provenance=source_data_provenance,
+                    holdout_untouched=holdout_untouched,
+                )
+                study = run_frozen_odd_lot_study(frozen)
+                report = export_odd_lot_study_report(frozen, study)
+                st.session_state["odd_lot_study_result"] = (study, frozen, report, data_provider)
+                render_odd_lot_study(study, frozen, report, data_provider)
+                st.stop()
             comparison = historical_vs_paper_replay(trade_data, config, train_fraction=train_fraction)
             robustness = (
                 build_robustness_report(
@@ -723,14 +806,15 @@ if run:
             )
             if persistent_ledger_audit.is_valid:
                 st.success(
-                    "M11-7 Independent ledger audit：PASS；"
+                    "M11-8 Independent ledger audit：PASS；"
                     f"已核對 {persistent_ledger_audit.nav_sessions} 個 NAV、"
                     f"{persistent_ledger_audit.fills} 筆成交及 "
-                    f"{persistent_ledger_audit.cash_credits} 筆現金入息。"
+                    f"{persistent_ledger_audit.cash_credits} 筆現金入息，"
+                    "並重建逐日現金流與損益。"
                 )
             else:
                 st.error(
-                    "M11-7 Independent ledger audit：FAIL；"
+                    "M11-8 Independent ledger audit：FAIL；"
                     + persistent_ledger_audit.issues[0]
                 )
             persistent_tax = summarize_dividend_tax(persistent_actions)
@@ -921,6 +1005,16 @@ if run:
             st.dataframe(comparison.paper_replay.alphas.tail(50), use_container_width=True, height=420)
 
     except Exception as exc:  # noqa: BLE001 - UI boundary must surface provider/runtime errors.
-        st.exception(exc)
+        if odd_lot_study and "raw prices appear split-adjusted" in str(exc):
+            st.error(
+                "資料中的原始價格疑似已調整拆股，繼續計算會重複套用企業行動。"
+                "請使用經確認的未調整價格與拆股資料，或先選合成資料測試流程。"
+                f" 詳細資訊：{exc}"
+            )
+        else:
+            st.exception(exc)
 else:
-    st.info("設定標的後按「執行模型」。第一次可先選『離線合成資料』驗證整套引擎。")
+    if odd_lot_study and "odd_lot_study_result" in st.session_state:
+        render_odd_lot_study(*st.session_state["odd_lot_study_result"])
+    else:
+        st.info("設定標的後按「執行模型」。第一次可先選『離線合成資料』驗證整套引擎。")

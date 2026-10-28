@@ -76,7 +76,7 @@ def test_completed_ledger_locks_execution_assumptions_before_next_session(
         existing_nav = prefix.nav_history()
         existing_orders = prefix.orders()
         existing_fills = prefix.fills()
-        assert prefix._meta_value("replay_execution_config")["schema_version"] == 1
+        assert prefix._meta_value("replay_execution_config")["schema_version"] == 2
     finally:
         prefix.close()
 

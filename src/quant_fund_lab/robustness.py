@@ -28,6 +28,7 @@ def _stress_market_costs(costs: MarketCostConfig, multiplier: float) -> MarketCo
     return replace(
         costs,
         commission_bps=costs.commission_bps * multiplier,
+        min_commission=costs.min_commission * multiplier,
         slippage_bps=costs.slippage_bps * multiplier,
         impact_coefficient=costs.impact_coefficient * multiplier,
     )

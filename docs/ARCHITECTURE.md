@@ -1,5 +1,11 @@
 # Quant Fund Lab — Architecture Plan
 
+## M12 — 十萬元台股零股研究（v0.12.0）
+
+獨立研究引擎 `odd_lot_research` 將 1–999 股委託、收盤觸發／次日退出、追蹤止損、單筆風險預算與兩個數學模型策略接到既有成交、企業行動與投資組合元件；原 persistent paper ledger 未加入此止損狀態機。`trade_analytics` 依成交、股息、拆股、終止及延遲零股結算重建完整持倉區間；未平倉含未結算應收權利並另行估值。`odd_lot_study` 固定輸入、三個日期區段、成本情境與參數，產生 SHA-256 驗證報告及唯讀用途的帳戶存檔。Equal-weight 對照只買入持有，不套策略止損；0050 使用未扣成本的 adjusted close 作參考。
+
+Historical 與 persistent 開盤執行現在使用前 20 日成交量中位數，不再引用 execution day 全日成交量。Persistent execution config schema v2 鎖定新模型與成本欄位，並鎖定第一筆已提交 session 之前 20 日流動性輸入；舊 v1 ledger 無法安全續跑，保留帳本並另建。每日 open 價格及估計成交量仍不能證明零股實際撮合，市場休市、限價與盤中成交細節需要更完整的資料。收盤止損只表示次一 session 嘗試退出，非盤中觸價成交保證。
+
 ## 1. 目標與邊界
 
 本專案只處理**虛擬資金**，不接券商 API、不送真實訂單。標的為美股與台股，第一階段使用日線資料，交易策略與成交模擬完全分離。
@@ -227,3 +233,9 @@ Streamlit local dashboard：
 **M11-7 已完成：Read-only independent accounting reconciliation。** `ledger_audit.audit_paper_ledger(connection)` 建立只讀 `LedgerAuditReport`，不依賴重播計算出來的暫存 PortfolioState，從 SQLite 已提交列獨立核對 `PRAGMA quick_check/foreign_key_check`、NAV 與 `session_commits` 日期集合、SQL snapshot links、fills ↔ orders symbol/side/FX/fees/slippage、order requested/remaining bounds、逐日 `position_marks` 的數量×收盤價×FX／未實現損益、NAV equity component、每日/累計 cash interest、累計成交費用及滑價，並按歷史 cash-in-lieu receivable created/settled timestamps 扣除成本基礎以核對 NAV unrealized PnL。最後核對目前 positions 數量、realized PnL 加累計 cash interest 及 metadata cash；允許最近 NAV 之後只已入帳 cash credit 的 M11-2 可續跑中斷情況。稽核最多列出 100 個 issue，方法純讀 SQLite，不做修正。
 
 **回放整合與限制。** `replay_targets_persistently()` 保留 M11-4/5 的已完成日期資料與 snapshot 特定錯誤優先顯示，再於 `ensure_replay_execution_config()` 和下一個 session 之前執行 `audit_integrity()`；任何異常即 fail closed。整輪 replay 結束後再次稽核，避免顯示成功但帳本已有自相矛盾。Streamlit 顯示 PASS/FAIL 和資料筆數／異常明細。原子 SQL 交易已完成的歷史 NAV、positions、cash credit 可逐日或期末稽核，但本模組不重演每個成交價格、無法獨立證明第三方 data provenance、實際券商回報或外部快照 bytes；後者仍由 snapshot 與資料指紋 preflight 檢查。版本 `0.11.6`。
+
+**M11-8 已完成：Independent cashflow / interest reconciliation。** 稽核從 `initial_cash` 累加每個 session 已入帳的利息、企業行動、terminal proceeds、成交及費用，對照每一日 NAV cash；延後 cash-in-lieu 以 `corporate_actions` 的 settlement 記錄一次，不把 receivable 表上的同一筆結算再次加回。另核對 `equity = initial_cash + realized_pnl + unrealized_pnl`、fill price × quantity、成交滑價、企業行動的 local/base FX、股息 gross／withholding／net、股息每股金額及 cash-in-lieu quantity × settlement price。比較排除非有限數值並使用原有浮點容忍度；損益恆等式在 equity 尺度比較，避免大額資金減法造成錯誤警報。
+
+**應收款狀態與事件配對。** 每筆 cash-in-lieu receivable 必須與 pending split 的 symbol、建立日、結算日、currency 與 fractional quantity 一對一相符；結算後再與 settlement event 的日期、股數、價格、FX、現金和 realized PnL 配對。`OPEN` 不得已有結算欄位或在最新 NAV 時已逾結算日；`SETTLED` 必須有完整欄位，且現金等於 fractional quantity × price × FX、realized PnL 等於現金減成本。孤兒建立或結算事件、重複配對及狀態不一致都在續跑前攔截，即使相同 symbol 有多筆同日到期的應收款亦逐筆核對。應收款的歷史 mark 與外部來源仍不由此配對證明。
+
+**利息與續跑守門。** 每個首日以後的已完成 NAV 必須有 cash-interest credit，包含年利率為零的情況。稽核逐筆核對 `previous_close`、前一 NAV cash、鎖定利率、實際日曆天數、ACT/365 算式及入息後餘額；最多允許一筆最後 NAV 之後的舊式中斷 credit。沒有對應 NAV 的 fill／corporate-action／terminal event 一律標為未完成 session。續跑前該筆 credit 必須對應輸入中的下一個交易日，避免先提交其他日期才發現 credit 無法接續；市場資料日期也必須遞增，且此檢查發生於 SQLite 開啟或重建之前。此階段不新增 schema 或自動修復；缺少流水的既有帳本會停止續跑，需人工稽核後處理。驗證不重算外部市場資料、第三方 FX 或實際成交的真實性，也不是資料庫的密碼學防竄改證明。版本 `0.11.7`。

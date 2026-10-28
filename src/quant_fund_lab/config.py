@@ -16,6 +16,16 @@ class MarketCostConfig:
     max_participation: float = 0.05
     lot_size: int = 1
     price_limit_pct: float | None = None
+    min_commission: float = 0.0
+    max_order_shares: int | None = None
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.min_commission) or self.min_commission < 0:
+            raise ValueError("min_commission must be finite and nonnegative")
+        if self.lot_size < 1:
+            raise ValueError("lot_size must be positive")
+        if self.max_order_shares is not None and self.max_order_shares < self.lot_size:
+            raise ValueError("max_order_shares must be at least lot_size")
 
 
 @dataclass(frozen=True)

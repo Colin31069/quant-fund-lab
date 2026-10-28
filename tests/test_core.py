@@ -236,9 +236,10 @@ def test_tw_round_lot_and_locked_limit_guard():
 
 
 def test_calendar_missing_session_is_reported_but_not_fatal():
-    observed = pd.DatetimeIndex(["2025-01-08", "2025-01-10"])
+    observed = pd.DatetimeIndex(["2025-01-07", "2025-01-10"])
     report = require_valid_daily_sessions(observed, "US")
-    assert pd.Timestamp("2025-01-09") in report.missing_sessions
+    assert pd.Timestamp("2025-01-08") in report.missing_sessions
+    assert pd.Timestamp("2025-01-09") not in report.missing_sessions
 
 
 def test_calendar_rejects_off_session_bar():

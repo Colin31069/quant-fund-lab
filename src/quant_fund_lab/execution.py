@@ -3,10 +3,23 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from math import floor, sqrt
 
+import numpy as np
 import pandas as pd
 
 from .config import BacktestConfig, MarketCostConfig
 from .fx import currency_for_symbol
+
+
+def prior_session_liquidity(volume: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
+    """Estimate daily liquidity using only sessions preceding the execution date.
+
+    This is a proxy for liquidity, not observed opening-auction or odd-lot volume.
+    Missing history produces zero capacity rather than using a future observation.
+    """
+    if lookback < 1:
+        raise ValueError("liquidity lookback must be positive")
+    clean = volume.astype(float).where(np.isfinite(volume) & (volume >= 0.0))
+    return clean.rolling(lookback, min_periods=1).median().shift(1).fillna(0.0)
 
 
 @dataclass(frozen=True)
@@ -99,7 +112,7 @@ def _cost_config(
 
 
 def _trade_costs(side: str, gross: float, costs: MarketCostConfig) -> float:
-    commission = gross * costs.commission_bps / 10_000.0
+    commission = max(gross * costs.commission_bps / 10_000.0, costs.min_commission)
     sell_tax = gross * costs.sell_tax_bps / 10_000.0 if side == "SELL" else 0.0
     sec_fee = gross * costs.sec_fee_per_million / 1_000_000.0 if side == "SELL" else 0.0
     return float(commission + sell_tax + sec_fee)
@@ -268,6 +281,8 @@ def execute_market_order(
         floor(available_volume * costs.max_participation / costs.lot_size) * costs.lot_size
     )
     qty = min(int(quantity), max_liquidity_qty)
+    if costs.max_order_shares is not None:
+        qty = min(qty, costs.max_order_shares)
     qty = int(floor(qty / costs.lot_size) * costs.lot_size)
     current = state.shares.get(symbol, 0)
     if side == "SELL":
@@ -286,10 +301,12 @@ def execute_market_order(
     fees_local = _trade_costs(side, gross_local, costs)
 
     if side == "BUY":
-        per_share_cash = fill_px * (1.0 + costs.commission_bps / 10_000.0) * factor
-        affordable = int(
-            floor(state.cash / max(per_share_cash, 1e-12) / costs.lot_size) * costs.lot_size
-        )
+        cash_local = state.cash / factor
+        # Both inequalities must hold because commission is the greater of the
+        # percentage fee and the per-order minimum.
+        by_rate = cash_local / (fill_px * (1.0 + costs.commission_bps / 10_000.0))
+        by_minimum = max(cash_local - costs.min_commission, 0.0) / fill_px
+        affordable = int(floor(min(by_rate, by_minimum) / costs.lot_size) * costs.lot_size)
         qty = min(qty, affordable)
         if qty <= 0:
             return None

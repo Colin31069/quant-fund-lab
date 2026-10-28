@@ -26,6 +26,7 @@ from .execution import (
     apply_terminal_returns,
     desired_quantities,
     execute_market_order,
+    prior_session_liquidity,
     transition_safe_reference,
 )
 from .fx import currency_for_symbol, validate_fx
@@ -403,7 +404,8 @@ class PaperLedger:
         """Lock only settings that can affect persistent fills, cashflows or NAV."""
 
         expected = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "liquidity_model": "prior_20_session_median_v1",
             "initial_cash": float(config.initial_cash),
             "base_currency": base_currency,
             "execution_price_basis": config.execution_price_basis,
@@ -1248,6 +1250,14 @@ class PaperLedger:
             fx_to_base,
             currency_codes,
         )
+        # A terminal event also invalidates an unfilled buy when no position
+        # existed, in which case apply_terminal_returns emits no event row.
+        for symbol in terminal_returns[terminal_returns.notna()].index:
+            self.connection.execute(
+                "UPDATE orders SET status='CANCELLED_TERMINAL' "
+                "WHERE symbol=? AND status IN ('NEW','PARTIAL')",
+                (symbol,),
+            )
         for event in events:
             row = self._position_row(event.symbol)
             prior_avg = float(row["avg_cost_base"]) if row is not None else 0.0
@@ -1446,6 +1456,8 @@ def replay_targets_persistently(
         raise ValueError("target_weights cannot be empty")
     if not target_weights.index.is_unique or not data.close.index.is_unique:
         raise ValueError("persistent replay requires unique session and target timestamps")
+    if not data.close.index.is_monotonic_increasing:
+        raise ValueError("persistent replay requires sessions in chronological order")
     if not data.close.columns.is_unique:
         raise ValueError("persistent replay requires unique symbol identifiers")
     required_metadata = data.membership.fillna(False) | data.terminal_returns.notna()
@@ -1510,6 +1522,7 @@ def replay_targets_persistently(
         data.market_codes,
         data.currency_codes,
     )
+    execution_liquidity = prior_session_liquidity(data.volume)
     try:
         first_signal = pd.Timestamp(target_weights.index.min())
         pending_row = ledger.connection.execute(
@@ -1531,12 +1544,47 @@ def replay_targets_persistently(
         ledger.verify_committed_snapshots(
             data, execution_reference, benchmark_close_base, snapshot_root
         )
+        first_commit = ledger.connection.execute(
+            "SELECT MIN(timestamp) AS value FROM session_commits"
+        ).fetchone()["value"]
+        first_session = pd.Timestamp(first_commit) if first_commit else replay_start
+        prehistory = data.volume.loc[data.volume.index < first_session].tail(20)
+        liquidity_context = {
+            "symbols": data.symbols,
+            "dates": [pd.Timestamp(value).isoformat() for value in prehistory.index],
+            "volume": [
+                [None if pd.isna(value) else float(value).hex() for value in row]
+                for row in prehistory.to_numpy()
+            ],
+        }
+        context_hash = hashlib.sha256(
+            json.dumps(liquidity_context, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        stored_context_hash = ledger._meta_value("liquidity_prehistory_sha256")
+        if first_commit and stored_context_hash != context_hash:
+            raise ValueError("persistent replay liquidity prehistory conflicts with committed ledger")
         accounting_audit = ledger.audit_integrity()
         if not accounting_audit.is_valid:
             raise ValueError(
                 "paper ledger accounting integrity audit failed before replay: "
                 + accounting_audit.issues[0]
             )
+        if completed_at is not None:
+            pending_credit = ledger.connection.execute(
+                "SELECT timestamp FROM cash_interest_credits WHERE timestamp>? "
+                "ORDER BY timestamp LIMIT 1",
+                (completed_at.isoformat(),),
+            ).fetchone()
+            if pending_credit is not None:
+                next_sessions = data.close.index[data.close.index > completed_at]
+                if (
+                    not len(next_sessions)
+                    or pd.Timestamp(pending_credit["timestamp"]) != next_sessions[0]
+                ):
+                    raise ValueError(
+                        "incomplete persistent session cash-interest credit must match "
+                        "the next replay session"
+                    )
         ledger.ensure_replay_execution_config(config, base_currency)
         if completed_at is None:
             dates = data.close.index[data.close.index >= replay_start]
@@ -1558,6 +1606,8 @@ def replay_targets_persistently(
                 data, timestamp, execution_reference.loc[timestamp], benchmark_value
             )
             with ledger.connection:
+                if first_commit is None:
+                    ledger._set_meta("liquidity_prehistory_sha256", context_hash)
                 ledger.accrue_cash_interest(timestamp, commit=False)
                 fx = data.fx_to_base.loc[timestamp] if data.fx_to_base is not None else None
                 market_codes = (
@@ -1607,7 +1657,7 @@ def replay_targets_persistently(
                 ledger.process_open(
                     timestamp,
                     execution_open.loc[timestamp],
-                    data.volume.loc[timestamp],
+                    execution_liquidity.loc[timestamp],
                     execution_reference.loc[timestamp],
                     config,
                     fx,

@@ -26,6 +26,18 @@ pip install -e '.[dev]'
 streamlit run src/quant_fund_lab/ui.py
 ```
 
+## 十萬元台股零股研究（v0.12）
+
+啟動 Streamlit 後勾選「十萬元台股零股策略研究」，預設使用 TWD 100,000、10 檔台股範例與 0050 比較基準。選擇 Yahoo 公開市場資料，或用「離線合成資料」驗證流程。按「執行模型」後，系統先保存並驗證市場資料與參數，再比較既有三模型組合、30 交易日相對動能與同股票池等權買入持有；模型每 5 個交易日重估，最多持有 5 檔。各期間帳戶重新以初始資金開始，2021–2023 為開發期、2024 為驗證期、2025 之後為歷史評估期。資料不足的期間會顯示缺失；開發期需要資料暖機，並非一定從 2021 年第一個交易日起計算。
+
+風險預設為每筆交易預估虧損不超過 2,000 元，以訊號日前 20 個交易日報酬波動的 2 倍估計止損距離、限制在 5%–12%，再考慮估計成本決定股數。收盤觸及止損後，在下一交易日嘗試賣出；無法成交則繼續嘗試，持倉未出清前不加碼。持倉獲利後依收盤價調高追蹤止損；拆股及除息會調整價格基準。價格跳空、跌停與流動性不足可能使實際虧損超過預算。研究模式每筆委託最多 999 股；不實際連券商，也不模擬委託簿、限價撮合、單筆價格升降單位、實際零股量或交割延遲。
+
+零股價格使用普通交易隔日開盤價加上假設滑價，流動性上限使用前 20 個交易日成交量中位數，均為代理值。手續費最低額預設 20 元，並另比較 0／20／50 元及不同滑價，這不是特定券商報價。原有整張模式不變。股息在除息日模擬入帳，非實際券商入帳時間；資料來源的公司行動完整性與歷史可得時間未經獨立證實。若偵測到原始價格似乎已調整拆股，研究會停止，要求提供經確認的未調整價格；Yahoo 台股資料可能遇到此問題，不能靠此檢查證明沒有其他資料缺口。固定現存股票池有存活者偏差，研究結果不能代表全市場。
+
+報告以完整持倉區間計算平均獲利／平均虧損，並列出勝率、profit factor、交易期望值、已實現／未平倉損益、風險倍數、樣本數與最大回撤。成本已計入成交價及費用；無獲利或虧損樣本時相關比值顯示資料不足。未平倉部位以期末價格估值，不計入已完成交易；少於 30 筆標示樣本不足，達 30 筆亦非策略有效的證明。未確認 2025 年以後資料未參與調參時，歷史評估標示為探索性。
+
+凍結輸入、設定、報告與只供稽核的 SQLite 帳戶存檔位於 `artifacts/odd_lot_studies/<study_id>/`；報告附雜湊驗證，SQLite 帳戶設定鎖定。這個研究帳戶**不能續跑**一般 persistent paper ledger，亦不會覆寫舊帳本。由於成交流動性算法改為使用歷史成交量，舊版 persistent ledger 的執行設定與新版不相容，續跑會拒絕；保留舊資料，另建帳本執行新版，不自動遷移。
+
 ## 目前階段
 
 MVP + M1 + M2 完成：除交易日曆、停牌/漲跌停、交易成本、point-in-time universe、terminal return、企業行動、可重現資料快照與 USD/TWD base-currency accounting 外，研究層已加入 leak-resistant walk-forward calibration、Deflated Sharpe Ratio、White Reality Check-style stationary bootstrap，以及 M2-3 regime detection、statistical factor neutralization 與 risk-contribution budgeting。Regime 只使用 trailing market returns 調整模型混合與 gross exposure；alpha 再對 market beta / idiosyncratic volatility 做可調強度的橫斷面部分殘差化，避免一次把有效 alpha 全部投影掉；optimizer 以 normalized risk contribution penalty 抑制風險集中。M3 persistent paper trading 也已完成：SQLite ledger 保存虛擬訂單、partial/pending 狀態、fills、positions、realized/unrealized PnL、NAV、benchmark 與 reconciliation；每日市場資料以 SHA-256 snapshot 留存，ledger 可關閉後重新開啟繼續處理未成交訂單。M4 production hardening 已完成：市場資料使用 provider chain，Yahoo 失效時可回退到經 SHA-256 驗證的本機 snapshot；研究執行採 versioned config schema + dataset ID + run context 產生 deterministic run ID；JSONL audit log 使用 SHA-256 hash chain 偵測竄改；報告匯出包含 metrics、equity、fills、weights、alpha、regime、成本、run manifest 與 HTML，並附 report manifest 驗證所有檔案完整性。目前 roadmap M0–M4 已具備完整可執行骨架。
@@ -107,3 +119,5 @@ M11-5 Execution Assumption & Snapshot Linkage Audit 已完成：persistent ledge
 M11-6 Safe Resumable Paper UI 已完成：Streamlit sidebar 的本機虛擬帳本從固定 `reset=True` 改為兩種明確模式。若 SQLite 存在，預設「安全續跑既有帳本」並傳入 `reset=False`，先執行 M11-3～5 的完成日、訊號、資料指紋、執行參數與 snapshot 完整性驗證；若 SQLite 不存在，預設「建立新帳本」。既有帳本選擇重建時必須另勾選覆寫確認，並明確提示先備份 SQLite 與整個 snapshot 目錄；`paper_workflow.plan_persistent_paper_run()` 在資料下載／回測前完成純讀取守門檢查，缺少既有帳本、路徑為目錄或未確認重建都不會接觸舊帳本。續跑驗證失敗會在介面顯示錯誤與處理方式，不會自動切回重建模式。安全續跑需要保留完整已完成日期的輸入資料、相同歷史 close target schedule／權重與比較基準；更改訓練區間導致歷史訊號不同時會保守拒絕。新增 Streamlit AppTest 的 sidebar／覆寫防護測試與真實 SQLite prefix→resume／資料改動 fail-closed 整合測試。版本升為 v0.11.5。
 
 M11-7 Independent Ledger Accounting Audit 已完成：新增只讀 `PaperLedger.audit_integrity()` 與 `LedgerAuditReport`，直接稽核 SQLite 實際儲存的 NAV、持倉收盤估值、成交與訂單關聯、交易 FX/稅費計算、每日/累計可支用現金利息、累積費用與滑價、應收款成本基礎、最新持倉與 cash metadata，並以 SQLite quick_check／foreign_key_check、NAV 完成標記與 snapshot SQL 連結檢查資料庫結構。若任何既有帳務不一致，安全續跑在建立新交易日帳務前停止；正常完成重播後再核對一次，不會自動改寫、回補或掩蓋差額。舊 M11-2 已入帳、但 NAV 尚未完成的單日 cash-interest credit 可作合法中斷狀態繼續，未誤判為重複利息。Streamlit 新增 PASS/FAIL 摘要和 Ledger Accounting Audit 分頁，可檢視所有稽核問題。本稽核是會計一致性檢查，不能證明市場資料時間點正確、模擬成交確實可在市場實現，也不能替代已提交 snapshot 的獨立檔案 hash 驗證。版本升為 v0.11.6。
+
+M11-8 Cashflow and Interest Reconciliation 已完成：稽核從初始資金出發，依每日利息、企業行動（含延後 cash-in-lieu 結算）、terminal proceeds 和買賣成交重建每個 NAV 的可支用現金，並核對 equity 與初始資金加已實現／未實現損益。成交價、滑價、股息、預扣稅、結算價格與 FX 欄位也會互相核對；延後結算只計入一次，待結算應收款不得提前變現。每筆應收款會與對應的拆股建立事件及結算事件逐筆配對，並核對狀態、時間、股數、幣別、結算現金與成本基礎，避免損壞的應收款在續跑時被跳過。每筆 cash-interest credit 獨立驗證前一 NAV 日期、可支用現金、鎖定利率、ACT/365 天數、應計利息與入息後餘額；即使利率為 0%，缺少已完成日的流水仍會被攔下。沒有對應 NAV 的成交／企業行動／終止事件視為未完成 session；單筆已入息但未完成的舊式中斷仍可恢復，但其日期必須是輸入資料的下一個 session。重播也在開啟或重建帳本前拒絕未按日期排序的市場資料。這些檢查可抓出部分同步改動多個帳務欄位的差異，但不提供外部資料真實性或不可竄改證明。版本升為 v0.11.7。

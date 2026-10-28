@@ -261,3 +261,15 @@ def test_data_fingerprint_stable_across_identical_frame_copies():
     after = replay_session_data_fingerprint(copied, day, copied.reference.loc[day], None)
     assert before == after
     assert len(before) == 64
+
+
+def test_resume_rejects_changed_pre_session_liquidity_history(tmp_path):
+    data, config, targets = _case()
+    path = tmp_path / "liquidity-history.sqlite"
+    prefix = replay_targets_persistently(data.slice(end=data.close.index[24]), targets, config, path)
+    prefix.close()
+    volume = data.volume.copy()
+    volume.iloc[0, 0] *= 2
+    revised = replace(data, volume=volume)
+    with pytest.raises(ValueError, match="liquidity prehistory conflicts"):
+        replay_targets_persistently(revised, targets, config, path, reset=False)
