@@ -52,9 +52,14 @@ streamlit run src/quant_fund_lab/ui.py
 | --- | --- |
 | `actions.csv` | `date,symbol,split_ratio,cash_dividend,source_url,evidence_path`：日期、代碼、事件後／事件前股數比、每事件前股現金股利、證交所網址與佐證檔案。無配股時比率填 `1`；合併除權息應填同一列。 |
 | `suspensions.csv` | `date,symbol,source_url,evidence_path`：逐交易日記錄有官方依據的停牌；全市場休市時代碼填 `*`。停牌不虛構開盤價，僅以前次收盤價估值。 |
-| `coverage.csv` | `symbol,start,end,source_url,evidence_path`：逐標的記錄已人工核對企業行動的完整日期範圍；應核對除權息以外的分割、面額變更、減資與其他影響持股的事件。 |
+| `coverage_reviews.csv` | `symbol,start,end,category,source_url,evidence_path`：逐標的、日期範圍及事件類型記錄人工審核與佐證；五個 `category` 分別為 `ex_rights`、`split`、`par_value`、`reduction`、`other_rights`。每類均需連續涵蓋研究及暖機區間。 |
+| `coverage.csv` | 舊版人工覆蓋紀錄，保留供稽核；新版研究不會將其自動視為五類都已完成審核。 |
 
-佐證檔案應放在資料包 `evidence/`，`evidence_path` 填相對路徑，例如 `evidence/0050_split.pdf`。停牌與覆蓋紀錄的網址須為證交所或公開資訊觀測站；企業行動另接受期交所，以及已確認為 2881 富邦金控投資人關係網站的 `fubon.irpro.co`，均須使用 HTTPS。按「從官方索引補入純現金股利」可補入除權息表中明確標示為純除息的資料，並保存來源表作佐證；已有人工資料不會被覆寫。股票股利、ETF 分割與停牌需核對官方明細後補入。`coverage.csv` 是人工核對紀錄，並非對來源完整性或歷史發布時間的獨立保證。
+佐證檔案應放在資料包 `evidence/`，`evidence_path` 填相對路徑，例如 `evidence/0050_split.pdf`。停牌與覆蓋紀錄的網址須為證交所；企業行動另接受期交所，以及已確認為 2881 富邦金控投資人關係網站的 `fubon.irpro.co`，均須使用 HTTPS。按「從官方索引補入純現金股利」可補入除權息表中明確標示為純除息的資料，並保存來源表作佐證；已有人工資料不會被覆寫。股票股利、ETF 分割與停牌需核對官方明細後補入。`coverage_reviews.csv` 是人工核對紀錄，並非對來源完整性或歷史發布時間的獨立保證。舊資料包若沒有該檔，須自行建立上述標頭並在實際核對後逐類填寫，系統不會推測或轉換舊紀錄。
+
+側欄「批次匯入官方檔案」接受 UTF-8 CSV，標頭為 `file,kind,source_url,symbol,month,year`。`file` 可為相對於清單的路徑；價格行的 `kind` 為 `price` 並填 `.TW` 代碼與 `YYYY-MM`，索引行的 `kind` 可為 `ex_right_index`、`etf_split_index`、`par_change_index`、`reduction_index` 或 `holiday_index`，並填西元 `year`。其餘欄位留空。畫面可下載缺檔清單作為範本；其中網址僅供核對，須自行填入實際檔案及確認其來源。先預覽，再匯入；清單中相同檔案可重試，來源、內容或雜湊衝突不覆寫。若某筆中斷，系統保留該筆來源與匯入紀錄以便相同資料重試；未登記且缺少匯入紀錄的孤兒檔案須人工核對。
+
+研究畫面與新報告將資料問題按類別和期間彙總，另保留原始明細與已知的缺檔關聯；暖機起點由目前觀測資料估計，缺漏交易日可能改變估計，因此不等於研究正式守門通過。新報告的 `quality_summary.csv`、`quality_grouped.csv`、`quality_periods.csv` 與 `missing_source_manifest.csv` 均納入報告雜湊驗證。
 
 系統交叉檢查年度索引、恢復交易註記、每日價量、停牌與交易日曆；缺檔、來源雜湊不符、缺少企業行動、企業行動數值與官方參考價不一致時，不會顯示依賴該資料或暖機區間的績效。現金增資、減資等尚未建模的事件亦會攔下受影響區段。畫面與報告顯示缺口，完整的來源檔及核對紀錄會複製進新的凍結研究目錄；驗證報告時也會檢查這些來源檔。
 

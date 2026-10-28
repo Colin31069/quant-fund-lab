@@ -36,7 +36,10 @@ MANUAL_FILES = {
     "actions.csv": "date,symbol,split_ratio,cash_dividend,source_url,evidence_path\n",
     "suspensions.csv": "date,symbol,source_url,evidence_path\n",
     "coverage.csv": "symbol,start,end,source_url,evidence_path\n",
+    "coverage_reviews.csv": "symbol,start,end,category,source_url,evidence_path\n",
 }
+
+COVERAGE_CATEGORIES = ("ex_rights", "split", "par_value", "reduction", "other_rights")
 
 
 @dataclass(frozen=True)
@@ -526,10 +529,13 @@ def prepare_twse_odd_lot(
             raise ValueError(f"不支援的來源類型：{kind}")
 
     for name in MANUAL_FILES:
-        source_files[name] = _safe_file(root, name)
+        # Older bundles can be inspected without creating or silently certifying reviews.
+        if name != "coverage_reviews.csv" or (root / name).exists():
+            source_files[name] = _safe_file(root, name)
     actions = _manual_rows(root, "actions.csv", {"date", "symbol", "split_ratio", "cash_dividend", "source_url", "evidence_path"})
     suspensions = _manual_rows(root, "suspensions.csv", {"date", "symbol", "source_url", "evidence_path"})
-    coverage = _manual_rows(root, "coverage.csv", {"symbol", "start", "end", "source_url", "evidence_path"})
+    coverage = (_manual_rows(root, "coverage_reviews.csv", {"symbol", "start", "end", "category", "source_url", "evidence_path"})
+                if (root / "coverage_reviews.csv").exists() else [])
     def evidence(row: dict[str, str]) -> None:
         name = row.get("evidence_path", "").strip()
         if not name.startswith("evidence/"):
@@ -557,15 +563,19 @@ def prepare_twse_odd_lot(
         if (date, symbol) in suspension_set:
             raise ValueError(f"重複停牌：{symbol} {date.date()}")
         suspension_set.add((date, symbol))
-    reviewed: dict[str, list[tuple[pd.Timestamp, pd.Timestamp]]] = {s: [] for s in symbols}
+    reviewed: dict[tuple[str, str], list[tuple[pd.Timestamp, pd.Timestamp]]] = {
+        (s, category): [] for s in symbols for category in COVERAGE_CATEGORIES
+    }
     for row in coverage:
         symbol = _symbol(row["symbol"])
         a, b = _date(row["start"]), _date(row["end"])
-        if not _official_url(row["source_url"]) or b < a:
+        category = row["category"].strip()
+        if (not _official_url(row["source_url"]) or pd.isna(a) or pd.isna(b)
+                or b < a or category not in COVERAGE_CATEGORIES):
             raise ValueError(f"企業行動覆蓋資料無效：{symbol}")
         evidence(row)
-        if symbol in reviewed:
-            reviewed[symbol].append((a, b))
+        if (symbol, category) in reviewed:
+            reviewed[(symbol, category)].append((a, b))
 
     for month in pd.period_range(first, last, freq="M"):
         a, b = max(first, month.start_time), min(last, month.end_time.normalize())
@@ -574,22 +584,24 @@ def prepare_twse_odd_lot(
                 issues.append(TWSEIssue(str(a.date()), str(b.date()), symbol, "缺少該月官方價量檔"))
     for year in range(first.year, last.year + 1):
         for kind, label in (("ex_right_index", "除權息"), ("etf_split_index", "ETF 分割"),
-                            ("par_change_index", "面額變更"), ("reduction_index", "減資")):
+                            ("par_change_index", "面額變更"), ("reduction_index", "減資"),
+                            ("holiday_index", "開休市")):
             if (kind, year) not in event_years:
                 issues.append(TWSEIssue(str(max(first, pd.Timestamp(year, 1, 1)).date()), str(min(last, pd.Timestamp(year, 12, 31)).date()), "*", f"缺少該年度官方{label}索引"))
     for symbol in symbols:
-        # Require continuous evidence coverage; do not silently treat missing reviews as no actions.
-        cursor = first
-        for a, b in sorted(reviewed[symbol]):
-            if b < cursor:
-                continue
-            if a > cursor:
-                issues.append(TWSEIssue(str(cursor.date()), str(min(last, a - pd.Timedelta(days=1)).date()), symbol, "缺少分割、減資及企業行動完整性覆蓋證據"))
-            cursor = max(cursor, b + pd.Timedelta(days=1))
-            if cursor > last:
-                break
-        if cursor <= last:
-            issues.append(TWSEIssue(str(cursor.date()), str(last.date()), symbol, "缺少分割、減資及企業行動完整性覆蓋證據"))
+        for category in COVERAGE_CATEGORIES:
+            # Each category requires its own continuous human-reviewed evidence.
+            cursor = first
+            for a, b in sorted(reviewed[(symbol, category)]):
+                if b < cursor:
+                    continue
+                if a > cursor:
+                    issues.append(TWSEIssue(str(cursor.date()), str(min(last, a - pd.Timedelta(days=1)).date()), symbol, f"缺少企業行動覆蓋審核：{category}"))
+                cursor = max(cursor, b + pd.Timedelta(days=1))
+                if cursor > last:
+                    break
+            if cursor <= last:
+                issues.append(TWSEIssue(str(cursor.date()), str(last.date()), symbol, f"缺少企業行動覆蓋審核：{category}"))
     for date, symbol in sorted((indexed_events | flagged_resumptions) - set(action_map)):
         issues.append(TWSEIssue(str(date.date()), str(date.date()), symbol, "官方企業行動索引或恢復交易註記有事件，actions.csv 缺少有來源的配股率/股利"))
     for date, symbol in sorted(unsupported_events):

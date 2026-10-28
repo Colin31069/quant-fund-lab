@@ -20,6 +20,7 @@ from quant_fund_lab.odd_lot_study import (
     verify_odd_lot_study_report,
 )
 from quant_fund_lab.twse_odd_lot import (
+    COVERAGE_CATEGORIES,
     _total_return,
     download_twse_bundle,
     import_twse_file,
@@ -69,6 +70,9 @@ def _bundle(tmp_path):
         source = tmp_path / f"{kind}.json"
         source.write_text(json.dumps({"stat": "OK", "fields": ["恢復買賣日期", symbol_field], "data": []}), encoding="utf-8")
         import_twse_file(root, source, kind=kind, year=2025, source_url="https://www.twse.com.tw/events")
+    holiday = tmp_path / "holiday.json"
+    holiday.write_text(json.dumps({"stat": "OK", "fields": ["日期", "名稱", "說明"], "data": []}), encoding="utf-8")
+    import_twse_file(root, holiday, kind="holiday_index", year=2025, source_url="https://www.twse.com.tw/calendar")
     evidence = root / "evidence" / "official.txt"
     evidence.parent.mkdir()
     evidence.write_text("official evidence fixture", encoding="utf-8")
@@ -82,6 +86,10 @@ def _bundle(tmp_path):
     ])
     _write_rows(root / "coverage.csv", ["symbol", "start", "end", *ref], [
         {"symbol": symbol, "start": "2025-06-09", "end": "2025-06-20", **ref} for symbol in symbols
+    ])
+    _write_rows(root / "coverage_reviews.csv", ["symbol", "start", "end", "category", *ref], [
+        {"symbol": symbol, "start": "2025-06-09", "end": "2025-06-20", "category": category, **ref}
+        for symbol in symbols for category in COVERAGE_CATEGORIES
     ])
     return root, symbols
 
@@ -147,6 +155,41 @@ def test_official_bundle_handles_split_distribution_and_suspension(tmp_path):
     assert "evidence/official.txt" in loaded.source_hashes
 
 
+def test_legacy_coverage_does_not_prove_category_review(tmp_path):
+    root, symbols = _bundle(tmp_path)
+    (root / "coverage_reviews.csv").unlink()
+    loaded = prepare_twse_odd_lot(root, symbols, "2025-06-09", "2025-06-20")
+    gaps = [issue for issue in loaded.issues if "缺少企業行動覆蓋審核" in issue.detail]
+    assert len(gaps) == len(symbols) * len(COVERAGE_CATEGORIES)
+    assert "coverage.csv" in loaded.source_hashes
+    assert "coverage_reviews.csv" not in loaded.source_hashes
+    assert not (root / "coverage_reviews.csv").exists()
+
+
+def test_one_category_cannot_cover_another(tmp_path):
+    root, symbols = _bundle(tmp_path)
+    path = root / "coverage_reviews.csv"
+    with path.open(encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+        rows, columns = list(reader), reader.fieldnames
+    _write_rows(path, columns, [r for r in rows if r["symbol"] != "2330.TW" or r["category"] != "reduction"])
+    loaded = prepare_twse_odd_lot(root, symbols, "2025-06-09", "2025-06-20")
+    gaps = [issue for issue in loaded.issues if "缺少企業行動覆蓋審核" in issue.detail]
+    assert len(gaps) == 1
+    assert gaps[0].symbol == "2330.TW" and gaps[0].detail.endswith("reduction")
+    assert "coverage_reviews.csv" in loaded.source_hashes
+
+
+def test_missing_official_holiday_index_is_reported(tmp_path):
+    root, symbols = _bundle(tmp_path)
+    path = root / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["sources"] = [entry for entry in manifest["sources"] if entry["kind"] != "holiday_index"]
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    loaded = prepare_twse_odd_lot(root, symbols, "2025-06-09", "2025-06-20")
+    assert any(issue.detail == "缺少該年度官方開休市索引" for issue in loaded.issues)
+
+
 def test_official_holiday_suppresses_calendar_false_positive(tmp_path):
     root = tmp_path / "calendar"
     price = tmp_path / "price.json"
@@ -175,6 +218,11 @@ def test_official_holiday_suppresses_calendar_false_positive(tmp_path):
     _write_rows(root / "coverage.csv", ["symbol", "start", "end", "source_url", "evidence_path"], [
         {"symbol": "2330.TW", "start": "2022-02-04", "end": "2022-02-07",
          "source_url": "https://www.twse.com.tw/calendar", "evidence_path": "evidence/calendar.json"}])
+    _write_rows(root / "coverage_reviews.csv", ["symbol", "start", "end", "category", "source_url", "evidence_path"], [
+        {"symbol": "2330.TW", "start": "2022-02-04", "end": "2022-02-07", "category": category,
+         "source_url": "https://www.twse.com.tw/calendar", "evidence_path": "evidence/calendar.json"}
+        for category in COVERAGE_CATEGORIES
+    ])
     loaded = prepare_twse_odd_lot(root, ["2330.TW"], "2022-02-04", "2022-02-07")
     assert loaded.issues == ()
 
@@ -273,6 +321,8 @@ def test_streamlit_exposes_official_source_and_manual_import():
     assert next(s for s in app.selectbox if s.label == "資料來源").value == "TWSE 官方歷史資料"
     assert any(c.label == "使用已授權的 TWSE 自動下載" and not c.value for c in app.checkbox)
     assert any(b.label == "匯入官方檔案" for b in app.button)
+    assert any(b.label == "預覽批次匯入" for b in app.button)
+    assert any(b.label == "執行批次匯入" for b in app.button)
 
 
 def test_quality_gates_periods_and_frozen_sources_are_verified(tmp_path):
@@ -296,6 +346,8 @@ def test_quality_gates_periods_and_frozen_sources_are_verified(tmp_path):
     assert ("historical_evaluation", "momentum") in study.results
     report = export_odd_lot_study_report(root, study)
     assert verify_odd_lot_study_report(report)
+    manifest = json.loads((report / "report_manifest.json").read_text(encoding="utf-8"))
+    assert {"quality_summary.csv", "quality_grouped.csv", "quality_periods.csv", "missing_source_manifest.csv"} <= set(manifest["files"])
     assert load_frozen_odd_lot_study(root)[1]["source_files"]["source.txt"] == digest
     (root / "sources" / "source.txt").write_text("tampered", encoding="utf-8")
     assert not verify_odd_lot_study_report(report)

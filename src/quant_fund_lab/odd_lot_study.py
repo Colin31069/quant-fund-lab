@@ -25,6 +25,11 @@ from .odd_lot_research import (
     validate_raw_split_basis,
 )
 from .snapshot import load_market_data_snapshot, save_market_data_snapshot
+from .twse_preparation import (
+    missing_source_manifest,
+    summarize_period_issues,
+    summarize_quality_issues,
+)
 
 SAMPLE_SYMBOLS = (
     "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2881.TW",
@@ -290,7 +295,7 @@ def run_frozen_odd_lot_study(directory: str | Path) -> OddLotStudyResult:
 def export_odd_lot_study_report(directory: str | Path, study: OddLotStudyResult) -> Path:
     """Write a new, hashed report without overwriting another run."""
     root = Path(directory)
-    _, metadata = load_frozen_odd_lot_study(root)
+    data, metadata = load_frozen_odd_lot_study(root)
     if study.study_id != metadata["study_id"] or study.dataset_id != metadata["dataset_id"]:
         raise ValueError("study results do not match the frozen input")
     target = root / "reports" / uuid.uuid4().hex
@@ -316,6 +321,16 @@ def export_odd_lot_study_report(directory: str | Path, study: OddLotStudyResult)
     execution_summary.to_csv(target / "execution_summary.csv", index=False)
     quality = pd.DataFrame(metadata.get("quality_issues", []), columns=["start", "end", "symbol", "detail"])
     quality.to_csv(target / "quality_issues.csv", index=False)
+    summary, grouped_quality = summarize_quality_issues(metadata.get("quality_issues", []), symbols=data.symbols)
+    period_quality = summarize_period_issues(
+        metadata.get("quality_issues", []), data.close.index, metadata["periods"],
+        warmup=max(120, _backtest_config(metadata["backtest_config"]).strategy.warmup_days),
+        coverage_end=metadata.get("source_provenance", {}).get("coverage_end"),
+    )
+    summary.to_csv(target / "quality_summary.csv", index=False)
+    grouped_quality.to_csv(target / "quality_grouped.csv", index=False)
+    period_quality.to_csv(target / "quality_periods.csv", index=False)
+    missing_source_manifest(metadata.get("quality_issues", [])).to_csv(target / "missing_source_manifest.csv", index=False)
     (target / "assumptions.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     (target / "unavailable.json").write_text(json.dumps(study.unavailable, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     (target / "report.html").write_text(
@@ -333,6 +348,8 @@ def export_odd_lot_study_report(directory: str | Path, study: OddLotStudyResult)
         "<h2>成本敏感度（驗證期）</h2>" + study.sensitivity.to_html(index=False) +
         "<h2>委託與交割摘要</h2>" + execution_summary.to_html(index=False) +
         "<h2>不可用區段及原因</h2>" + pd.DataFrame([{"period": k, "reason": v} for k, v in study.unavailable.items()]).to_html(index=False, escape=True) +
+        "<h2>各區段資料問題</h2><p>暖機起點依目前已有觀測值估計；缺失交易日可能使估計改變，不代表資料完整。</p>" + period_quality.to_html(index=False, escape=True) +
+        "<h2>資料問題分類</h2>" + summary.to_html(index=False, escape=True) +
         "<h2>資料品質問題明細</h2>" + quality.to_html(index=False, escape=True) +
         "</body></html>", encoding="utf-8"
     )

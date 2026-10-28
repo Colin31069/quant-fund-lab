@@ -24,6 +24,7 @@ from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
 from quant_fund_lab.odd_lot_execution import default_instrument_rules
 from quant_fund_lab.odd_lot_research import OddLotResearchConfig
 from quant_fund_lab.odd_lot_study import (
+    PERIODS,
     SAMPLE_BENCHMARK,
     SAMPLE_SYMBOLS,
     OddLotStudyResult,
@@ -46,6 +47,13 @@ from quant_fund_lab.twse_odd_lot import (
     import_twse_file,
     populate_cash_dividends,
     prepare_twse_odd_lot,
+)
+from quant_fund_lab.twse_preparation import (
+    batch_import_twse,
+    missing_source_manifest,
+    read_batch_manifest,
+    summarize_period_issues,
+    summarize_quality_issues,
 )
 from quant_fund_lab.ui_inputs import load_verified_ui_inputs
 from quant_fund_lab.walkforward import (
@@ -92,6 +100,19 @@ with st.sidebar:
                     st.success(f"已匯入：{imported}")
                 except (OSError, ValueError, KeyError) as exc:
                     st.error(f"匯入失敗：{exc}")
+        with st.expander("批次匯入官方檔案"):
+            st.caption("準備 CSV 清單：file,kind,source_url,symbol,month,year；相對路徑以清單所在目錄為準。")
+            batch_path = st.text_input("批次清單 CSV 路徑")
+            preview_batch = st.button("預覽批次匯入")
+            import_batch = st.button("執行批次匯入")
+            if preview_batch or import_batch:
+                try:
+                    rows = read_batch_manifest(batch_path)
+                    result = batch_import_twse(twse_directory, rows, dry_run=not import_batch)
+                    st.dataframe(result, use_container_width=True)
+                    st.caption("相同來源可重試；衝突檔案不會覆寫。請先預覽並確認來源網址。")
+                except (OSError, ValueError, KeyError) as exc:
+                    st.error(f"批次清單無法處理：{exc}")
     verified_mode = data_mode == "M8 Verified Lifecycle Snapshot"
     if verified_mode:
         symbols_text = st.text_input("交易 Security IDs", "")
@@ -350,7 +371,22 @@ if run:
                 provider_attempts = ((data_provider, True, None),)
                 if twse_inputs.issues:
                     st.warning(f"官方資料檢查發現 {len(twse_inputs.issues)} 項問題；受影響期間不計算績效。")
-                    st.dataframe(pd.DataFrame([asdict(issue) for issue in twse_inputs.issues]), use_container_width=True)
+                    summary, details = summarize_quality_issues(twse_inputs.issues, symbols=raw.symbols)
+                    period_quality = summarize_period_issues(
+                        twse_inputs.issues, raw.close.index, PERIODS,
+                        warmup=max(120, StrategyConfig().warmup_days),
+                        coverage_end=twse_inputs.provenance["coverage_end"],
+                    )
+                    st.caption("各期暖機起點依目前觀測值估計，缺失交易日可能改變估計；正式守門仍以研究結果為準。")
+                    st.dataframe(period_quality, use_container_width=True)
+                    st.dataframe(summary, use_container_width=True)
+                    checklist = missing_source_manifest(twse_inputs.issues)
+                    if not checklist.empty:
+                        st.caption("缺檔清單的網址僅供核對；填入本機檔案及實際來源網址後才可匯入。")
+                        st.download_button("下載缺檔匯入清單", checklist.to_csv(index=False).encode("utf-8-sig"),
+                                           file_name="twse_missing_sources.csv", mime="text/csv")
+                    with st.expander("完整資料問題與關聯"):
+                        st.dataframe(details, use_container_width=True)
                 else:
                     st.success("資料包檢查通過；歷史發布與修訂時間仍未獨立驗證。")
             elif verified_mode:
