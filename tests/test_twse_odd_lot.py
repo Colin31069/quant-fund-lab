@@ -337,9 +337,21 @@ def test_quality_gates_periods_and_frozen_sources_are_verified(tmp_path):
     digest = hashlib.sha256(source.read_bytes()).hexdigest()
     issue = {"start": "2024-01-15", "end": "2024-01-15", "symbol": "2330.TW", "detail": "缺少企業行動"}
     root = freeze_odd_lot_study(data, tmp_path / "studies", symbols=symbols,
-                                source="twse_official", source_provenance={"coverage_end": str(dates[-1].date())},
+                                source="synthetic", source_provenance={"coverage_end": str(dates[-1].date())},
                                 source_files={"source.txt": source}, source_hashes={"source.txt": digest},
                                 quality_issues=[issue])
+    # Reconstruct the legacy v2 fixture explicitly; new official freezes use v3.
+    metadata_path = root / "study.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("study_id")
+    metadata.pop("readiness", None)
+    metadata.pop("readiness_fingerprint", None)
+    metadata["schema_version"] = 2
+    metadata["data_source"] = "twse_official"
+    metadata["periods"]["historical_evaluation"][1] = None
+    identity = hashlib.sha256(json.dumps(metadata, sort_keys=True, separators=(",", ":"),
+                                        ensure_ascii=False, allow_nan=False).encode()).hexdigest()[:24]
+    metadata_path.write_text(json.dumps({"study_id": identity, **metadata}), encoding="utf-8")
     study = run_frozen_odd_lot_study(root)
     assert "validation/momentum" in study.unavailable
     assert "缺少企業行動" in study.unavailable["validation/momentum"]

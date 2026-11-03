@@ -16,15 +16,20 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
-import exchange_calendars as xcals
 import numpy as np
 import pandas as pd
 
 from .data import MarketData
+from .market_calendar import expected_market_sessions
+from .twse_calendar import is_official_closure, official_closure_evidence
+
+if TYPE_CHECKING:
+    from .odd_lot_inputs.types import PriceSelection
 
 PRICE_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY"
 EVENT_URL = "https://www.twse.com.tw/rwd/zh/exRight/TWT49U"
@@ -392,7 +397,8 @@ def _total_return(raw_close: pd.DataFrame, dividends: pd.DataFrame, splits: pd.D
 
 
 def prepare_twse_odd_lot(
-    directory: str | Path, symbols: list[str], start: str, end: str
+    directory: str | Path, symbols: list[str], start: str, end: str, *,
+    _price_selection: PriceSelection | None = None,
 ) -> TWSEInput:
     """Normalize a TWSE bundle and report all known gaps without guessing.
 
@@ -409,6 +415,14 @@ def prepare_twse_odd_lot(
     if manifest.get("schema_version") != 1 or not isinstance(manifest.get("sources"), list):
         raise ValueError("不支援的 TWSE 資料包格式")
     source_files: dict[str, Path] = {"manifest.json": manifest_path}
+    for record in manifest.get("amendment_records", []):
+        name = record["path"]
+        if name in source_files or not name.startswith("amendments/"):
+            raise ValueError("修訂紀錄路徑重複或不安全")
+        path = _safe_file(root, name)
+        if _sha(path.read_bytes()) != record["sha256"]:
+            raise ValueError("修訂紀錄雜湊不符")
+        source_files[name] = path
     issues: list[TWSEIssue] = []
     prices: dict[str, dict[pd.Timestamp, tuple[float, float, float]]] = {s: {} for s in symbols}
     seen_price_dates: dict[str, set[pd.Timestamp]] = {s: set() for s in symbols}
@@ -488,7 +502,7 @@ def prepare_twse_odd_lot(
                     continue
                 if date.year != year:
                     raise ValueError(f"休市日期與來源年度不符：{date.date()}")
-                if "休市" in name or "無交易" in name or "放假" in explanation:
+                if is_official_closure(name, explanation):
                     official_closures.add(date)
         elif kind in {"ex_right_index", "etf_split_index", "par_change_index", "reduction_index"}:
             year = int(entry["year"])
@@ -577,11 +591,17 @@ def prepare_twse_odd_lot(
         if (symbol, category) in reviewed:
             reviewed[(symbol, category)].append((a, b))
 
+    if _price_selection is not None:
+        from .odd_lot_inputs.overlay import overlay_selected_prices
+
+        issues.extend(overlay_selected_prices(prices, covered_prices, _price_selection, first, last,
+                                             reviewed_suspensions=frozenset(suspension_set)))
     for month in pd.period_range(first, last, freq="M"):
         a, b = max(first, month.start_time), min(last, month.end_time.normalize())
         for symbol in symbols:
             if (symbol, str(month)) not in covered_prices:
-                issues.append(TWSEIssue(str(a.date()), str(b.date()), symbol, "缺少該月官方價量檔"))
+                detail = "缺少政策允許的該月價量檔" if _price_selection else "缺少該月官方價量檔"
+                issues.append(TWSEIssue(str(a.date()), str(b.date()), symbol, detail))
     for year in range(first.year, last.year + 1):
         for kind, label in (("ex_right_index", "除權息"), ("etf_split_index", "ETF 分割"),
                             ("par_change_index", "面額變更"), ("reduction_index", "減資"),
@@ -602,6 +622,20 @@ def prepare_twse_odd_lot(
                     break
             if cursor <= last:
                 issues.append(TWSEIssue(str(cursor.date()), str(last.date()), symbol, f"缺少企業行動覆蓋審核：{category}"))
+    from .odd_lot_event_dates import resolve_cash_dividend_dates
+
+    date_resolutions = resolve_cash_dividend_dates(
+        root, source_files, action_map, indexed_details, unsupported_events,
+        str(first.date()), str(last.date()),
+    )
+    for original, effective in date_resolutions.items():
+        action_map[effective] = action_map.pop(original)
+        indexed_details[effective] = indexed_details.pop(original)
+        indexed_events.discard(original)
+        indexed_events.add(effective)
+        if original in flagged_resumptions:
+            flagged_resumptions.remove(original)
+            flagged_resumptions.add(effective)
     for date, symbol in sorted((indexed_events | flagged_resumptions) - set(action_map)):
         issues.append(TWSEIssue(str(date.date()), str(date.date()), symbol, "官方企業行動索引或恢復交易註記有事件，actions.csv 缺少有來源的配股率/股利"))
     for date, symbol in sorted(unsupported_events):
@@ -619,14 +653,20 @@ def prepare_twse_odd_lot(
 
     observed = sorted({d for values in prices.values() for d in values if first <= d <= last})
     if not observed:
+        if _price_selection is not None:
+            raise ValueError("選源後沒有可用價量；請核對期間、來源衝突與無報價紀錄")
         raise ValueError("指定期間沒有任何官方價量資料；請先下載或匯入")
     index = pd.DatetimeIndex(observed)
     for (date, symbol), _ in sorted(action_map.items()):
         if symbol in prices and first <= date <= last and date not in prices[symbol]:
             issues.append(TWSEIssue(str(date.date()), str(date.date()), symbol, "企業行動日缺少可核對的價量；無法安全估值"))
     # A whole-market omission also needs an explicit official closure explanation.
-    calendar = xcals.get_calendar("XTAI")
-    expected_sessions = calendar.sessions_in_range(first, last).tz_localize(None).normalize()
+    calendar_hashes = {name: _sha(path.read_bytes()) for name, path in source_files.items()}
+    closures = official_closure_evidence(source_files, calendar_hashes,
+                                         str(first.date()), str(last.date()))
+    expected_sessions = pd.DatetimeIndex(expected_market_sessions(
+        "TW", first, last, closures=closures,
+    ).sessions)
     for date in expected_sessions.difference(index):
         if first <= date <= last and date not in official_closures and (date, "*") not in suspension_set:
             issues.append(TWSEIssue(str(date.date()), str(date.date()), "*", "交易日曆缺少整日資料；請核對休市公告"))
@@ -673,4 +713,7 @@ def prepare_twse_odd_lot(
     provenance = {"source": "TWSE", "coverage_start": str(first.date()), "coverage_end": str(last.date()),
                   "source_manifest_sha256": _sha(json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode()),
                   "coverage_note": "manual review; historical publication and revision times are not independently verified"}
+    if _price_selection is not None:
+        provenance.update(source="TWSE+FinMind", source_policy=_price_selection.policy.policy_id,
+                          selection_fingerprint=_price_selection.selection_fingerprint)
     return TWSEInput(data=data, issues=tuple(issues), source_files=source_files, source_hashes=hashes, provenance=provenance)
