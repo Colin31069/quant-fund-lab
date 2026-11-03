@@ -10,27 +10,30 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # Detect Python / virtualenv
-if [ -f ".venv/bin/python" ]; then
+if [ -n "${QFL_PYTHON:-}" ]; then
+    PYTHON="${QFL_PYTHON}"
+elif [ -f ".venv/bin/python" ]; then
     PYTHON=".venv/bin/python"
-    RUFF=".venv/bin/ruff"
-    PYTEST=".venv/bin/pytest"
 else
     PYTHON="python3"
-    RUFF="ruff"
-    PYTEST="pytest"
 fi
+
+# Module invocation keeps lint and tests on the selected interpreter, even if
+# stale console-script shebangs remain after a virtualenv upgrade.
+"${PYTHON}" -c 'import sys; print("Verification Python:", sys.executable, sys.version)'
+"${PYTHON}" -I "${REPO_ROOT}/scripts/check_environment.py"
 
 echo "=================================================="
 echo " [1/2] Running Ruff Linter & Formatting Checks..."
 echo "=================================================="
-${RUFF} check .
+"${PYTHON}" -m ruff check .
 echo "✓ Ruff checks passed cleanly."
 
 echo ""
 echo "=================================================="
 echo " [2/2] Running Pytest Suite..."
 echo "=================================================="
-${PYTEST} "$@"
+"${PYTHON}" -m pytest "$@"
 echo "✓ All tests passed successfully."
 
 echo ""
