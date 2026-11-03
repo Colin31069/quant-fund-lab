@@ -22,6 +22,8 @@ from quant_fund_lab.diagnostics import diagnose_walk_forward
 from quant_fund_lab.factors import research_factors
 from quant_fund_lab.fx import attach_fx_rates, attach_yahoo_fx, validate_fx
 from quant_fund_lab.odd_lot_execution import default_instrument_rules
+from quant_fund_lab.odd_lot_inputs.prepare import prepare_reviewed_odd_lot_input
+from quant_fund_lab.odd_lot_inputs.types import PriceSourcePolicy
 from quant_fund_lab.odd_lot_research import OddLotResearchConfig
 from quant_fund_lab.odd_lot_study import (
     PERIODS,
@@ -30,6 +32,7 @@ from quant_fund_lab.odd_lot_study import (
     OddLotStudyResult,
     export_odd_lot_study_report,
     freeze_odd_lot_study,
+    load_frozen_odd_lot_study,
     run_frozen_odd_lot_study,
     verify_odd_lot_study_report,
 )
@@ -55,6 +58,7 @@ from quant_fund_lab.twse_preparation import (
     summarize_period_issues,
     summarize_quality_issues,
 )
+from quant_fund_lab.twse_quality.ui import render_readiness
 from quant_fund_lab.ui_inputs import load_verified_ui_inputs
 from quant_fund_lab.walkforward import (
     WalkForwardSpec,
@@ -66,19 +70,51 @@ st.set_page_config(page_title="Quant Fund Lab", layout="wide")
 st.title("Quant Fund Lab")
 st.caption("數學 Alpha → 風險模型 → 組合最佳化 → 模擬成交；僅虛擬資金，不連接券商。")
 
+if st.sidebar.checkbox("零股研究協議與決策瀏覽", value=False):
+    from quant_fund_lab.odd_lot_decisions.ui import render_research_browser
+
+    render_research_browser(st, Path(__file__).resolve().parents[2])
+    st.stop()
+
+if st.sidebar.checkbox("零股前向虛擬觀察", value=False):
+    from quant_fund_lab.odd_lot_paper.forward_ui import render_observation_panel
+
+    render_observation_panel(st, Path(__file__).resolve().parents[2])
+    st.stop()
+
+if st.sidebar.checkbox("零股持久化歷史帳戶", value=False):
+    from quant_fund_lab.odd_lot_paper.ui import render_account_panel
+
+    render_account_panel(st, Path(__file__).resolve().parents[2])
+    st.stop()
+
+if st.sidebar.checkbox("權利事件帳戶唯讀核驗", value=False):
+    from quant_fund_lab.odd_lot_rights.inspection_ui import render_rights_inspection
+
+    render_rights_inspection(st)
+    st.stop()
+
 with st.sidebar:
     st.header("研究設定")
     odd_lot_study = st.checkbox("十萬元台股零股策略研究", value=False)
-    data_modes = (["TWSE 官方歷史資料", "離線合成資料"] if odd_lot_study else
+    data_modes = (["TWSE 官方歷史資料", "TWSE＋FinMind 本機資料", "離線合成資料"] if odd_lot_study else
                   ["Yahoo 公開市場資料", "離線合成資料", "M8 Verified Lifecycle Snapshot"])
     data_mode = st.selectbox("資料來源", data_modes)
-    twse_mode = data_mode == "TWSE 官方歷史資料"
+    reviewed_mode = data_mode == "TWSE＋FinMind 本機資料"
+    twse_mode = data_mode == "TWSE 官方歷史資料" or reviewed_mode
     twse_directory = ""
+    provider_directory = ""
+    reviewed_no_quote = False
     twse_download = False
     twse_authorized = False
     twse_cash_events = False
     if twse_mode:
         twse_directory = st.text_input("TWSE 資料包目錄", "artifacts/twse_odd_lot")
+        if reviewed_mode:
+            provider_directory = st.text_input("FinMind 資料包目錄", "artifacts/data_acquisition/2026-10-28")
+            reviewed_no_quote = st.checkbox("依官方個股停牌證據核對無報價", value=False,
+                help="僅接受與有來源個股停牌相符的無報價紀錄；無證據或報價衝突仍阻擋，選擇會凍結在來源政策。")
+            st.caption("保留兩個來源的原始紀錄；事件、日曆與暖機仍須通過檢查。")
         twse_download = st.checkbox("使用已授權的 TWSE 自動下載", value=False)
         if twse_download:
             twse_authorized = st.checkbox("證交所已同意這種自動化存取方式", value=False)
@@ -142,6 +178,12 @@ with st.sidebar:
     end_default = taipei_now.date()
     if odd_lot_study and taipei_now.hour < 18:
         end_default -= timedelta(days=1)
+    if reviewed_mode:
+        try:
+            provider_manifest = json.loads((Path(provider_directory) / "provider_manifest.json").read_text())
+            end_default = datetime.fromisoformat(provider_manifest["research_cutoff"]).date()
+        except (OSError, ValueError, KeyError):
+            st.caption("執行時會核對 FinMind 資料包、日期範圍與來源。")
     end_date = st.date_input("結束日", value=end_default)
     start_date = st.date_input(
         "開始日", value=datetime(2021, 1, 1).date() if odd_lot_study else end_date - timedelta(days=365 * 4)
@@ -294,7 +336,16 @@ def render_odd_lot_study(study: OddLotStudyResult, frozen: Path, report: Path, p
     if not study.holdout_untouched:
         st.warning("2025 年後資料是否已用於調參未確認；歷史評估應視為探索性結果。")
     st.caption(f"研究 ID：{study.study_id}；資料 ID：{study.dataset_id}。")
-    st.caption(f"凍結資料：{frozen}；報告：{report}；報告校驗：{'PASS' if verify_odd_lot_study_report(report) else 'FAIL'}。")
+    if study.readiness_fingerprint:
+        metadata = load_frozen_odd_lot_study(frozen)[1]
+        render_readiness(st, metadata["readiness"], study.readiness_fingerprint)
+    report_valid = verify_odd_lot_study_report(report)
+    st.caption(f"凍結資料：{frozen}；報告：{report}；報告校驗：{'PASS' if report_valid else 'FAIL'}。")
+    if provider == "provider_reviewed":
+        st.caption("依凍結政策選用 TWSE／FinMind 原始價量；各筆來源及衝突見逐日來源清單。")
+        if report_valid:
+            st.download_button("下載逐日來源清單", (report / "price_selection.csv").read_bytes(),
+                               file_name="price_selection.csv", mime="text/csv")
     st.dataframe(study.comparison, use_container_width=True)
     st.caption("完整交易少於 30 筆標示樣本不足；30 筆以上也不代表策略已獲證實。市場基準是未扣交易成本的總報酬代理。")
     st.caption("供應商價格是否為真實未調整價格、股息實際入帳時間與零股歷史成交價尚未獨立驗證。")
@@ -361,13 +412,20 @@ if run:
                                          authorized=twse_authorized)
                 if twse_cash_events:
                     populate_cash_dividends(twse_directory, all_symbols)
-                twse_inputs = prepare_twse_odd_lot(twse_directory, all_symbols, str(warmup_start), str(end_date))
+                if reviewed_mode:
+                    policy = PriceSourcePolicy(str(warmup_start), str(end_date), str(end_date),
+                        policy_id="reviewed_provider_v2" if reviewed_no_quote else "reviewed_provider_v1",
+                        schema_version=2 if reviewed_no_quote else 1)
+                    twse_inputs = prepare_reviewed_odd_lot_input(
+                        twse_directory, provider_directory, all_symbols, policy).evidence
+                else:
+                    twse_inputs = prepare_twse_odd_lot(twse_directory, all_symbols, str(warmup_start), str(end_date))
                 raw = twse_inputs.data
                 trade_data = raw
                 trade_symbols = requested_trade_assets
                 benchmark_symbol = requested_benchmark
                 source_data_provenance = twse_inputs.provenance
-                data_provider = "twse_official"
+                data_provider = "provider_reviewed" if reviewed_mode else "twse_official"
                 provider_attempts = ((data_provider, True, None),)
                 if twse_inputs.issues:
                     st.warning(f"官方資料檢查發現 {len(twse_inputs.issues)} 項問題；受影響期間不計算績效。")
