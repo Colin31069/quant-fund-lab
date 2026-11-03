@@ -2,41 +2,37 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
-from math import floor, sqrt
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pandas as pd
 
 from .analytics import performance_metrics
-from .cash_carry import accrue_base_cash_interest
-from .config import BacktestConfig, MarketCostConfig, StrategyConfig
+from .config import BacktestConfig
 from .corporate_actions import (
     CashInLieuReceivable,
-    apply_cash_dividend_events,
-    apply_stock_split_events,
-    mark_cash_in_lieu_receivables,
-    settle_cash_in_lieu_receivables,
 )
 from .data import MarketData
 from .execution import (
     PortfolioState,
-    apply_terminal_returns,
     prior_session_liquidity,
 )
 from .market_calendar import require_valid_daily_sessions
-from .models import ensemble_alpha
 from .odd_lot_execution import (
     default_instrument_rules,
-    fee_breakdown,
-    round_price,
-    simulate_limit_order,
-    trade_fees,
     validate_instrument_rules,
 )
-from .portfolio import optimize_weights
-from .research import detect_market_regime, neutralize_alpha, regime_adjusted_alpha
+from .odd_lot_paper import strategy as _research_strategy
+from .odd_lot_paper.bridge import HistoricalSessionState
+from .odd_lot_paper.engine_records import EngineOrder as _Order
+from .odd_lot_paper.engine_records import EngineStop as _Stop
+from .odd_lot_paper.session import OddLotSessionInput, run_odd_lot_session
 from .trade_analytics import position_episodes, summarize_episodes
+
+# Preserve existing helper lookup and test injection points after colocation.
+_entry_quantity = _research_strategy._entry_quantity
+_estimated_risk = _research_strategy._estimated_risk
+_targets = _research_strategy._targets
 
 
 @dataclass(frozen=True)
@@ -105,24 +101,6 @@ class OddLotResearchResult:
     backtest_config: BacktestConfig
 
 
-@dataclass
-class _Stop:
-    stop: float
-    high_close: float
-    distance: float
-
-
-@dataclass
-class _Order:
-    side: str
-    quantity: int
-    reason: str
-    stop: float = 0.0
-    signal_price: float = 0.0
-    distance: float = 0.0
-    signal_volume: float = 0.0
-
-
 def validate_raw_split_basis(data: MarketData) -> None:
     """Reject raw prices that appear to already include split adjustments.
 
@@ -182,77 +160,6 @@ def odd_lot_backtest_config(
     )
 
 
-def _estimated_risk(
-    quantity: int, price: float, stop: float, volume: float, costs: MarketCostConfig,
-    kind: str = "stock", fee_rounding: str = "fractional",
-) -> float:
-    if quantity <= 0:
-        return 0.0
-    impact = costs.impact_coefficient * sqrt(quantity / max(volume, 1.0)) / 100.0
-    slip = costs.slippage_bps / 10_000.0 + impact
-    buy = quantity * round_price(price * (1.0 + slip), kind, "up")
-    exit_price = stop * max(0.0, 1.0 - slip)
-    sell = quantity * round_price(exit_price, kind, "down") if exit_price >= 0.01 else 0.0
-    return buy + trade_fees("BUY", buy, costs, fee_rounding) - sell + trade_fees("SELL", sell, costs, fee_rounding)
-
-
-def _entry_quantity(
-    price: float, stop: float, volume: float, equity: float, weight: float,
-    research: OddLotResearchConfig, costs: MarketCostConfig, kind: str,
-) -> int:
-    if not np.isfinite(price) or not np.isfinite(stop) or price <= stop or stop <= 0 or volume <= 0:
-        return 0
-    high = max(0, floor(equity * min(weight, research.max_weight) / price))
-    high = min(high, costs.max_order_shares or high)
-    low = 0
-    while low < high:
-        mid = (low + high + 1) // 2
-        if _estimated_risk(mid, price, stop, volume, costs, kind, research.fee_rounding) <= research.risk_budget:
-            low = mid
-        else:
-            high = mid - 1
-    return low
-
-
-def _targets(
-    history: pd.DataFrame, eligible: pd.Series, research: OddLotResearchConfig,
-    strategy: StrategyConfig, previous: pd.Series,
-) -> tuple[pd.Series, pd.Series]:
-    symbols = history.columns
-    eligible = eligible.reindex(symbols).fillna(False).astype(bool)
-    if research.strategy == "equal_weight":
-        scores = pd.Series(1.0, index=symbols).where(eligible, 0.0)
-    elif research.strategy == "momentum":
-        if len(history) <= research.momentum_lookback:
-            return pd.Series(0.0, index=symbols), pd.Series(0.0, index=symbols)
-        scores = (history.iloc[-1] / history.iloc[-research.momentum_lookback - 1] - 1.0)
-        scores = scores.replace([np.inf, -np.inf], np.nan).fillna(0.0).where(eligible, 0.0)
-    else:
-        frame = ensemble_alpha(history, strategy)
-        regime = detect_market_regime(history, strategy.regime_lookback)
-        scores = regime_adjusted_alpha(frame, strategy, regime) if strategy.regime_enabled else frame["ensemble"]
-        returns = history.pct_change(fill_method=None).tail(strategy.factor_lookback)
-        if strategy.factor_neutralization:
-            neutral, _ = neutralize_alpha(scores, returns, eligible=eligible)
-            scores = (1.0 - strategy.factor_neutralization_strength) * scores + strategy.factor_neutralization_strength * neutral
-        scores = scores.reindex(symbols).fillna(0.0).where(eligible, 0.0)
-    ranked = sorted((str(s) for s in symbols if eligible[s] and scores[s] > 0), key=lambda s: (-float(scores[s]), s))
-    selected = ranked if research.strategy == "equal_weight" else ranked[:research.max_positions]
-    allowed = pd.Series(False, index=symbols)
-    allowed.loc[selected] = True
-    if research.strategy == "ensemble" and selected:
-        returns = history.pct_change(fill_method=None).tail(strategy.covariance_lookback)
-        regime = detect_market_regime(history, strategy.regime_lookback)
-        limit = regime.gross_exposure_limit if strategy.regime_enabled else 1.0
-        weights = optimize_weights(scores, returns, previous, strategy, eligible=allowed, gross_exposure_limit=limit)
-    else:
-        weights = pd.Series(0.0, index=symbols)
-        if selected:
-            denominator = len(selected) if research.strategy == "equal_weight" else research.max_positions
-            weights.loc[selected] = min(research.max_weight, 1.0 / denominator)
-    return scores, weights
-
-
 def run_odd_lot_research(
     data: MarketData,
     research: OddLotResearchConfig | None = None,
@@ -260,6 +167,7 @@ def run_odd_lot_research(
     *,
     start: str | pd.Timestamp | None = None,
     end: str | pd.Timestamp | None = None,
+    _passive_without_risk_estimate: bool = False,
 ) -> OddLotResearchResult:
     """Run a fresh, long-only account. Prices and volume are explicit proxies.
 
@@ -267,6 +175,8 @@ def run_odd_lot_research(
     not an intraday stop order and cannot guarantee the modeled loss budget.
     """
     research = research or OddLotResearchConfig()
+    if _passive_without_risk_estimate and (research.strategy != "equal_weight" or len(data.symbols) != 1):
+        raise ValueError("passive benchmark entry requires one asset and the passive strategy")
     config = odd_lot_backtest_config(base_config, research)
     if any((
         config.strategy.factor_alpha_enabled,
@@ -328,216 +238,21 @@ def run_odd_lot_research(
                     "sale_receivables": 0.0, "sale_payables": 0.0, "receivable_value": 0.0}]
     passive_submitted = False
 
-    def unsettled(side: str) -> float:
-        return sum(item["amount"] for item in settlements
-                   if item["side"] == side and item["settled_at"] is None and item["amount"] >= 0)
-
-    def sale_payables() -> float:
-        return sum(-item["amount"] for item in settlements if item["side"] == "SELL"
-                   and item["settled_at"] is None and item["amount"] < 0)
-
     for i in range(start_index, end_index):
-        signal_date, date = dates[i], dates[i + 1]
-        close_now = raw_close.loc[signal_date]
-        equity = state.equity(close_now) + unsettled("SELL")
-        # A stop has precedence over every model and is checked daily, not weekly.
-        for symbol, stop in list(stops.items()):
-            price = float(close_now.get(symbol, np.nan))
-            observed = pd.notna(raw_open.at[signal_date, symbol])
-            if not observed or not np.isfinite(price) or price <= 0:
-                continue
-            if price <= stop.stop:
-                pending[symbol] = _Order("SELL", state.shares[symbol], "stop")
-                signal_rows.append({"timestamp": signal_date, "symbol": symbol, "reason": "stop", "price": price, "stop": stop.stop, "score": np.nan, "weight": 0.0})
-            else:
-                stop.high_close = max(stop.high_close, price)
-                stop.stop = max(stop.stop, stop.high_close * (1.0 - stop.distance))
-
-        rebalance = (i - start_index) % research.rebalance_every == 0
-        if rebalance and (research.strategy != "equal_weight" or not passive_submitted):
-            history = data.close.iloc[: i + 1]
-            eligible = data.membership.loc[signal_date].copy()
-            eligible.loc[eligible.index.intersection(terminated)] = False
-            previous = pd.Series({symbol: state.shares.get(symbol, 0) * float(close_now[symbol]) / equity
-                                  if equity > 0 and pd.notna(close_now[symbol]) else 0.0
-                                  for symbol in data.symbols}, dtype=float)
-            scores, weights = _targets(history, eligible, research, config.strategy, previous)
-            for symbol in data.symbols:
-                held = state.shares.get(symbol, 0)
-                if symbol in pending and pending[symbol].side == "SELL":
-                    continue
-                if held and weights[symbol] <= 0 and research.strategy != "equal_weight":
-                    pending[symbol] = _Order("SELL", held, "model_exit")
-                    signal_rows.append({"timestamp": signal_date, "symbol": symbol, "reason": "model_exit", "price": float(close_now[symbol]), "stop": stops[symbol].stop, "score": float(scores[symbol]), "weight": 0.0})
-                elif not held and weights[symbol] > 0:
-                    returns = history[symbol].pct_change(fill_method=None).dropna().tail(research.volatility_lookback)
-                    if len(returns) < research.volatility_lookback:
-                        continue
-                    sigma = float(returns.std(ddof=1))
-                    if not np.isfinite(sigma):
-                        continue
-                    distance = float(np.clip(sigma * research.volatility_multiplier, research.min_stop_distance, research.max_stop_distance))
-                    price = float(close_now[symbol])
-                    stop_price = price * (1.0 - distance)
-                    known_volume = float(liquidity.at[date, symbol])
-                    if research.strategy == "equal_weight":
-                        qty = min(999, floor(equity * float(weights[symbol]) / price)) if price > 0 else 0
-                    else:
-                        costs = replace(config.tw_costs, sell_tax_bps=research.instrument_rules[symbol]["sell_tax_bps"])
-                        qty = _entry_quantity(price, stop_price, known_volume, equity, float(weights[symbol]),
-                                              research, costs, research.instrument_rules[symbol]["kind"])
-                    if qty:
-                        pending[symbol] = _Order("BUY", qty, "entry", stop_price, price, distance, known_volume)
-                        signal_rows.append({"timestamp": signal_date, "symbol": symbol, "reason": "entry", "price": price, "stop": stop_price, "score": float(scores[symbol]), "weight": float(weights[symbol])})
-                elif not held and symbol in pending and pending[symbol].side == "BUY":
-                    del pending[symbol]
-            passive_submitted = True
-
-        accrue_base_cash_interest(state, signal_date, date, config.cash_annual_yield)
-        currencies = None if data.currency_codes is None else data.currency_codes.loc[date]
-        settlement = settle_cash_in_lieu_receivables(
-            state, receivables, date,
-            None if data.cash_in_lieu_prices is None else data.cash_in_lieu_prices.loc[date],
-            currency_codes=currencies,
-        )
-        actions.extend(asdict(event) for event in settlement)
-        # Cash dividends are declared per pre-event share.  Apply them before a
-        # simultaneous stock dividend/split, and adjust all price levels on the
-        # same pre-event-share basis.
-        for symbol in data.symbols:
-            ratio = float(data.stock_splits.at[date, symbol])
-            dividend = float(data.dividends.at[date, symbol])
-            has_split = np.isfinite(ratio) and ratio > 0 and not np.isclose(ratio, 1.0)
-            if symbol in stops and np.isfinite(dividend) and dividend > 0:
-                stops[symbol].stop = max(0.0, stops[symbol].stop - dividend)
-                stops[symbol].high_close = max(0.0, stops[symbol].high_close - dividend)
-            if has_split:
-                if symbol in stops:
-                    stops[symbol].stop /= ratio
-                    stops[symbol].high_close /= ratio
-                if symbol in pending and pending[symbol].side == "BUY":
-                    del pending[symbol]
-        dividend_events = apply_cash_dividend_events(
-            state, data.dividends.loc[date], date, withholding=config.dividend_withholding,
-            market_codes=None if data.market_codes is None else data.market_codes.loc[date],
-            currency_codes=currencies,
-        )
-        actions.extend(asdict(event) for event in dividend_events)
-        split_events = apply_stock_split_events(
-            state, data.stock_splits.loc[date], raw_open.loc[date], date,
-            currency_codes=currencies,
-            cash_in_lieu_prices=None if data.cash_in_lieu_prices is None else data.cash_in_lieu_prices.loc[date],
-            cash_in_lieu_settlement_dates=None if data.cash_in_lieu_settlement_dates is None else data.cash_in_lieu_settlement_dates.loc[date],
-            receivables=receivables,
-        )
-        actions.extend(asdict(event) for event in split_events)
-        reference = close_now.copy()
-        for symbol in data.symbols:
-            ratio = float(data.stock_splits.at[date, symbol])
-            dividend = float(data.dividends.at[date, symbol])
-            if not np.isfinite(ratio) or not np.isfinite(dividend):
-                reference[symbol] = np.nan
-                continue
-            if np.isfinite(dividend) and dividend > 0:
-                reference[symbol] = max(float(reference[symbol]) - dividend, 0.0)
-            if np.isfinite(ratio) and ratio > 0 and not np.isclose(ratio, 1.0):
-                reference[symbol] /= ratio
-        terminal = apply_terminal_returns(
-            state, data.terminal_returns.loc[date], reference, date,
-            currency_codes=currencies,
-        )
-        terminal_events.extend(asdict(event) for event in terminal)
-        for symbol in data.terminal_returns.loc[date].dropna().index:
-            terminated.add(symbol)
-            stops.pop(symbol, None)
-            pending.pop(symbol, None)
-        for event in split_events:
-            if event.quantity_after == 0:
-                stops.pop(event.symbol, None)
-                pending.pop(event.symbol, None)
-
-        for side in ("SELL", "BUY"):
-            for symbol in data.symbols:
-                order = pending.get(symbol)
-                if order is None or order.side != side:
-                    continue
-                if (
-                    side == "BUY"
-                    and research.strategy != "equal_weight"
-                    and sum(qty > 0 for qty in state.shares.values()) >= research.max_positions
-                ):
-                    orders.append({"timestamp": date, "symbol": symbol, "side": side,
-                                   "reason": order.reason, "requested_quantity": order.quantity,
-                                   "filled_quantity": 0, "expired_quantity": order.quantity,
-                                   "limit_price": None, "reference_price": float(reference[symbol]),
-                                   "open_proxy": float(raw_open.at[date, symbol]),
-                                   "liquidity_proxy": float(liquidity.at[date, symbol]),
-                                   "status": "expired", "outcome": "position_limit"})
-                    del pending[symbol]
-                    continue
-                qty = min(state.shares.get(symbol, 0), 999) if side == "SELL" else min(order.quantity, 999)
-                rule = research.instrument_rules[symbol]
-                costs = replace(config.tw_costs, sell_tax_bps=rule["sell_tax_bps"])
-                fill, limit_price, outcome = simulate_limit_order(
-                    state, symbol, side, qty, float(raw_open.at[date, symbol]),
-                    float(liquidity.at[date, symbol]), float(reference[symbol]), date, costs,
-                    rule, research.limit_offset, research.fill_fraction, research.fee_rounding,
-                )
-                filled_quantity = 0 if fill is None else fill.quantity
-                orders.append({"timestamp": date, "symbol": symbol, "side": side,
-                               "reason": order.reason, "requested_quantity": qty,
-                               "filled_quantity": filled_quantity, "expired_quantity": qty - filled_quantity,
-                               "limit_price": limit_price, "reference_price": float(reference[symbol]),
-                               "open_proxy": float(raw_open.at[date, symbol]),
-                               "liquidity_proxy": float(liquidity.at[date, symbol]),
-                               "status": "filled" if filled_quantity == qty and qty else
-                                         "partial_expired" if filled_quantity else "expired",
-                               "outcome": outcome})
-                if side == "BUY":
-                    # Exchange orders expire daily; no automatic top-up of a partial entry.
-                    del pending[symbol]
-                if fill is None:
-                    continue
-                amount = fill.gross_value + fill.fees if side == "BUY" else fill.gross_value - fill.fees
-                if side == "SELL" and amount >= 0:
-                    # Sell proceeds are an economic receivable until T+2 close.
-                    state.cash -= amount
-                settlements.append({"trade_date": date, "symbol": symbol, "side": side,
-                                    "amount": amount, "settled_at": None,
-                                    "due_session_index": i + 3})
-                record = asdict(fill)
-                record["commission"], record["sell_tax"] = fee_breakdown(
-                    side, fill.gross_value, costs, research.fee_rounding,
-                )
-                record["reason"] = order.reason
-                record["planned_risk"] = 0.0
-                if side == "BUY":
-                    if research.strategy != "equal_weight":
-                        record["planned_risk"] = _estimated_risk(
-                            fill.quantity, order.signal_price, order.stop, order.signal_volume,
-                            costs, rule["kind"], research.fee_rounding,
-                        )
-                        stops[symbol] = _Stop(order.stop, order.signal_price, order.distance)
-                elif state.shares.get(symbol, 0) <= 0:
-                    stops.pop(symbol, None)
-                    del pending[symbol]
-                fills.append(record)
-        # The T+2 proceeds are credited after this day's open, so they cannot fund
-        # today's orders. The observed session sequence is the settlement proxy.
-        for item in settlements:
-            if item["settled_at"] is None and item["due_session_index"] == i + 1:
-                item["settled_at"] = date
-                if item["side"] == "SELL" and item["amount"] >= 0:
-                    state.cash += item["amount"]
-        state.receivable_value = mark_cash_in_lieu_receivables(
-            receivables, raw_close.loc[date], currency_codes=currencies
-        )
-        buy_payables, sale_receivables = unsettled("BUY"), unsettled("SELL")
-        equity_rows.append({"timestamp": date, "equity": state.equity(raw_close.loc[date]) + sale_receivables,
-                            "cash": state.cash, "settled_cash": state.cash + buy_payables + sale_payables(),
-                            "buy_payables": buy_payables, "sale_receivables": sale_receivables,
-                            "sale_payables": sale_payables(),
-                            "receivable_value": state.receivable_value})
+        transition = run_odd_lot_session(OddLotSessionInput(
+            HistoricalSessionState(state, stops, pending, terminated, receivables, settlements,
+                                   passive_submitted),
+            data, research, config, i, start_index, liquidity, _passive_without_risk_estimate))
+        runtime = transition.runtime
+        state, stops, pending = runtime.portfolio, runtime.stops, runtime.pending
+        terminated, receivables = runtime.terminated, runtime.receivables
+        settlements, passive_submitted = runtime.settlements, runtime.passive_submitted
+        signal_rows.extend(transition.signals)
+        orders.extend(transition.orders)
+        fills.extend(transition.fills)
+        actions.extend(transition.actions)
+        terminal_events.extend(transition.terminal_events)
+        equity_rows.append(transition.nav)
 
     curve = pd.DataFrame(equity_rows).set_index("timestamp")
     fills_df, actions_df, terminal_df = pd.DataFrame(fills), pd.DataFrame(actions), pd.DataFrame(terminal_events)

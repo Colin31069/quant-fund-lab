@@ -17,19 +17,29 @@ from . import __version__
 from .analytics import buy_and_hold_equity, performance_metrics
 from .config import BacktestConfig, DividendWithholdingConfig, MarketCostConfig, StrategyConfig
 from .data import MarketData
+from .odd_lot_diagnostics.types import StudyRiskDiagnostics
 from .odd_lot_execution import validate_instrument_rules
+from .odd_lot_inputs.reporting import price_selection_csv, verify_price_selection_report
 from .odd_lot_research import (
     OddLotResearchConfig,
     OddLotResearchResult,
     run_odd_lot_research,
     validate_raw_split_basis,
 )
+from .odd_lot_sensitivity.types import MatchedSensitivity
 from .snapshot import load_market_data_snapshot, save_market_data_snapshot
 from .twse_preparation import (
     missing_source_manifest,
     summarize_period_issues,
     summarize_quality_issues,
 )
+from .twse_quality.frozen import (
+    assess_frozen_inputs,
+    explicit_periods,
+    reconstruct_reviewed_inputs,
+    validate_frozen_readiness,
+)
+from .twse_quality.types import READINESS_RULE_VERSION
 
 SAMPLE_SYMBOLS = (
     "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2881.TW",
@@ -52,6 +62,10 @@ class OddLotStudyResult:
     results: dict[tuple[str, str], OddLotResearchResult]
     unavailable: dict[str, str]
     holdout_untouched: bool
+    readiness_fingerprint: str | None = None
+    benchmark_specs: dict[str, dict] | None = None
+    risk_diagnostics: StudyRiskDiagnostics | None = None
+    matched_sensitivity: MatchedSensitivity | None = None
 
 
 def _canonical(value: object) -> bytes:
@@ -91,7 +105,9 @@ def freeze_odd_lot_study(
     """
     research = research or OddLotResearchConfig()
     base_config = base_config or BacktestConfig(initial_cash=100_000.0, base_currency="TWD")
-    if source == "twse_official" and (
+    if source == "twse_official" and (source_provenance or {}).get("source_policy"):
+        raise ValueError("reviewed provider inputs require their own source identity")
+    if source in {"twse_official", "provider_reviewed"} and (
         not source_files or source_hashes is None or quality_issues is None
         or not source_provenance or "coverage_end" not in source_provenance
     ):
@@ -143,6 +159,12 @@ def freeze_odd_lot_study(
         if source_files is not None:
             payload["source_files"] = archived_sources
             payload["quality_issues"] = list(quality_issues or [])
+        if source in {"twse_official", "provider_reviewed"}:
+            payload["schema_version"] = 3
+            payload["periods"] = explicit_periods(PERIODS, source_provenance["coverage_end"])
+            readiness = assess_frozen_inputs(data, payload, staging)
+            payload["readiness"] = readiness.to_dict()
+            payload["readiness_fingerprint"] = readiness.readiness_fingerprint
         study_id = hashlib.sha256(_canonical(payload)).hexdigest()[:24]
         metadata = {"study_id": study_id, **payload}
         (staging / "study.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
@@ -159,6 +181,10 @@ def freeze_odd_lot_study(
 def load_frozen_odd_lot_study(directory: str | Path) -> tuple[MarketData, dict]:
     root = Path(directory)
     metadata = json.loads((root / "study.json").read_text(encoding="utf-8"))
+    if metadata.get("schema_version") not in {1, 2, 3}:
+        raise ValueError("unsupported frozen study schema")
+    if metadata.get("data_source") == "provider_reviewed" and metadata["schema_version"] != 3:
+        raise ValueError("reviewed provider studies require the shared readiness schema")
     study_id = metadata.get("study_id")
     payload = {key: value for key, value in metadata.items() if key != "study_id"}
     if study_id != hashlib.sha256(_canonical(payload)).hexdigest()[:24]:
@@ -178,6 +204,7 @@ def load_frozen_odd_lot_study(directory: str | Path) -> tuple[MarketData, dict]:
         raise ValueError("study snapshot symbols conflict with frozen configuration")
     if snapshot_manifest["start"] != str(data.close.index.min().date()) or snapshot_manifest["end"] != str(data.close.index.max().date()):
         raise ValueError("study snapshot date range conflicts with its manifest")
+    validate_frozen_readiness(data, metadata, root)
     return data, metadata
 
 
@@ -190,12 +217,17 @@ def _backtest_config(payload: dict) -> BacktestConfig:
     return BacktestConfig(**values)
 
 
-def run_frozen_odd_lot_study(directory: str | Path) -> OddLotStudyResult:
+def run_frozen_odd_lot_study(directory: str | Path, *, _include_sensitivity: bool = True) -> OddLotStudyResult:
+    if type(_include_sensitivity) is not bool:
+        raise TypeError("sensitivity execution flag must be boolean")
     data, metadata = load_frozen_odd_lot_study(directory)
     if metadata["package_version"] != __version__:
         raise ValueError("study was frozen with a different package version; freeze a new study")
-    if metadata["data_source"] not in {"twse_official", "synthetic"}:
+    if metadata["data_source"] not in {"twse_official", "provider_reviewed", "synthetic"}:
         raise ValueError("odd-lot studies require a quality-reviewed TWSE bundle or explicitly synthetic data")
+    if (metadata.get("schema_version") == 3
+            and metadata["readiness"]["rule_version"] != READINESS_RULE_VERSION):
+        raise ValueError("study used older readiness rules; preserve it and freeze a new study")
     trade_data = _subset(data, metadata["symbols"])
     base = _backtest_config(metadata["backtest_config"])
     research = OddLotResearchConfig(**metadata["research_config"])
@@ -206,8 +238,20 @@ def run_frozen_odd_lot_study(directory: str | Path) -> OddLotStudyResult:
     for period, (start, end) in metadata["periods"].items():
         selected_data = trade_data
         selected_all = data
-        if metadata["data_source"] == "twse_official":
+        if metadata["data_source"] in {"twse_official", "provider_reviewed"}:
             # Every reported period must have a complete 120-session warm-up.
+            if metadata.get("schema_version") == 3:
+                decision = next(p for p in metadata["readiness"]["periods"] if p["period"] == period)
+                if decision["status"] != "ready":
+                    blocked = set(decision["blocking_ids"])
+                    details = [f["detail"] for f in metadata["readiness"]["findings"]
+                               if f["finding_id"] in blocked]
+                    reason = "; ".join(details[:20])
+                    if len(details) > 20:
+                        reason += f"；另有 {len(details) - 20} 項，完整紀錄見正式修復清單"
+                    for strategy in ("ensemble", "momentum", "equal_weight", "benchmark"):
+                        unavailable[f"{period}/{strategy}"] = reason
+                    continue
             start_ts = pd.Timestamp(start)
             end_ts = pd.Timestamp(end) if end else data.close.index.max()
             first_pos = int(data.close.index.searchsorted(start_ts, side="left"))
@@ -264,7 +308,7 @@ def run_frozen_odd_lot_study(directory: str | Path) -> OddLotStudyResult:
 
     sensitivity: list[dict] = []
     start, end = metadata["periods"]["validation"]
-    for strategy in ("ensemble", "momentum"):
+    for strategy in (("ensemble", "momentum") if _include_sensitivity else ()):
         if ("validation", strategy) not in results:
             continue
         scenarios = list(dict.fromkeys((
@@ -289,6 +333,7 @@ def run_frozen_odd_lot_study(directory: str | Path) -> OddLotStudyResult:
         comparison=pd.DataFrame(rows), sensitivity=pd.DataFrame(sensitivity),
         results=results, unavailable=unavailable,
         holdout_untouched=metadata["holdout_untouched"],
+        readiness_fingerprint=metadata.get("readiness_fingerprint"),
     )
 
 
@@ -298,11 +343,24 @@ def export_odd_lot_study_report(directory: str | Path, study: OddLotStudyResult)
     data, metadata = load_frozen_odd_lot_study(root)
     if study.study_id != metadata["study_id"] or study.dataset_id != metadata["dataset_id"]:
         raise ValueError("study results do not match the frozen input")
+    if study.readiness_fingerprint != metadata.get("readiness_fingerprint"):
+        raise ValueError("study results do not match frozen readiness")
     target = root / "reports" / uuid.uuid4().hex
     target.mkdir(parents=True, exist_ok=False)
     _write_account_archive(target / "study_ledger.sqlite", study)
     study.comparison.to_csv(target / "comparison.csv", index=False)
     study.sensitivity.to_csv(target / "sensitivity.csv", index=False)
+    if study.benchmark_specs is not None:
+        (target / "benchmark_specs.json").write_text(
+            json.dumps(study.benchmark_specs, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    if metadata["data_source"] == "provider_reviewed":
+        selected = reconstruct_reviewed_inputs(metadata, root).selection
+        (target / "price_selection.csv").write_bytes(price_selection_csv(selected))
+    if "action_date_reviews.csv" in metadata.get("source_files", {}):
+        (target / "action_date_reviews.csv").write_bytes(
+            (root / "sources" / "action_date_reviews.csv").read_bytes()
+        )
     execution_rows = []
     for (period, strategy), result in study.results.items():
         order_status = result.orders.get("status", pd.Series(dtype=str))
@@ -319,8 +377,26 @@ def export_odd_lot_study_report(directory: str | Path, study: OddLotStudyResult)
                                "sale_payables": last["sale_payables"]})
     execution_summary = pd.DataFrame(execution_rows)
     execution_summary.to_csv(target / "execution_summary.csv", index=False)
+    diagnostic_html = ""
+    if study.risk_diagnostics is not None:
+        from .odd_lot_protocol.diagnostics import export_risk_diagnostics
+
+        diagnostic_html = export_risk_diagnostics(target, study.risk_diagnostics)
+    if study.matched_sensitivity is not None:
+        from .odd_lot_sensitivity.reporting import export_matched_sensitivity
+
+        diagnostic_html += export_matched_sensitivity(target, study.matched_sensitivity)
+    readiness_repairs_html = ""
     quality = pd.DataFrame(metadata.get("quality_issues", []), columns=["start", "end", "symbol", "detail"])
     quality.to_csv(target / "quality_issues.csv", index=False)
+    if metadata.get("schema_version") == 3:
+        (target / "readiness.json").write_text(
+            json.dumps(metadata["readiness"], ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        pd.DataFrame(metadata["readiness"]["periods"]).to_csv(target / "readiness_periods.csv", index=False)
+        from .twse_quality.repairs import export_repair_summary
+
+        readiness_repairs_html = export_repair_summary(target, metadata["readiness"])
     summary, grouped_quality = summarize_quality_issues(metadata.get("quality_issues", []), symbols=data.symbols)
     period_quality = summarize_period_issues(
         metadata.get("quality_issues", []), data.close.index, metadata["periods"],
@@ -342,11 +418,26 @@ def export_odd_lot_study_report(directory: str | Path, study: OddLotStudyResult)
         "以資料交易日作 T+2 交割日代理，未確認交割日曆或券商可用資金規則；"
         "固定現存股票池有存活者偏差；"
         "股利與股票股利在除權息日模擬入帳，歷史資料修訂及發布時間未獨立驗證。</p>"
-        + ("<p>2025 年後的歷史評估為探索性，未證實為獨立樣本外結果。</p>" if not study.holdout_untouched else "") +
+        + ("<p>資料來源為 TWSE 與 FinMind，各筆價格的原始來源見 price_selection.csv；"
+           "事件與交易日曆另依官方佐證核對。</p>" if metadata["data_source"] == "provider_reviewed" else "") +
+        ("<p>2025 年後的歷史評估為探索性，未證實為獨立樣本外結果。</p>" if not study.holdout_untouched else "") +
         ("<p>必要資料尚未通過檢查，沒有可報告的績效。</p>" if study.comparison.empty else "") +
+        ("<h2>可交易 ETF 基準</h2><p>期初單次零股委託，未成交量當日到期；"
+         "不套止損、不補單，股利保留現金。採相同成本與交割代理，ETF 稅率／限價規則另行明列。"
+         "無成本總報酬參考與可交易基準分列，不以不同成本口徑直接排名。</p>"
+         + pd.DataFrame(study.benchmark_specs).T.to_html(index=False, escape=True)
+         if study.benchmark_specs is not None else "") +
+        ("<p>經佐證核對的現金股利日期修訂見 action_date_reviews.csv；"
+         "原訂日期保留，模擬入帳使用核對後的有效交易日。</p>"
+         if "action_date_reviews.csv" in metadata.get("source_files", {}) else "") +
+        ("<h2>正式就緒判定</h2><p>" + study.readiness_fingerprint + "</p>" +
+         pd.DataFrame(metadata["readiness"]["periods"])[["period", "start", "end", "status"]].to_html(index=False)
+         if study.readiness_fingerprint else "") +
+        readiness_repairs_html +
         "<h2>分段比較</h2>" + study.comparison.to_html(index=False) +
         "<h2>成本敏感度（驗證期）</h2>" + study.sensitivity.to_html(index=False) +
         "<h2>委託與交割摘要</h2>" + execution_summary.to_html(index=False) +
+        diagnostic_html +
         "<h2>不可用區段及原因</h2>" + pd.DataFrame([{"period": k, "reason": v} for k, v in study.unavailable.items()]).to_html(index=False, escape=True) +
         "<h2>各區段資料問題</h2><p>暖機起點依目前已有觀測值估計；缺失交易日可能使估計改變，不代表資料完整。</p>" + period_quality.to_html(index=False, escape=True) +
         "<h2>資料問題分類</h2>" + summary.to_html(index=False, escape=True) +
@@ -359,6 +450,10 @@ def export_odd_lot_study_report(directory: str | Path, study: OddLotStudyResult)
             getattr(result, name).to_csv(target / f"{prefix}_{name}.csv", index=name == "equity_curve")
     hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(target.iterdir()) if path.is_file()}
     manifest = {"study_id": study.study_id, "dataset_id": study.dataset_id, "files": hashes}
+    if readiness_repairs_html:
+        from .twse_quality.repairs import REPAIR_SUMMARY_RULE
+
+        manifest["repair_summary_rule"] = REPAIR_SUMMARY_RULE
     manifest["report_id"] = hashlib.sha256(_canonical(manifest)).hexdigest()
     (target / "report_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     return target
@@ -376,7 +471,30 @@ def verify_odd_lot_study_report(directory: str | Path) -> bool:
         return False
     if manifest.get("study_id") != metadata["study_id"] or manifest.get("dataset_id") != metadata["dataset_id"]:
         return False
-    return all((root / name).is_file() and hashlib.sha256((root / name).read_bytes()).hexdigest() == expected for name, expected in manifest["files"].items())
+    if not all((root / name).is_file() and hashlib.sha256((root / name).read_bytes()).hexdigest() == expected for name, expected in manifest["files"].items()):
+        return False
+    from .twse_quality.repairs import verify_repair_summary
+
+    if not verify_repair_summary(root, metadata, manifest):
+        return False
+    if metadata["data_source"] == "provider_reviewed":
+        try:
+            selected = reconstruct_reviewed_inputs(metadata, root.parent.parent).selection
+            if not verify_price_selection_report(root, selected, manifest):
+                return False
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+    protocol_files = ("protocol.json", "experiment.json")
+    if any((root / name).exists() or name in manifest["files"] for name in protocol_files):
+        if not all(name in manifest["files"] for name in protocol_files):
+            return False
+        try:
+            from .odd_lot_protocol.report_binding import verify_protocol_report_binding
+
+            verify_protocol_report_binding(root, metadata)
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+    return True
 
 
 def _account_assumptions(result: OddLotResearchResult) -> dict:
