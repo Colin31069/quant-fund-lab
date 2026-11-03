@@ -4,5 +4,6 @@
 
 - **Agent 專案導覽手冊**：請參閱根目錄 [`AGENTS.md`](../AGENTS.md) 與 [`CLAUDE.md`](../CLAUDE.md)。
 - **核心架構與歷史里程碑**：請參閱 [`src/ARCHITECTURE/README.md`](../src/ARCHITECTURE/README.md)。
+- **發展路線圖與詳細執行／驗收計畫**：請參閱 [`ROADMAP.md`](../src/ARCHITECTURE/ROADMAP.md) 與[計畫索引](../src/ARCHITECTURE/plans/README.md)。
 - **子系統模組導覽**：請參閱 [`src/quant_fund_lab/README.md`](../src/quant_fund_lab/README.md)。
 - **測試指南**：請參閱 [`tests/README.md`](../tests/README.md)。

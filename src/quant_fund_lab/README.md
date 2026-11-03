@@ -58,10 +58,20 @@
 
 ### E. 證交所官方零股專題 (TWSE Odd-Lot Trading)
 - **`twse_odd_lot.py`**: 證交所官方月價量、除權息、減資與開休市資料解析與嚴格品質守門。
+- **`twse_coverage_amendments.py`**: 顯式逐標的／類別／期間 CoverageReview；核對證據 bytes 後發布不可變衍生資料，保留原 coverage／manifest，不從舊 coverage 自動推定五類審核完成。
+- **`odd_lot_rights/`**: E05 認購權純核心：分階段資訊、共用持股基礎的多腿權利、明確付款／費用、待交付資產、碎股淨款、憑證換發與精確估值／checkpoint；真實來源、session／SQL／獨立稽核尚待接線，未解除現有 unsupported 事件。
+
+  接續已有 `audit.py`／`audit_reconstruction.py` 獨立重建原命令的現金、費用、逐腿數量及 inventory debit／credit；實際來源、外層 cash flows／持倉與 NAV 連結仍待整合，不以純核心稽核通過放行真實事件。
+- **`odd_lot_event_dates.py`、`twse_event_amendments.py`**: 逐案核對全市場休市的純現金股利日期映射；保留原訂索引與原資料包，修訂證據進入 freeze／報告 hash，不支援以此方式處理認股權。
 - **`twse_preparation.py`**: 官方檔案批次預覽、原子替換與匯入管線。
 - **`odd_lot_execution.py`**: 零股升降單位（Tick size）、限價撮合代理、委託比例與交割規則。
 - **`odd_lot_research.py`**: 十萬元台股零股策略獨立研究引擎（動能、均值回歸、動態止損與風險預算）。
+- **`odd_lot_benchmarks.py`**: 明確 ETF 規則的單一可交易基準；期初一次零股委託、未成交到期、股利保留現金，與策略共用撮合及帳務。
+- **`odd_lot_diagnostics/`**: 純讀取資金／未成交／episode 風險及止損退出診斷；建倉預算有 fill 證據，未平倉與權利待收款分列，缺來源不造有效數值；v3 協議輸出及重建核對報告。
+- **`odd_lot_sensitivity/`**: v4 協議的固定策略／ETF 成本與成交比例矩陣；逐情境保存設定、帳務與成功／受阻／失敗結果，來源摘要可重建，不以驗證期敏感度自動選參。
+- **`odd_lot_decisions/`**: R07 純計算決策核心；只依開發期排名，固定選擇後檢查驗證／敏感度／風險，逐項保留失敗與缺資料，沒有驗證後改選。協議、登記來源與 UI 接線尚待完成。
 - **`odd_lot_study.py`**: 零股研究批次執行、報告與 SQLite 唯讀帳戶凍結。
+- **`odd_lot_protocol/`**: 有限候選協議、程式／環境身分、不可覆寫的協議及 SQLite 實驗重試紀錄；接既有守門執行與雜湊報告，保留受阻／失敗與重現性差異。
 - **`trade_analytics.py`**: 持倉 Episode 重建、勝率、Profit Factor 與期望值分析。
 
 ### F. 模擬實盤與帳本稽核 (Paper Trading & Audit)
