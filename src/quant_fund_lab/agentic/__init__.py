@@ -21,6 +21,12 @@ from .evaluator import (
     extract_top_drawdown_episodes,
     synthesize_drawdown_driver,
 )
+from .generators import (
+    APIStrategyGenerator,
+    EvolutionaryStrategyGenerator,
+    FileBridgeGenerator,
+    extract_json_payload,
+)
 from .orchestrator import (
     AgenticTournamentOrchestrator,
     TournamentResult,
@@ -75,6 +81,7 @@ __all__ = [
     "REFLECTION_PROMPT_TEMPLATE",
     "SKEPTIC_SYSTEM_PROMPT",
     "STATE_FEATURE_NAMES",
+    "APIStrategyGenerator",
     "ASTSanitizer",
     "AgenticTournamentOrchestrator",
     "CompactBacktestDiagnostics",
@@ -83,8 +90,10 @@ __all__ = [
     "DrawdownEpisode",
     "DriftReport",
     "DriftedSleeveBook",
+    "EvolutionaryStrategyGenerator",
     "ExecutionFrictionDecomposition",
     "ExecutionOverlayConfig",
+    "FileBridgeGenerator",
     "GlobalDsrContext",
     "LookAheadError",
     "PointInTimeView",
@@ -111,6 +120,7 @@ __all__ = [
     "compute_structural_diff",
     "evaluate_primitive",
     "evaluate_tournament_ensemble",
+    "extract_json_payload",
     "extract_top_drawdown_episodes",
     "prune_correlated_strategies",
     "run_canary_test",

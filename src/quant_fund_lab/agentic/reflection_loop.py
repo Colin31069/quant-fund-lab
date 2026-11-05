@@ -77,6 +77,7 @@ def run_reflection_loop(
     archetype: str,
     registry: TrialsRegistry,
     max_rounds: int = 4,
+    early_stop_patience: int | None = 2,
     lineage_id: str | None = None,
     seed: int = 42,
 ) -> ReflectionResult:
@@ -120,7 +121,7 @@ def run_reflection_loop(
             )
             history.append({"round": round_num, "status": "FAILED", "trial_id": record_id})
             stagnant_count += 1
-            if stagnant_count >= 2:
+            if early_stop_patience is not None and stagnant_count >= early_stop_patience:
                 return ReflectionResult(
                     lineage_id=lineage_id,
                     archetype=archetype,
@@ -171,6 +172,51 @@ def run_reflection_loop(
             note="OK" if dsr >= 0.8 else "Sub-optimal DSR",
         )
 
+        # Build diagnostic payload for auditing and reflection prompt
+        dd_raw = extract_top_drawdown_episodes(net_ret)
+        episodes = [
+            DrawdownEpisode(
+                id=e.episode_id,
+                depth_pct=e.depth_pct,
+                duration_days=e.duration_days,
+                recovery_days=e.recovery_days or -1,
+                regime_state="anonymized",
+                driver="Adverse tail move",
+            )
+            for e in dd_raw
+        ]
+        diag = CompactBacktestDiagnostics(
+            iteration=round_num,
+            global_dsr_context=GlobalDsrContext(
+                universe_total_trials_N=n_trials + 1,
+                expected_null_max_sharpe_SR0=sr0,
+                strategy_deflated_sharpe_DSR=dsr,
+                status="ACTIVE",
+            ),
+            core_performance=CorePerformance(
+                net_sharpe=net_sharpe,
+                gross_sharpe=net_sharpe * 1.1,
+                bootstrap_sharpe_p05=p05,
+                bootstrap_sharpe_p50=p50,
+                max_drawdown_pct=float(metrics.get("max_drawdown", 0.0) * 100.0),
+                calmar_ratio=float(metrics.get("calmar", 0.0)),
+                annualized_turnover_one_way=1.0,
+            ),
+            regime_conditioned_sharpe=RegimeConditionedSharpe(
+                volatility_terciles={"low": 1.5, "mid": 1.0, "high": 0.0},
+                dispersion_terciles={"low": 0.5, "mid": 1.0, "high": 1.5},
+                market_trend_state={"bull": 1.5, "chop": 1.0, "bear": -0.5},
+            ),
+            worst_anonymized_drawdown_episodes=episodes,
+            execution_friction_decomposition_annual_bps=ExecutionFrictionDecomposition(
+                gross_alpha_bps=2000,
+                commission_and_tax_drag_bps=-300,
+                slippage_and_tick_quantization_bps=-200,
+                net_alpha_bps=1500,
+                stress_1_5x_cost_net_sharpe=net_sharpe * 0.85,
+            ),
+        )
+
         history.append({
             "round": round_num,
             "status": "SUCCESS",
@@ -178,6 +224,8 @@ def run_reflection_loop(
             "net_sharpe": net_sharpe,
             "fitness_j": fitness_j,
             "dsr": dsr,
+            "diagnostics": diag,
+            "contract": contract,
         })
 
         if fitness_j > best_fitness_j:
@@ -191,7 +239,7 @@ def run_reflection_loop(
                 stagnant_count = 0
         prev_j = fitness_j
 
-        if stagnant_count >= 2:
+        if early_stop_patience is not None and stagnant_count >= early_stop_patience:
             return ReflectionResult(
                 lineage_id=lineage_id,
                 archetype=archetype,
@@ -204,50 +252,6 @@ def run_reflection_loop(
             )
 
         if round_num < max_rounds:
-            # Build diagnostic payload
-            dd_raw = extract_top_drawdown_episodes(net_ret)
-            episodes = [
-                DrawdownEpisode(
-                    id=e.episode_id,
-                    depth_pct=e.depth_pct,
-                    duration_days=e.duration_days,
-                    recovery_days=e.recovery_days or -1,
-                    regime_state="anonymized",
-                    driver="Adverse tail move",
-                )
-                for e in dd_raw
-            ]
-            diag = CompactBacktestDiagnostics(
-                iteration=round_num,
-                global_dsr_context=GlobalDsrContext(
-                    universe_total_trials_N=n_trials + 1,
-                    expected_null_max_sharpe_SR0=sr0,
-                    strategy_deflated_sharpe_DSR=dsr,
-                    status="ACTIVE",
-                ),
-                core_performance=CorePerformance(
-                    net_sharpe=net_sharpe,
-                    gross_sharpe=net_sharpe * 1.1,
-                    bootstrap_sharpe_p05=p05,
-                    bootstrap_sharpe_p50=p50,
-                    max_drawdown_pct=float(metrics.get("max_drawdown", 0.0) * 100.0),
-                    calmar_ratio=float(metrics.get("calmar", 0.0)),
-                    annualized_turnover_one_way=1.0,
-                ),
-                regime_conditioned_sharpe=RegimeConditionedSharpe(
-                    volatility_terciles={"low": 1.5, "mid": 1.0, "high": 0.0},
-                    dispersion_terciles={"low": 0.5, "mid": 1.0, "high": 1.5},
-                    market_trend_state={"bull": 1.5, "chop": 1.0, "bear": -0.5},
-                ),
-                worst_anonymized_drawdown_episodes=episodes,
-                execution_friction_decomposition_annual_bps=ExecutionFrictionDecomposition(
-                    gross_alpha_bps=2000,
-                    commission_and_tax_drag_bps=-300,
-                    slippage_and_tick_quantization_bps=-200,
-                    net_alpha_bps=1500,
-                    stress_1_5x_cost_net_sharpe=net_sharpe * 0.85,
-                ),
-            )
             lineage_table = registry.format_lineage_markdown_table(lineage_id)
             current_prompt = REFLECTION_PROMPT_TEMPLATE.format(
                 current_round=round_num + 1,

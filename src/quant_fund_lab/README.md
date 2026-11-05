@@ -82,7 +82,10 @@
 - **`provenance.py` & `replay_provenance.py`**: 執行環境 Provenance 與 Run ID 生成。
 
 ### G. 視覺化儀表板與產物報表 (Presentation & Reporting)
-- **`ui.py`**: Streamlit 本機量化研究與視覺化平台。
+- **`ui.py`**: Streamlit 本機量化研究與視覺化平台主進入點。
+- **`ui_sidebar.py`** (及 `ui_sidebar_odd_lot.py`, `ui_sidebar_twse.py`, `ui_sidebar_risk.py`, `ui_sidebar_paper.py`, `ui_sidebar_presets.py`): 模組化側邊欄參數設定、快速範本預設與輸入控制。
+- **`ui_pipeline.py`**: 市場資料管線、多來源 Failover 載入、可驗證報告匯出與帳本重播。
+- **`ui_views/`**: 人類導向的模組化視覺呈現層（KPI 儀表板、Plotly 雙軌淨值與水下回撤圖、風控政權、因子實驗室、稅務交割、持久化帳本審計、穩健性檢定與台股零股研究）。
 - **`ui_inputs.py`**: UI 輸入參數解析、驗證與狀態管理。
 - **`reporting.py`**: 產出包含雜湊 Manifest 的 HTML、CSV 與 JSON 研究報告。
 - **`analytics.py`**: 核心財務績效統計（CAGR、Sharpe、Max Drawdown、Calmar）。

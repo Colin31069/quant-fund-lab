@@ -45,12 +45,14 @@ class AgenticTournamentOrchestrator:
         partition: TemporalPartition | None = None,
         archetypes: list[str] | None = None,
         max_rounds_per_lineage: int = 4,
+        early_stop_patience: int | None = 2,
         seed: int = 42,
     ) -> None:
         self.registry = registry
         self.partition = partition or TemporalPartition()
         self.archetypes = archetypes or list(self.DEFAULT_ARCHETYPES)
         self.max_rounds = max_rounds_per_lineage
+        self.early_stop_patience = early_stop_patience
         self.seed = seed
 
     def run(
@@ -80,6 +82,7 @@ class AgenticTournamentOrchestrator:
                 archetype=archetype,
                 registry=self.registry,
                 max_rounds=self.max_rounds,
+                early_stop_patience=self.early_stop_patience,
                 lineage_id=f"{run_id}_{archetype}",
                 seed=self.seed,
             )
@@ -108,16 +111,20 @@ class AgenticTournamentOrchestrator:
             if verdict.decision == "APPROVE_FOR_OOS":
                 approved_contracts.append(ref_res.best_contract)
                 c_name = ref_res.best_contract.strategy_name
-                dsr_val = best_diag.global_dsr_context.deflated_sharpe_ratio if best_diag else 0.95
+                dsr_val = (
+                    best_diag.global_dsr_context.strategy_deflated_sharpe_DSR
+                    if best_diag
+                    else 0.95
+                )
                 dsr_scores[c_name] = dsr_val
 
                 # Precompute bootstrap confidence bounds for live drift monitoring
                 if best_diag:
-                    p01 = best_diag.core_performance.bootstrap_sharpe_p01
                     p05 = best_diag.core_performance.bootstrap_sharpe_p05
+                    p50 = best_diag.core_performance.bootstrap_sharpe_p50
                 else:
-                    p01, p05 = -0.5, 0.0
-                bootstrap_thresholds[c_name] = (p01, p05)
+                    p05, p50 = -0.5, 0.0
+                bootstrap_thresholds[c_name] = (p05, p50)
 
         # 4. Tournament Allocation on OOS Vault Data
         tournament_res = evaluate_tournament_ensemble(
