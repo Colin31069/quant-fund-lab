@@ -275,59 +275,88 @@ def run_backtest(data: MarketData, config: BacktestConfig | None = None) -> Back
 
         if (i - start_i) % strategy.rebalance_every == 0:
             history = data.close.iloc[: i + 1] * fx_to_base.iloc[: i + 1]
-            alpha_frame = ensemble_alpha(history, strategy)
-            eligible = data.membership.loc[signal_date].reindex(data.symbols).fillna(False)
-            if strategy.regime_enabled:
-                regime = detect_market_regime(history, strategy.regime_lookback)
-                raw_alpha = regime_adjusted_alpha(alpha_frame, strategy, regime)
-            else:
-                regime = detect_market_regime(history, strategy.regime_lookback)
-                raw_alpha = alpha_frame["ensemble"]
-            if strategy.factor_alpha_enabled:
-                factor_signal = factor_alpha_from_precomputed(
-                    factor_panel,
-                    factor_ic,
-                    pd.Timestamp(signal_date),
-                    data.symbols,
-                    horizon=strategy.factor_ic_horizon,
-                    lookback=strategy.factor_ic_lookback,
-                    min_observations=strategy.factor_ic_min_observations,
-                )
-                overlay = float(np.clip(strategy.factor_alpha_weight, 0.0, 1.0))
-                if not factor_signal.weights.empty:
-                    raw_alpha = (1.0 - overlay) * raw_alpha + overlay * factor_signal.score
-                factor_weight_row = factor_signal.weights.copy()
-                factor_weight_row.name = signal_date
-                factor_weight_rows.append(factor_weight_row)
-            factor_returns = history.pct_change(fill_method=None).tail(strategy.factor_lookback)
-            if strategy.factor_neutralization:
-                neutral_alpha, _ = neutralize_alpha(raw_alpha, factor_returns, eligible=eligible)
-                strength = float(np.clip(strategy.factor_neutralization_strength, 0.0, 1.0))
-                alpha = (1.0 - strength) * raw_alpha + strength * neutral_alpha
-                alpha = alpha.where(eligible, 0.0)
-            else:
-                alpha = raw_alpha.where(eligible, 0.0)
-            alpha = alpha.reindex(data.symbols).fillna(0.0)
             returns = history.pct_change(fill_method=None).tail(strategy.covariance_lookback)
-            previous = signal_weights
-            gross_limit = regime.gross_exposure_limit if strategy.regime_enabled else 1.0
-            target = optimize_weights(
-                alpha,
-                returns,
-                previous,
-                strategy,
-                eligible=eligible,
-                gross_exposure_limit=gross_limit,
-            )
-            regime_rows.append(
-                {
-                    "timestamp": signal_date,
-                    "label": regime.label,
-                    "trend_z": regime.trend_z,
-                    "annual_volatility": regime.annual_volatility,
-                    "gross_exposure_limit": gross_limit,
-                }
-            )
+            if config.custom_alpha_evaluator is not None:
+                target = config.custom_alpha_evaluator(data, signal_date)
+                alpha = target
+                if not isinstance(target, pd.Series):
+                    target = pd.Series(target, index=data.symbols).fillna(0.0)
+                else:
+                    target = target.reindex(data.symbols).fillna(0.0)
+                alpha = target
+                if regime_rows:
+                    last_regime = regime_rows[-1]
+                else:
+                    last_regime = {
+                        "timestamp": signal_date,
+                        "label": "custom",
+                        "trend_z": 0.0,
+                        "annual_volatility": 0.0,
+                        "gross_exposure_limit": 1.0,
+                    }
+                _ = last_regime
+                regime_rows.append(
+                    {
+                        "timestamp": signal_date,
+                        "label": "custom",
+                        "trend_z": 0.0,
+                        "annual_volatility": 0.0,
+                        "gross_exposure_limit": 1.0,
+                    }
+                )
+            else:
+                alpha_frame = ensemble_alpha(history, strategy)
+                eligible = data.membership.loc[signal_date].reindex(data.symbols).fillna(False)
+                if strategy.regime_enabled:
+                    regime = detect_market_regime(history, strategy.regime_lookback)
+                    raw_alpha = regime_adjusted_alpha(alpha_frame, strategy, regime)
+                else:
+                    regime = detect_market_regime(history, strategy.regime_lookback)
+                    raw_alpha = alpha_frame["ensemble"]
+                if strategy.factor_alpha_enabled:
+                    factor_signal = factor_alpha_from_precomputed(
+                        factor_panel,
+                        factor_ic,
+                        pd.Timestamp(signal_date),
+                        data.symbols,
+                        horizon=strategy.factor_ic_horizon,
+                        lookback=strategy.factor_ic_lookback,
+                        min_observations=strategy.factor_ic_min_observations,
+                    )
+                    overlay = float(np.clip(strategy.factor_alpha_weight, 0.0, 1.0))
+                    if not factor_signal.weights.empty:
+                        raw_alpha = (1.0 - overlay) * raw_alpha + overlay * factor_signal.score
+                    factor_weight_row = factor_signal.weights.copy()
+                    factor_weight_row.name = signal_date
+                    factor_weight_rows.append(factor_weight_row)
+                factor_returns = history.pct_change(fill_method=None).tail(strategy.factor_lookback)
+                if strategy.factor_neutralization:
+                    neutral_alpha, _ = neutralize_alpha(raw_alpha, factor_returns, eligible=eligible)
+                    strength = float(np.clip(strategy.factor_neutralization_strength, 0.0, 1.0))
+                    alpha = (1.0 - strength) * raw_alpha + strength * neutral_alpha
+                    alpha = alpha.where(eligible, 0.0)
+                else:
+                    alpha = raw_alpha.where(eligible, 0.0)
+                alpha = alpha.reindex(data.symbols).fillna(0.0)
+                previous = signal_weights
+                gross_limit = regime.gross_exposure_limit if strategy.regime_enabled else 1.0
+                target = optimize_weights(
+                    alpha,
+                    returns,
+                    previous,
+                    strategy,
+                    eligible=eligible,
+                    gross_exposure_limit=gross_limit,
+                )
+                regime_rows.append(
+                    {
+                        "timestamp": signal_date,
+                        "label": regime.label,
+                        "trend_z": regime.trend_z,
+                        "annual_volatility": regime.annual_volatility,
+                        "gross_exposure_limit": gross_limit,
+                    }
+                )
             risk_result = apply_portfolio_risk_controls(
                 target,
                 returns,

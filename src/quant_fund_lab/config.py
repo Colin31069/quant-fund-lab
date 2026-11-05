@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,7 @@ class BacktestConfig:
         )
     )
     cash_annual_yield: float = 0.0
+    custom_alpha_evaluator: Any | None = None
 
     def __post_init__(self) -> None:
         rate = float(self.cash_annual_yield)
